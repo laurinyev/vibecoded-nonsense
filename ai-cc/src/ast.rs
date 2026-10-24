@@ -69,12 +69,13 @@ pub enum Expr {
     Char(char),
     String(String),
     Var(String),
-    Assign(String, Box<Expr>),
+    Assign(Box<Expr>, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     Call(String, Vec<Expr>),
     Conditional(Box<Expr>, Box<Expr>, Box<Expr>),
     Member(Box<Expr>, String, bool),
+    Subscript(Box<Expr>, Box<Expr>),
 }
 #[derive(Clone, Copy, Debug)]
 pub enum BinOp {
@@ -104,4 +105,6 @@ pub enum UnOp {
     Not,
     Pos,
     BitNot,
+    Address,
+    Deref,
 }

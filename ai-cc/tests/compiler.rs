@@ -204,9 +204,8 @@ fn aggregate_and_qualified_types() {
 }
 
 #[test]
-fn member_access_is_diagnosed_until_lowered() {
-    let errors = compile_errors("member-access.c");
-    assert!(errors.iter().any(|e| e.message.contains("member access")));
+fn member_access_compiles() {
+    compile_ok("member-access.c");
 }
 
 #[test]
@@ -266,9 +265,13 @@ fn incomplete_and_void_objects_are_rejected_in_all_forms() {
 }
 
 #[test]
-fn member_access_is_rejected_until_lowered() {
-    let e = compile_errors("member-access.c");
-    assert!(e.iter().any(|x| x.message.contains("member access")));
+fn member_access_is_accepted() {
+    compile_ok("member-access.c");
+}
+
+#[test]
+fn aggregate_lowering_runs() {
+    run_case("aggregate-lowering.c", b"");
 }
 
 #[test]
@@ -285,12 +288,7 @@ fn aggregate_qualifier_keywords_lex() {
 
 #[test]
 fn unsupported_pointer_sizeof_and_subscript_operators_are_diagnosed() {
-    for file in [
-        "unsupported-address.c",
-        "unsupported-deref.c",
-        "unsupported-subscript.c",
-        "unsupported-sizeof.c",
-    ] {
+    for file in ["unsupported-sizeof.c"] {
         assert!(
             compile_errors(file).iter().any(|_| true),
             "accepted unsupported operator: {file}"

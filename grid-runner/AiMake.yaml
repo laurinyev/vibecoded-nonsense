@@ -1,0 +1,9 @@
+targets:
+  grid-runner:
+    sources:
+      - src/main.c
+      - src/game.c
+      - src/world.c
+      - src/render.c
+      - src/rng.c
+    output: build/grid-runner

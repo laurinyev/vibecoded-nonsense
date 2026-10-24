@@ -45,6 +45,7 @@ pub enum TokenKind {
     Double,
     Enum,
     Typedef,
+    Static,
     Sizeof,
     Plus,
     Minus,
@@ -107,6 +108,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Struct => "'struct'",
             TokenKind::Union => "'union'",
             TokenKind::Enum => "'enum'",
+            TokenKind::Static => "'static'",
             TokenKind::Return => "'return'",
             TokenKind::If => "'if'",
             TokenKind::Else => "'else'",
@@ -303,6 +305,7 @@ impl Lexer {
                 "double" => TokenKind::Double,
                 "enum" => TokenKind::Enum,
                 "typedef" => TokenKind::Typedef,
+                "static" => TokenKind::Static,
                 "sizeof" => TokenKind::Sizeof,
                 _ => TokenKind::Ident(x),
             };

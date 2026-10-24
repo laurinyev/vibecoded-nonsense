@@ -3,10 +3,12 @@ use crate::{
     diag::{Diagnostic, Span},
     lex::{Token, TokenKind},
 };
+use std::collections::HashMap;
 pub struct Parser {
     t: Vec<Token>,
     p: usize,
     errors: Vec<Diagnostic>,
+    aliases: HashMap<String, Type>,
 }
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
@@ -14,6 +16,7 @@ impl Parser {
             t: tokens,
             p: 0,
             errors: Vec::new(),
+            aliases: HashMap::new(),
         }
     }
     fn cur(&self) -> &TokenKind {
@@ -174,6 +177,7 @@ impl Parser {
                         Type::UnsignedLong
                     }
                 } else {
+                    self.take(&TokenKind::Int);
                     Type::UnsignedInt
                 }
             }
@@ -207,6 +211,11 @@ impl Parser {
                 self.p += 1;
                 Type::Char
             }
+            TokenKind::Ident(name) if self.aliases.contains_key(name) => {
+                let ty = self.aliases.get(name).cloned().unwrap();
+                self.p += 1;
+                return Ok(ty);
+            }
             TokenKind::Void => {
                 self.p += 1;
                 Type::Void
@@ -225,6 +234,23 @@ impl Parser {
         let mut types = Vec::new();
         let mut e = Vec::new();
         while *self.cur() != TokenKind::End {
+            if self.take(&TokenKind::Typedef) {
+                match self.typ().and_then(|ty| {
+                    let (name, ty) = self.declarator(ty)?;
+                    self.expect(&TokenKind::Semicolon)?;
+                    Ok((name, ty))
+                }) {
+                    Ok((name, ty)) => {
+                        self.aliases.insert(name, ty);
+                        continue;
+                    }
+                    Err(x) => {
+                        e.push(x);
+                        self.synchronize(false);
+                        continue;
+                    }
+                }
+            }
             let parsed = if matches!(
                 self.cur(),
                 TokenKind::Struct | TokenKind::Union | TokenKind::Enum
@@ -257,6 +283,7 @@ impl Parser {
         }
     }
     fn function(&mut self) -> Result<Function, Diagnostic> {
+        self.take(&TokenKind::Static);
         let ret = self.typ()?;
         self.function_after_type(ret)
     }
@@ -265,6 +292,10 @@ impl Parser {
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
         if *self.cur() != TokenKind::RParen {
+            if self.take(&TokenKind::Void) && *self.cur() == TokenKind::RParen {
+                self.expect(&TokenKind::RParen)?;
+                return self.finish_function(name, ret, params);
+            }
             loop {
                 let ty = self.typ()?;
                 let (n, ty) = self.declarator(ty)?;
@@ -275,6 +306,14 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RParen)?;
+        self.finish_function(name, ret, params)
+    }
+    fn finish_function(
+        &mut self,
+        name: String,
+        ret: Type,
+        params: Vec<(String, Type)>,
+    ) -> Result<Function, Diagnostic> {
         let start = self.t[self.p].span.start;
         let external = self.take(&TokenKind::Semicolon);
         let body = if external {
@@ -397,39 +436,7 @@ impl Parser {
             self.expect(&TokenKind::Semicolon)?;
             return Ok(Stmt::Continue);
         }
-        if matches!(
-            self.cur(),
-            TokenKind::Int
-                | TokenKind::Bool
-                | TokenKind::CharKw
-                | TokenKind::Void
-                | TokenKind::SizeT
-                | TokenKind::PtrdiffT
-                | TokenKind::WcharT
-                | TokenKind::VaList
-                | TokenKind::Int8T
-                | TokenKind::Uint8T
-                | TokenKind::Int16T
-                | TokenKind::Uint16T
-                | TokenKind::Int32T
-                | TokenKind::Uint32T
-                | TokenKind::Int64T
-                | TokenKind::Uint64T
-                | TokenKind::IntmaxT
-                | TokenKind::UintmaxT
-                | TokenKind::Struct
-                | TokenKind::Union
-                | TokenKind::Enum
-                | TokenKind::Const
-                | TokenKind::Volatile
-                | TokenKind::Restrict
-                | TokenKind::Signed
-                | TokenKind::Unsigned
-                | TokenKind::Short
-                | TokenKind::Long
-                | TokenKind::Float
-                | TokenKind::Double
-        ) {
+        if self.is_type() {
             return self.declaration();
         }
         let x = self.expr()?;
@@ -437,27 +444,40 @@ impl Parser {
         Ok(Stmt::Expr(x))
     }
     fn is_type(&self) -> bool {
-        matches!(
-            self.cur(),
-            TokenKind::Int
-                | TokenKind::Bool
-                | TokenKind::CharKw
-                | TokenKind::Void
-                | TokenKind::SizeT
-                | TokenKind::PtrdiffT
-                | TokenKind::WcharT
-                | TokenKind::VaList
-                | TokenKind::Int8T
-                | TokenKind::Uint8T
-                | TokenKind::Int16T
-                | TokenKind::Uint16T
-                | TokenKind::Int32T
-                | TokenKind::Uint32T
-                | TokenKind::Int64T
-                | TokenKind::Uint64T
-                | TokenKind::IntmaxT
-                | TokenKind::UintmaxT
-        )
+        matches!(self.cur(), TokenKind::Ident(name) if self.aliases.contains_key(name))
+            || matches!(
+                self.cur(),
+                TokenKind::Int
+                    | TokenKind::Bool
+                    | TokenKind::CharKw
+                    | TokenKind::Void
+                    | TokenKind::SizeT
+                    | TokenKind::PtrdiffT
+                    | TokenKind::WcharT
+                    | TokenKind::VaList
+                    | TokenKind::Int8T
+                    | TokenKind::Uint8T
+                    | TokenKind::Int16T
+                    | TokenKind::Uint16T
+                    | TokenKind::Int32T
+                    | TokenKind::Uint32T
+                    | TokenKind::Int64T
+                    | TokenKind::Uint64T
+                    | TokenKind::IntmaxT
+                    | TokenKind::UintmaxT
+                    | TokenKind::Struct
+                    | TokenKind::Union
+                    | TokenKind::Enum
+                    | TokenKind::Const
+                    | TokenKind::Volatile
+                    | TokenKind::Restrict
+                    | TokenKind::Signed
+                    | TokenKind::Unsigned
+                    | TokenKind::Short
+                    | TokenKind::Long
+                    | TokenKind::Float
+                    | TokenKind::Double
+            )
     }
     fn declaration(&mut self) -> Result<Stmt, Diagnostic> {
         let ty = self.typ()?;
@@ -475,6 +495,7 @@ impl Parser {
             ty = Type::Pointer(Box::new(ty));
         }
         let n = self.ident()?;
+        let mut arrays = Vec::new();
         while self.take(&TokenKind::LBracket) {
             let size = if let TokenKind::Number(n) = self.cur().clone() {
                 self.p += 1;
@@ -483,6 +504,9 @@ impl Parser {
                 None
             };
             self.expect(&TokenKind::RBracket)?;
+            arrays.push(size);
+        }
+        for size in arrays.into_iter().rev() {
             ty = Type::Array(Box::new(ty), size);
         }
         Ok((n, ty))
@@ -518,12 +542,12 @@ impl Parser {
         };
         if let Some(op) = op {
             self.p += 1;
-            if let Expr::Var(n) = x {
+            if Self::is_lvalue(&x) {
                 let rhs = self.assign()?;
                 Ok(Expr::Assign(
-                    n.clone(),
+                    Box::new(x.clone()),
                     if let Some(op) = op {
-                        Box::new(Expr::Binary(op, Box::new(Expr::Var(n)), Box::new(rhs)))
+                        Box::new(Expr::Binary(op, Box::new(x), Box::new(rhs)))
                     } else {
                         Box::new(rhs)
                     },
@@ -534,6 +558,15 @@ impl Parser {
         } else {
             Ok(x)
         }
+    }
+    fn is_lvalue(x: &Expr) -> bool {
+        matches!(
+            x,
+            Expr::Var(_)
+                | Expr::Member(_, _, _)
+                | Expr::Subscript(_, _)
+                | Expr::Unary(UnOp::Deref, _)
+        )
     }
     fn prec(k: &TokenKind) -> Option<(u8, BinOp)> {
         Some(match k {
@@ -580,7 +613,7 @@ impl Parser {
                 return Err(Diagnostic::error("increment target required", None));
             };
             return Ok(Expr::Assign(
-                n.clone(),
+                Box::new(Expr::Var(n.clone())),
                 Box::new(Expr::Binary(
                     if add { BinOp::Add } else { BinOp::Sub },
                     Box::new(Expr::Var(n)),
@@ -599,6 +632,12 @@ impl Parser {
         }
         if self.take(&TokenKind::Not) {
             return Ok(Expr::Unary(UnOp::Not, Box::new(self.unary()?)));
+        }
+        if self.take(&TokenKind::BitAnd) {
+            return Ok(Expr::Unary(UnOp::Address, Box::new(self.unary()?)));
+        }
+        if self.take(&TokenKind::Star) {
+            return Ok(Expr::Unary(UnOp::Deref, Box::new(self.unary()?)));
         }
         self.primary()
     }
@@ -639,7 +678,7 @@ impl Parser {
                     let x = Expr::Var(n.clone());
                     if self.take(&TokenKind::PlusPlus) {
                         Expr::Assign(
-                            n,
+                            Box::new(x.clone()),
                             Box::new(Expr::Binary(
                                 BinOp::Add,
                                 Box::new(x),
@@ -648,7 +687,7 @@ impl Parser {
                         )
                     } else if self.take(&TokenKind::MinusMinus) {
                         Expr::Assign(
-                            n,
+                            Box::new(x.clone()),
                             Box::new(Expr::Binary(
                                 BinOp::Sub,
                                 Box::new(x),
@@ -675,6 +714,12 @@ impl Parser {
         };
         let mut x = x;
         loop {
+            if self.take(&TokenKind::LBracket) {
+                let index = self.expr()?;
+                self.expect(&TokenKind::RBracket)?;
+                x = Expr::Subscript(Box::new(x), Box::new(index));
+                continue;
+            }
             let arrow = self.take(&TokenKind::Arrow);
             let dot = arrow || self.take(&TokenKind::Dot);
             if !dot {

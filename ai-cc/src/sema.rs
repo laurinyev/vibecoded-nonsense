@@ -29,6 +29,9 @@ impl Sema {
             }
         }
         for f in &ast.items {
+            if f.external {
+                continue;
+            }
             if let Err(e) = self.syms.insert(Symbol {
                 name: f.name.clone(),
                 ty: f.ret.clone(),
@@ -170,11 +173,8 @@ impl Sema {
                         .push(Diagnostic::error(format!("unknown identifier {}", n), None))
                 }
             }
-            Expr::Assign(n, x) => {
-                if self.syms.lookup(n).is_none() {
-                    self.errs
-                        .push(Diagnostic::error(format!("unknown identifier {}", n), None))
-                }
+            Expr::Assign(target, x) => {
+                self.expr(target);
                 self.expr(x)
             }
             Expr::Binary(_, a, b) => {
@@ -189,10 +189,10 @@ impl Sema {
             }
             Expr::Member(x, _, _) => {
                 self.expr(x);
-                self.errs.push(Diagnostic::error(
-                    "structure member access requires object lowering support",
-                    None,
-                ));
+            }
+            Expr::Subscript(a, b) => {
+                self.expr(a);
+                self.expr(b);
             }
             Expr::Call(_, a) => {
                 for x in a {
