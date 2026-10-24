@@ -1,6 +1,6 @@
-# ai-bullshit
+# Vibecoded Nonsense
 
-A workspace for assorted experimental, AI-assisted programming projects—currently a compiler, a tiny build tool, and a game that puts them to work.
+A workspace for assorted vibecoded projects—currently a compiler, a tiny build tool, and a game that puts them to work.
 
 ## Projects
 
