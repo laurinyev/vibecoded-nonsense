@@ -5,10 +5,11 @@ use crate::{
 };
 use std::collections::HashMap;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum DeclaratorOp {
     Pointer(Qualifiers),
     Array(Option<usize>),
+    Function(Vec<Type>),
 }
 
 pub struct Parser {
@@ -504,7 +505,7 @@ impl Parser {
         let ty = self.typ()?;
         let mut declarations = Vec::new();
         loop {
-            let (n, declared_ty) = self.declarator(ty.clone())?;
+            let (n, declared_ty) = self.declarator_full(ty.clone())?;
             let init = if self.take(&TokenKind::Assign) {
                 Some(self.assign()?)
             } else {
@@ -524,24 +525,37 @@ impl Parser {
         }
     }
     fn declarator(&mut self, mut ty: Type) -> Result<(String, Type), Diagnostic> {
+        self.declarator_inner(&mut ty, false)
+    }
+
+    fn declarator_full(&mut self, mut ty: Type) -> Result<(String, Type), Diagnostic> {
+        self.declarator_inner(&mut ty, true)
+    }
+
+    fn declarator_inner(
+        &mut self,
+        ty: &mut Type,
+        allow_function: bool,
+    ) -> Result<(String, Type), Diagnostic> {
         while let Some(qualifier) = self.take_qualifier() {
-            ty = Self::qualified(ty, qualifier);
+            *ty = Self::qualified(ty.clone(), qualifier);
         }
-        let (name, ops) = self.declarator_ops()?;
+        let (name, ops) = self.declarator_ops(allow_function)?;
         for op in ops.into_iter().rev() {
-            ty = match op {
+            *ty = match op {
                 DeclaratorOp::Pointer(q) => {
-                    let pointer = Type::Pointer(Box::new(ty));
+                    let pointer = Type::Pointer(Box::new(ty.clone()));
                     if q == Qualifiers::default() {
                         pointer
                     } else {
                         Type::Qualified(Box::new(pointer), q)
                     }
                 }
-                DeclaratorOp::Array(size) => Type::Array(Box::new(ty), size),
+                DeclaratorOp::Array(size) => Type::Array(Box::new(ty.clone()), size),
+                DeclaratorOp::Function(params) => Type::Function(Box::new(ty.clone()), params),
             };
         }
-        Ok((name, ty))
+        Ok((name, ty.clone()))
     }
 
     fn take_qualifier(&mut self) -> Option<Qualifiers> {
@@ -576,7 +590,10 @@ impl Parser {
         }
     }
 
-    fn declarator_ops(&mut self) -> Result<(String, Vec<DeclaratorOp>), Diagnostic> {
+    fn declarator_ops(
+        &mut self,
+        allow_function: bool,
+    ) -> Result<(String, Vec<DeclaratorOp>), Diagnostic> {
         let mut pointers = Vec::new();
         while self.take(&TokenKind::Star) {
             let mut qualifiers = Qualifiers::default();
@@ -588,7 +605,7 @@ impl Parser {
             pointers.push(qualifiers);
         }
         let (name, mut ops) = if self.take(&TokenKind::LParen) {
-            let inner = self.declarator_ops()?;
+            let inner = self.declarator_ops(allow_function)?;
             self.expect(&TokenKind::RParen)?;
             inner
         } else {
@@ -603,6 +620,32 @@ impl Parser {
             };
             self.expect(&TokenKind::RBracket)?;
             ops.push(DeclaratorOp::Array(size));
+        }
+        if allow_function && self.take(&TokenKind::LParen) {
+            let mut params = Vec::new();
+            if !self.take(&TokenKind::RParen) {
+                if self.take(&TokenKind::Void) && self.take(&TokenKind::RParen) {
+                    // `void` denotes an empty parameter list.
+                } else {
+                    loop {
+                        let param_ty = self.typ()?;
+                        let param_ty = if matches!(
+                            self.cur(),
+                            TokenKind::Ident(_) | TokenKind::Star | TokenKind::LParen
+                        ) {
+                            self.declarator_full(param_ty)?.1
+                        } else {
+                            param_ty
+                        };
+                        params.push(param_ty);
+                        if !self.take(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                }
+            }
+            ops.push(DeclaratorOp::Function(params));
         }
         ops.extend(pointers.into_iter().map(DeclaratorOp::Pointer));
         Ok((name, ops))

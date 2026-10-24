@@ -207,6 +207,25 @@ fn function_prototype_parameter_list_is_accepted() {
 }
 
 #[test]
+fn local_function_pointer_declarator_is_parsed() {
+    let source = "int main(void) { int (*callback)(int); return 0; }";
+    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    let ast = parser.parse_translation_unit().unwrap();
+    let ai_cc::ast::Stmt::Decl(_, ty, _, _) = &ast.items[0].body.stmts[0] else {
+        panic!("expected function pointer declaration");
+    };
+    assert_eq!(
+        ty,
+        &ai_cc::ast::Type::Pointer(Box::new(ai_cc::ast::Type::Function(
+            Box::new(ai_cc::ast::Type::Int),
+            vec![ai_cc::ast::Type::Int]
+        )))
+    );
+    ai_cc::compile_preprocessed(source, "function-pointer.c").unwrap();
+}
+
+#[test]
 fn lexer_recognizes_c99_keywords_punctuator_and_integer_radices() {
     use ai_cc::lex::TokenKind as K;
     let tokens = ai_cc::lex::Lexer::new(

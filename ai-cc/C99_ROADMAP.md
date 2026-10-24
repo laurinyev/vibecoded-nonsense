@@ -89,13 +89,13 @@ Keep `#pragma once` as an extension, but do not use it as a substitute for stand
 
 Replace the current “one name per declaration” parser with C99 declaration-specifier and declarator parsing:
 
-Progress: the parser accepts varied orderings of integer and character type specifiers, qualifiers before or after type specifiers and after pointer stars, multiple local declarators with assignment initializers, parenthesized pointer/array declarators (including pointers to arrays), and function prototypes with parameter lists. This is partial coverage: fully arbitrary specifier ordering, function pointers, storage classes, block-scope typedefs, VLAs, type names, and old-style declarations remain outstanding.
+Progress: the parser accepts varied orderings of integer and character type specifiers, qualifiers before or after type specifiers and after pointer stars, multiple local declarators with assignment initializers, parenthesized pointer/array declarators (including pointers to arrays), function-pointer declarators, and function prototypes with parameter lists. Function-pointer calls and runtime VLA behavior are not implemented. This is partial coverage: fully arbitrary specifier ordering, storage classes, block-scope typedefs, type names, and old-style declarations remain outstanding.
 
 - Arbitrary declaration-specifier ordering (integer/character specifier permutations and common qualifier positions are supported; storage-class and every C99 combination remain).
 - Multiple declarators per declaration (local declarations only; file-scope objects remain unsupported).
 - Fully nested declarators, including function declarators.
 - Function declarators and prototype parameter lists (basic prototypes are supported; remaining declarator forms are outstanding).
-- Function pointers (pointers to arrays are supported).
+- Function pointers (declaration parsing is supported; indirect calls are not).
 - Array qualifiers, `static` array bounds, and variable-length arrays.
 - Type names for casts, `sizeof`, and compound literals.
 - `extern`, `static`, `auto`, `register`, and `inline`.
