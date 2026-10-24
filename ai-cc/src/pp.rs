@@ -10,9 +10,18 @@ pub struct Preprocessor {
 }
 impl Preprocessor {
     pub fn new(resolver: impl FileResolver + 'static) -> Self {
+        Self::new_with_hosted(resolver, true)
+    }
+
+    pub fn new_with_hosted(resolver: impl FileResolver + 'static, hosted: bool) -> Self {
+        let mut macros = std::collections::HashMap::new();
+        macros.insert(
+            "__STDC_HOSTED__".into(),
+            if hosted { "1".into() } else { "0".into() },
+        );
         Self {
             resolver: Box::new(resolver),
-            macros: std::collections::HashMap::new(),
+            macros,
             function_macros: std::collections::HashMap::new(),
             once: std::collections::HashSet::new(),
         }
@@ -24,24 +33,43 @@ impl Preprocessor {
         let mut out = String::new();
         let mut errs = Vec::new();
         let mut cond: Vec<(bool, bool)> = Vec::new();
-        for (n, line) in source.lines().enumerate() {
+        let mut offset = 0;
+        for raw_line in source.split_inclusive('\n') {
+            let has_newline = raw_line.ends_with('\n');
+            let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+            let line_start = offset;
+            offset += raw_line.len();
+            let span = || {
+                Some(Span {
+                    start: line_start,
+                    end: line_start + line.len(),
+                })
+            };
+            let preserve_line = |out: &mut String| {
+                if has_newline {
+                    out.push('\n');
+                }
+            };
             let t = line.trim();
             let parent = cond.iter().all(|(active, _)| *active);
             if let Some(rest) = t.strip_prefix("#if ") {
                 let value = self.if_value(rest.trim());
                 cond.push((parent && value, value));
+                preserve_line(&mut out);
                 continue;
             }
             if let Some(rest) = t.strip_prefix("#ifdef ") {
                 let value = self.macros.contains_key(rest.trim())
                     || self.function_macros.contains_key(rest.trim());
                 cond.push((parent && value, value));
+                preserve_line(&mut out);
                 continue;
             }
             if let Some(rest) = t.strip_prefix("#ifndef ") {
                 let value = !(self.macros.contains_key(rest.trim())
                     || self.function_macros.contains_key(rest.trim()));
                 cond.push((parent && value, value));
+                preserve_line(&mut out);
                 continue;
             }
             if t == "#else" {
@@ -52,7 +80,10 @@ impl Preprocessor {
                 if let Some((active, seen)) = cond.last_mut() {
                     *active = outer && !*seen;
                     *seen = true;
+                } else {
+                    errs.push(Diagnostic::error("#else without matching #if", span()));
                 }
+                preserve_line(&mut out);
                 continue;
             }
             if let Some(rest) = t.strip_prefix("#elif ") {
@@ -64,18 +95,24 @@ impl Preprocessor {
                 if let Some((active, seen)) = cond.last_mut() {
                     *active = outer && !*seen && value;
                     *seen |= value;
+                } else {
+                    errs.push(Diagnostic::error("#elif without matching #if", span()));
                 }
+                preserve_line(&mut out);
                 continue;
             }
             if t == "#endif" {
-                cond.pop();
+                if cond.pop().is_none() {
+                    errs.push(Diagnostic::error("#endif without matching #if", span()));
+                }
+                preserve_line(&mut out);
                 continue;
             }
             if !cond.iter().all(|(active, _)| *active) {
+                preserve_line(&mut out);
                 continue;
             }
-            if t.starts_with("#define ") {
-                let def = &t[8..];
+            if let Some(def) = t.strip_prefix("#define ") {
                 if let Some(open) = def.find('(') {
                     if let Some(close) = def.find(')') {
                         let name = def[..open].trim().to_string();
@@ -94,31 +131,40 @@ impl Preprocessor {
                             .insert(k.to_string(), p.next().unwrap_or("").trim().to_string());
                     }
                 }
-            } else if t.starts_with("#include ") {
-                let q = t[9..].trim().trim_matches(['"', '<', '>']);
+                preserve_line(&mut out);
+            } else if let Some(rest) = t.strip_prefix("#undef ") {
+                let name = rest.trim();
+                self.macros.remove(name);
+                self.function_macros.remove(name);
+                preserve_line(&mut out);
+            } else if let Some(rest) = t.strip_prefix("#include ") {
+                let q = rest.trim().trim_matches(['"', '<', '>']);
                 match self.resolver.resolve(q, file_name) {
                     Ok(s) => match self.run(q, &s) {
                         Ok(x) => out.push_str(&x),
                         Err(mut e) => errs.append(&mut e),
                     },
-                    Err(e) => errs.push(Diagnostic::error(
-                        format!("include {}: {}", q, e),
-                        Some(Span {
-                            start: n,
-                            end: n + line.len(),
-                        }),
-                    )),
+                    Err(e) => errs.push(Diagnostic::error(format!("include {}: {}", q, e), span())),
                 }
             } else if t == "#pragma once" {
                 self.once.insert(file_name.to_string());
+                preserve_line(&mut out);
+            } else if let Some(rest) = t.strip_prefix("#error") {
+                errs.push(Diagnostic::error(
+                    format!("preprocessor #error{}", rest),
+                    span(),
+                ));
+                preserve_line(&mut out);
             } else if t.starts_with('#') {
+                errs.push(Diagnostic::error(
+                    format!("unsupported preprocessor directive: {}", t),
+                    span(),
+                ));
+                preserve_line(&mut out);
             } else {
                 let mut x = line.to_string();
                 for (name, (args, body)) in &self.function_macros {
-                    loop {
-                        let Some(start) = x.find(&format!("{}(", name)) else {
-                            break;
-                        };
+                    while let Some(start) = x.find(&format!("{}(", name)) {
                         let open = start + name.len();
                         let Some(end) = x[open..].find(')') else {
                             break;
@@ -141,6 +187,15 @@ impl Preprocessor {
                 out.push_str(&x);
                 out.push('\n');
             }
+        }
+        if !cond.is_empty() {
+            errs.push(Diagnostic::error(
+                "unterminated conditional inclusion",
+                Some(Span {
+                    start: source.len(),
+                    end: source.len(),
+                }),
+            ));
         }
         if errs.is_empty() {
             Ok(out)

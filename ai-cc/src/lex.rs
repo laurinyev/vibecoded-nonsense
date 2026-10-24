@@ -239,19 +239,33 @@ impl Lexer {
             } else {
                 10
             };
-            let mut n = 0;
+            let mut n = 0i64;
             let mut any = false;
+            let mut overflow = false;
             while self.pos < self.src.len() {
                 let Some(d) = self.src[self.pos].to_digit(base) else {
                     break;
                 };
                 any = true;
-                n = n * base as i64 + d as i64;
+                if let Some(next) = n
+                    .checked_mul(base as i64)
+                    .and_then(|x| x.checked_add(d as i64))
+                {
+                    n = next;
+                } else {
+                    overflow = true;
+                }
                 self.pos += 1;
             }
             if !any {
                 return Err(Diagnostic::error(
                     "expected hexadecimal digit",
+                    Some(self.t(TokenKind::End, s).span),
+                ));
+            }
+            if overflow {
+                return Err(Diagnostic::error(
+                    "integer constant is out of range",
                     Some(self.t(TokenKind::End, s).span),
                 ));
             }

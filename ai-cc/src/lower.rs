@@ -41,6 +41,12 @@ pub struct Lowerer {
     functions: HashMap<String, (Type, Vec<Type>)>,
 }
 
+impl Default for Lowerer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Lowerer {
     pub fn new() -> Self {
         Self {
@@ -337,7 +343,7 @@ impl Lowerer {
 
     fn stmt(&mut self, s: &Stmt, v: &mut Vec<Instr>) {
         match s {
-            Stmt::Decl(n, ty, init) => {
+            Stmt::Decl(n, ty, init, _) => {
                 let slot = format!("%slot_{}", n);
                 let size = Self::size(ty).max(1);
                 self.vars.insert(n.clone(), ty.clone());
@@ -349,19 +355,19 @@ impl Lowerer {
                     v.push(Instr::Store(x, addr, ty.clone()));
                 }
             }
-            Stmt::Expr(e) => {
+            Stmt::Expr(e, _) => {
                 self.expr(e, v);
             }
-            Stmt::Return(e) => {
+            Stmt::Return(e, _) => {
                 let value = e.as_ref().map(|x| self.expr(x, v));
                 v.push(Instr::Ret(value));
             }
-            Stmt::Block(b) => {
+            Stmt::Block(b, _) => {
                 for x in &b.stmts {
                     self.stmt(x, v)
                 }
             }
-            Stmt::If(c, a, b) => {
+            Stmt::If(c, a, b, _) => {
                 let x = self.expr(c, v);
                 let i = self.n;
                 self.n += 1;
@@ -379,7 +385,7 @@ impl Lowerer {
                 v.push(Instr::Jump(e.clone()));
                 v.push(Instr::Label(e));
             }
-            Stmt::While(c, b) => {
+            Stmt::While(c, b, _) => {
                 let i = self.n;
                 self.n += 1;
                 let h = format!("@while{}", i);
@@ -395,7 +401,7 @@ impl Lowerer {
                 v.push(Instr::Jump(h));
                 v.push(Instr::Label(e));
             }
-            Stmt::DoWhile(b, c) => {
+            Stmt::DoWhile(b, c, _) => {
                 let i = self.n;
                 self.n += 1;
                 let h = format!("@do{}", i);
@@ -408,7 +414,7 @@ impl Lowerer {
                 v.push(Instr::Branch(y, h, e.clone()));
                 v.push(Instr::Label(e));
             }
-            Stmt::For(init, c, step, b) => {
+            Stmt::For(init, c, step, b, _) => {
                 if let Some(x) = init {
                     self.stmt(x, v);
                 }
@@ -436,12 +442,12 @@ impl Lowerer {
                 v.push(Instr::Jump(h));
                 v.push(Instr::Label(e));
             }
-            Stmt::Break => {
+            Stmt::Break(_) => {
                 if let Some((x, _)) = self.loops.last() {
                     v.push(Instr::Jump(x.clone()));
                 }
             }
-            Stmt::Continue => {
+            Stmt::Continue(_) => {
                 if let Some((_, x)) = self.loops.last() {
                     v.push(Instr::Jump(x.clone()));
                 }

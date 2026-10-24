@@ -1,5 +1,9 @@
 # ai-cc
 
+The implementation contract and current C99 coverage boundary are documented in
+[`C99_IMPLEMENTATION.md`](C99_IMPLEMENTATION.md). The ordered implementation roadmap is in
+[`C99_ROADMAP.md`](C99_ROADMAP.md).
+
 Install compiler and freestanding headers:
 
 ```sh

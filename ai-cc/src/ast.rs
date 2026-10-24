@@ -42,6 +42,7 @@ pub struct Function {
     pub name: String,
     pub ret: Type,
     pub params: Vec<(String, Type)>,
+    pub params_unspecified: bool,
     pub body: Block,
     pub external: bool,
     pub span: Span,
@@ -52,16 +53,39 @@ pub struct Block {
 }
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    Decl(String, Type, Option<Expr>),
-    Expr(Expr),
-    Return(Option<Expr>),
-    Block(Block),
-    If(Expr, Box<Stmt>, Option<Box<Stmt>>),
-    While(Expr, Box<Stmt>),
-    DoWhile(Box<Stmt>, Expr),
-    For(Option<Box<Stmt>>, Option<Expr>, Option<Expr>, Box<Stmt>),
-    Break,
-    Continue,
+    Decl(String, Type, Option<Expr>, Span),
+    Expr(Expr, Span),
+    Return(Option<Expr>, Span),
+    Block(Block, Span),
+    If(Expr, Box<Stmt>, Option<Box<Stmt>>, Span),
+    While(Expr, Box<Stmt>, Span),
+    DoWhile(Box<Stmt>, Expr, Span),
+    For(
+        Option<Box<Stmt>>,
+        Option<Expr>,
+        Option<Expr>,
+        Box<Stmt>,
+        Span,
+    ),
+    Break(Span),
+    Continue(Span),
+}
+
+impl Stmt {
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Decl(_, _, _, span)
+            | Self::Expr(_, span)
+            | Self::Return(_, span)
+            | Self::Block(_, span)
+            | Self::If(_, _, _, span)
+            | Self::While(_, _, span)
+            | Self::DoWhile(_, _, span)
+            | Self::For(_, _, _, _, span)
+            | Self::Break(span)
+            | Self::Continue(span) => *span,
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub enum Expr {
@@ -77,7 +101,7 @@ pub enum Expr {
     Member(Box<Expr>, String, bool),
     Subscript(Box<Expr>, Box<Expr>),
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOp {
     Add,
     Sub,
@@ -99,7 +123,7 @@ pub enum BinOp {
     Shr,
     Comma,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnOp {
     Neg,
     Not,

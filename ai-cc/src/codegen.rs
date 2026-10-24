@@ -2,6 +2,12 @@ use crate::{ast::Type, diag::Diagnostic, lower::*};
 
 pub struct QbeCodegen;
 
+impl Default for QbeCodegen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl QbeCodegen {
     pub fn new() -> Self {
         Self

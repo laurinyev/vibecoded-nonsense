@@ -9,6 +9,7 @@ pub struct Parser {
     p: usize,
     errors: Vec<Diagnostic>,
     aliases: HashMap<String, Type>,
+    eof: TokenKind,
 }
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
@@ -17,14 +18,34 @@ impl Parser {
             p: 0,
             errors: Vec::new(),
             aliases: HashMap::new(),
+            eof: TokenKind::End,
         }
     }
     fn cur(&self) -> &TokenKind {
-        &self.t[self.p].kind
+        self.t.get(self.p).map(|x| &x.kind).unwrap_or(&self.eof)
+    }
+    fn cur_span(&self) -> Span {
+        self.t
+            .get(self.p)
+            .map(|x| x.span)
+            .or_else(|| self.t.last().map(|x| x.span))
+            .unwrap_or_default()
+    }
+    fn span_from(&self, start: usize) -> Span {
+        Span {
+            start,
+            end: self
+                .t
+                .get(self.p.saturating_sub(1))
+                .map(|x| x.span.end)
+                .unwrap_or(start),
+        }
     }
     fn take(&mut self, k: &TokenKind) -> bool {
         if self.cur() == k {
-            self.p += 1;
+            if self.p + 1 < self.t.len() {
+                self.p += 1;
+            }
             true
         } else {
             false
@@ -36,7 +57,7 @@ impl Parser {
         } else {
             Err(Diagnostic::error(
                 format!("expected {}, found {}", k, self.cur()),
-                Some(self.t[self.p].span),
+                Some(self.cur_span()),
             ))
         }
     }
@@ -47,7 +68,7 @@ impl Parser {
         } else {
             Err(Diagnostic::error(
                 "expected identifier",
-                Some(self.t[self.p].span),
+                Some(self.cur_span()),
             ))
         }
     }
@@ -84,7 +105,7 @@ impl Parser {
                     if fields.iter().any(|(n, _)| n == &name) {
                         return Err(Diagnostic::error(
                             format!("duplicate member {}", name),
-                            None,
+                            Some(self.cur_span()),
                         ));
                     }
                     fields.push((name, ft));
@@ -115,7 +136,7 @@ impl Parser {
                         } else {
                             return Err(Diagnostic::error(
                                 "enumerator requires integer constant",
-                                None,
+                                Some(self.cur_span()),
                             ));
                         }
                     }
@@ -220,12 +241,7 @@ impl Parser {
                 self.p += 1;
                 Type::Void
             }
-            _ => {
-                return Err(Diagnostic::error(
-                    "expected type",
-                    Some(self.t[self.p].span),
-                ))
-            }
+            _ => return Err(Diagnostic::error("expected type", Some(self.cur_span()))),
         };
         Ok(x)
     }
@@ -291,10 +307,11 @@ impl Parser {
         let (name, ret) = self.declarator(ret)?;
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
+        let mut params_unspecified = false;
         if *self.cur() != TokenKind::RParen {
             if self.take(&TokenKind::Void) && *self.cur() == TokenKind::RParen {
                 self.expect(&TokenKind::RParen)?;
-                return self.finish_function(name, ret, params);
+                return self.finish_function(name, ret, params, false);
             }
             loop {
                 let ty = self.typ()?;
@@ -304,17 +321,20 @@ impl Parser {
                     break;
                 }
             }
+        } else {
+            params_unspecified = true;
         }
         self.expect(&TokenKind::RParen)?;
-        self.finish_function(name, ret, params)
+        self.finish_function(name, ret, params, params_unspecified)
     }
     fn finish_function(
         &mut self,
         name: String,
         ret: Type,
         params: Vec<(String, Type)>,
+        params_unspecified: bool,
     ) -> Result<Function, Diagnostic> {
-        let start = self.t[self.p].span.start;
+        let start = self.cur_span().start;
         let external = self.take(&TokenKind::Semicolon);
         let body = if external {
             Block { stmts: Vec::new() }
@@ -325,6 +345,7 @@ impl Parser {
             name,
             ret,
             params,
+            params_unspecified,
             body,
             external,
             span: Span {
@@ -358,9 +379,11 @@ impl Parser {
         self.take(&TokenKind::Semicolon);
     }
     fn stmt(&mut self) -> Result<Stmt, Diagnostic> {
+        let start = self.cur_span().start;
         if self.take(&TokenKind::LBrace) {
             self.p -= 1;
-            return Ok(Stmt::Block(self.block()?));
+            let block = self.block()?;
+            return Ok(Stmt::Block(block, self.span_from(start)));
         }
         if self.take(&TokenKind::Return) {
             let x = if *self.cur() == TokenKind::Semicolon {
@@ -369,7 +392,7 @@ impl Parser {
                 Some(self.expr()?)
             };
             self.expect(&TokenKind::Semicolon)?;
-            return Ok(Stmt::Return(x));
+            return Ok(Stmt::Return(x, self.span_from(start)));
         }
         if self.take(&TokenKind::If) {
             self.expect(&TokenKind::LParen)?;
@@ -381,13 +404,17 @@ impl Parser {
             } else {
                 None
             };
-            return Ok(Stmt::If(c, a, b));
+            return Ok(Stmt::If(c, a, b, self.span_from(start)));
         }
         if self.take(&TokenKind::While) {
             self.expect(&TokenKind::LParen)?;
             let c = self.expr()?;
             self.expect(&TokenKind::RParen)?;
-            return Ok(Stmt::While(c, Box::new(self.stmt()?)));
+            return Ok(Stmt::While(
+                c,
+                Box::new(self.stmt()?),
+                self.span_from(start),
+            ));
         }
         if self.take(&TokenKind::Do) {
             let body = Box::new(self.stmt()?);
@@ -396,7 +423,7 @@ impl Parser {
             let c = self.expr()?;
             self.expect(&TokenKind::RParen)?;
             self.expect(&TokenKind::Semicolon)?;
-            return Ok(Stmt::DoWhile(body, c));
+            return Ok(Stmt::DoWhile(body, c, self.span_from(start)));
         }
         if self.take(&TokenKind::For) {
             self.expect(&TokenKind::LParen)?;
@@ -406,9 +433,10 @@ impl Parser {
                 let s = if self.is_type() {
                     self.declaration()?
                 } else {
+                    let expr_start = self.cur_span().start;
                     let e = self.expr()?;
                     self.expect(&TokenKind::Semicolon)?;
-                    Stmt::Expr(e)
+                    Stmt::Expr(e, self.span_from(expr_start))
                 };
                 Some(Box::new(s))
             };
@@ -426,22 +454,28 @@ impl Parser {
                 self.expect(&TokenKind::RParen)?;
                 Some(e)
             };
-            return Ok(Stmt::For(init, cond, step, Box::new(self.stmt()?)));
+            return Ok(Stmt::For(
+                init,
+                cond,
+                step,
+                Box::new(self.stmt()?),
+                self.span_from(start),
+            ));
         }
         if self.take(&TokenKind::Break) {
             self.expect(&TokenKind::Semicolon)?;
-            return Ok(Stmt::Break);
+            return Ok(Stmt::Break(self.span_from(start)));
         }
         if self.take(&TokenKind::Continue) {
             self.expect(&TokenKind::Semicolon)?;
-            return Ok(Stmt::Continue);
+            return Ok(Stmt::Continue(self.span_from(start)));
         }
         if self.is_type() {
             return self.declaration();
         }
         let x = self.expr()?;
         self.expect(&TokenKind::Semicolon)?;
-        Ok(Stmt::Expr(x))
+        Ok(Stmt::Expr(x, self.span_from(start)))
     }
     fn is_type(&self) -> bool {
         matches!(self.cur(), TokenKind::Ident(name) if self.aliases.contains_key(name))
@@ -480,6 +514,7 @@ impl Parser {
             )
     }
     fn declaration(&mut self) -> Result<Stmt, Diagnostic> {
+        let start = self.cur_span().start;
         let ty = self.typ()?;
         let (n, ty) = self.declarator(ty)?;
         let x = if self.take(&TokenKind::Assign) {
@@ -488,7 +523,7 @@ impl Parser {
             None
         };
         self.expect(&TokenKind::Semicolon)?;
-        Ok(Stmt::Decl(n, ty, x))
+        Ok(Stmt::Decl(n, ty, x, self.span_from(start)))
     }
     fn declarator(&mut self, mut ty: Type) -> Result<(String, Type), Diagnostic> {
         while self.take(&TokenKind::Star) {
@@ -553,7 +588,10 @@ impl Parser {
                     },
                 ))
             } else {
-                Err(Diagnostic::error("assignment target required", None))
+                Err(Diagnostic::error(
+                    "assignment target required",
+                    Some(self.cur_span()),
+                ))
             }
         } else {
             Ok(x)
@@ -593,10 +631,7 @@ impl Parser {
     }
     fn binary(&mut self, min: u8) -> Result<Expr, Diagnostic> {
         let mut x = self.unary()?;
-        loop {
-            let Some((p, op)) = Self::prec(self.cur()) else {
-                break;
-            };
+        while let Some((p, op)) = Self::prec(self.cur()) {
             if p < min {
                 break;
             }
@@ -610,7 +645,10 @@ impl Parser {
         if self.take(&TokenKind::PlusPlus) || self.take(&TokenKind::MinusMinus) {
             let add = self.t[self.p - 1].kind == TokenKind::PlusPlus;
             let Expr::Var(n) = self.primary()? else {
-                return Err(Diagnostic::error("increment target required", None));
+                return Err(Diagnostic::error(
+                    "increment target required",
+                    Some(self.cur_span()),
+                ));
             };
             return Ok(Expr::Assign(
                 Box::new(Expr::Var(n.clone())),
@@ -708,7 +746,7 @@ impl Parser {
             _ => {
                 return Err(Diagnostic::error(
                     "expected expression",
-                    Some(self.t[self.p].span),
+                    Some(self.cur_span()),
                 ))
             }
         };

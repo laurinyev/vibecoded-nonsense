@@ -1,7 +1,7 @@
 use ai_cc::{
     compile_preprocessed,
     diag::{Diagnostic, DiagnosticFormatter, SourceMap},
-    preprocess,
+    preprocess_with_hosted,
 };
 use clap::{ArgAction, Parser};
 use std::{
@@ -225,7 +225,7 @@ fn dynamic_linker(verbose: bool) -> Result<PathBuf, String> {
             if let Some(path) = entries.flatten().map(|x| x.path()).find(|x| {
                 x.file_name()
                     .and_then(|x| x.to_str())
-                    .map_or(false, |x| x.starts_with("ld-linux") && x.is_ascii())
+                    .is_some_and(|x| x.starts_with("ld-linux") && x.is_ascii())
             }) {
                 return Ok(path);
             }
@@ -272,7 +272,7 @@ fn run(cli: Cli) -> Result<(), String> {
     for input in &cli.inputs {
         let name = input.display().to_string();
         let raw = read_input(input)?;
-        let pre = match preprocess(&raw, &name) {
+        let pre = match preprocess_with_hosted(&raw, &name, !cli.freestanding) {
             Ok(x) => x,
             Err(errors) => {
                 report(&name, &raw, errors);

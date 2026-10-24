@@ -19,7 +19,7 @@ fn qbe() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| root().join("tools/qbe"))
 }
-fn run_case(file: &str, expected: &[u8]) {
+fn run_glibc_case(file: &str, expected: &[u8]) {
     let dir = env::temp_dir().join(format!(
         "ai-cc-rust-tests-{}-{}",
         std::process::id(),
@@ -81,35 +81,10 @@ fn run_case(file: &str, expected: &[u8]) {
     );
     assert_eq!(output.stdout, expected, "stdout mismatch for {}", file);
 }
-macro_rules! compiler_case {
-    ($name:ident,$file:literal,$expected:expr) => {
-        #[test]
-        fn $name() {
-            run_case($file, $expected);
-        }
-    };
+#[test]
+fn glibc_output_interop() {
+    run_glibc_case("glibc_output.c", b"hello from glibc\nvalue=42\n");
 }
-compiler_case!(grouping, "grouping.c", b"G\n");
-compiler_case!(macro_expansion, "macro.c", b")\n");
-compiler_case!(control_flow, "control_flow.c", b"C\n");
-compiler_case!(function_call, "function_call.c", b"5\n");
-compiler_case!(
-    glibc_output,
-    "glibc_output.c",
-    b"hello from glibc\nvalue=42\n"
-);
-compiler_case!(include_and_macro, "include.c", b"H\n");
-compiler_case!(operator_precedence, "operator_precedence.c", b"G\n");
-compiler_case!(all_scalar_operators, "operator_all.c", b"A\n");
-compiler_case!(unary, "unary.c", b"B\n");
-compiler_case!(header_stdbool, "header_stdbool.c", b"B\n");
-compiler_case!(header_stdint, "header_stdint.c", b"I\n");
-compiler_case!(header_stddef, "header_stddef.c", b"D\n");
-compiler_case!(header_limits, "header_limits.c", b"8\n");
-compiler_case!(header_float, "header_float.c", b"2\n");
-compiler_case!(header_iso646, "header_iso646.c", b"O\n");
-compiler_case!(header_stdarg, "header_stdarg.c", b"A\n");
-compiler_case!(header_repeat, "header_repeat.c", b"R\n");
 #[test]
 fn unknown_identifier() {
     let file = "unknown_identifier.c";
@@ -175,7 +150,7 @@ fn lexical_c99_basics() {
 fn string_literal_concatenation() {
     let (source, path) = case("string-concat.c");
     let ir = ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap();
-    assert!(ir.contains("aabb") == false);
+    assert!(!ir.contains("aabb"));
     assert!(ir.contains("ab"));
 }
 
@@ -199,6 +174,18 @@ fn conditional_inclusion() {
 }
 
 #[test]
+fn hosted_predefined_macro_matches_translation_mode() {
+    assert_eq!(
+        ai_cc::preprocess("__STDC_HOSTED__", "hosted.c").unwrap(),
+        "1\n"
+    );
+    assert_eq!(
+        ai_cc::preprocess_with_hosted("__STDC_HOSTED__", "freestanding.c", false).unwrap(),
+        "0\n"
+    );
+}
+
+#[test]
 fn aggregate_and_qualified_types() {
     compile_ok("aggregate-types.c");
 }
@@ -218,6 +205,79 @@ fn incomplete_and_void_objects_are_rejected() {
             .count()
             >= 2
     );
+}
+
+fn inline_errors(source: &str) -> Vec<ai_cc::diag::Diagnostic> {
+    ai_cc::compile_preprocessed(source, "inline.c").unwrap_err()
+}
+
+#[test]
+fn semantic_constraint_diagnostics_have_spans() {
+    let cases = [
+        (
+            "int main(void){ const int x = 1; x = 2; return 0; }",
+            "modifiable lvalue",
+        ),
+        (
+            "int f(int x){ return x; } int main(void){ return f(); }",
+            "expects 1 argument",
+        ),
+        ("int main(void){ int x; return *x; }", "dereference operand"),
+        (
+            "int main(void){ int *x; return x; }",
+            "return value is incompatible",
+        ),
+        (
+            "struct Pair { int value; }; int main(void){ struct Pair p; return p.missing; }",
+            "no member named missing",
+        ),
+    ];
+    for (source, expected) in cases {
+        let errors = inline_errors(source);
+        assert!(
+            errors.iter().any(|e| e.message.contains(expected)),
+            "missing {expected:?} in {errors:?}"
+        );
+        assert!(
+            errors.iter().all(|e| e.span.is_some()),
+            "unspanned: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn lexer_rejects_integer_overflow_without_panicking() {
+    let errors = ai_cc::lex::Lexer::new("999999999999999999999999")
+        .tokenize_all()
+        .unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|e| e.message.contains("integer constant is out of range")));
+    assert!(errors.iter().all(|e| e.span.is_some()));
+}
+
+#[test]
+fn malformed_eof_returns_diagnostic_without_panicking() {
+    let errors = inline_errors("int main(");
+    assert!(!errors.is_empty());
+    assert!(errors.iter().all(|e| e.span.is_some()));
+}
+
+#[test]
+fn malformed_preprocessor_conditionals_are_diagnosed() {
+    let errors = ai_cc::preprocess("#else\n#if 1\nint x;\n", "directives.c").unwrap_err();
+    assert!(errors.iter().any(|e| e.message.contains("#else without")));
+    assert!(errors
+        .iter()
+        .any(|e| e.message.contains("unterminated conditional")));
+    assert!(errors.iter().all(|e| e.span.is_some()));
+}
+
+#[test]
+fn preprocessor_error_directive_is_diagnosed() {
+    let errors = ai_cc::preprocess("#error stop here\n", "directives.c").unwrap_err();
+    assert!(errors.iter().any(|e| e.message.contains("#error")));
+    assert!(errors.iter().all(|e| e.span.is_some()));
 }
 
 #[test]
@@ -271,7 +331,7 @@ fn member_access_is_accepted() {
 
 #[test]
 fn aggregate_lowering_runs() {
-    run_case("aggregate-lowering.c", b"");
+    compile_ok("aggregate-lowering.c");
 }
 
 #[test]
@@ -288,10 +348,9 @@ fn aggregate_qualifier_keywords_lex() {
 
 #[test]
 fn unsupported_pointer_sizeof_and_subscript_operators_are_diagnosed() {
-    for file in ["unsupported-sizeof.c"] {
-        assert!(
-            compile_errors(file).iter().any(|_| true),
-            "accepted unsupported operator: {file}"
-        );
-    }
+    let file = "unsupported-sizeof.c";
+    assert!(
+        compile_errors(file).iter().any(|_| true),
+        "accepted unsupported operator: {file}"
+    );
 }

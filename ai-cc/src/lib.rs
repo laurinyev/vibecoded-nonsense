@@ -42,7 +42,7 @@ impl FileResolver for FsResolver {
                     && dir
                         .file_name()
                         .and_then(|x| x.to_str())
-                        .map_or(false, |x| x.contains('-'))
+                        .is_some_and(|x| x.contains('-'))
                 {
                     includes.push(dir.join(path));
                 }
@@ -71,11 +71,18 @@ pub fn compile(source: &str, file_name: &str) -> Result<String, Vec<Diagnostic>>
     compile_preprocessed(&source, file_name)
 }
 pub fn preprocess(source: &str, file_name: &str) -> Result<String, Vec<Diagnostic>> {
-    let mut pp = Preprocessor::new(FsResolver);
+    preprocess_with_hosted(source, file_name, true)
+}
+pub fn preprocess_with_hosted(
+    source: &str,
+    file_name: &str,
+    hosted: bool,
+) -> Result<String, Vec<Diagnostic>> {
+    let mut pp = Preprocessor::new_with_hosted(FsResolver, hosted);
     pp.run(file_name, source)
 }
 pub fn compile_preprocessed(source: &str, _file_name: &str) -> Result<String, Vec<Diagnostic>> {
-    let mut l = lex::Lexer::new(&source);
+    let mut l = lex::Lexer::new(source);
     let tokens = l.tokenize_all()?;
     let mut p = parser::Parser::new(tokens);
     let mut ast = p.parse_translation_unit()?;
