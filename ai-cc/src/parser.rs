@@ -151,55 +151,66 @@ impl Parser {
             return Ok(Type::Enum(tag, values));
         }
         let x = match self.cur() {
-            TokenKind::Int => {
-                self.p += 1;
-                Type::Int
-            }
-            TokenKind::Signed => {
-                self.p += 1;
-                if self.take(&TokenKind::CharKw) {
-                    Type::SignedChar
-                } else if self.take(&TokenKind::Short) {
-                    Type::Short
-                } else if self.take(&TokenKind::Long) {
-                    if self.take(&TokenKind::Long) {
-                        Type::LongLong
-                    } else {
-                        Type::Long
+            TokenKind::Signed
+            | TokenKind::Unsigned
+            | TokenKind::Short
+            | TokenKind::Long
+            | TokenKind::Int
+            | TokenKind::CharKw => {
+                let mut signed = false;
+                let mut unsigned = false;
+                let mut short = false;
+                let mut longs = 0;
+                let mut saw_int = false;
+                let mut saw_char = false;
+                loop {
+                    match self.cur() {
+                        TokenKind::Signed if !signed && !unsigned => signed = true,
+                        TokenKind::Unsigned if !signed && !unsigned => unsigned = true,
+                        TokenKind::Short if !short && longs == 0 => short = true,
+                        TokenKind::Long if !short && longs < 2 => longs += 1,
+                        TokenKind::Int if !saw_int => saw_int = true,
+                        TokenKind::CharKw if !saw_char => saw_char = true,
+                        _ => break,
                     }
-                } else {
-                    Type::SignedInt
+                    self.p += 1;
                 }
-            }
-            TokenKind::Unsigned => {
-                self.p += 1;
-                if self.take(&TokenKind::CharKw) {
-                    Type::UnsignedChar
-                } else if self.take(&TokenKind::Short) {
-                    Type::UnsignedShort
-                } else if self.take(&TokenKind::Long) {
-                    if self.take(&TokenKind::Long) {
-                        Type::UnsignedLongLong
-                    } else {
-                        Type::UnsignedLong
+                if longs == 1
+                    && !signed
+                    && !unsigned
+                    && !short
+                    && !saw_int
+                    && self.take(&TokenKind::Double)
+                {
+                    return Ok(Type::LongDouble);
+                }
+                if saw_char {
+                    return match (signed, unsigned, short, longs, saw_int) {
+                        (true, false, false, 0, false) => Ok(Type::SignedChar),
+                        (false, true, false, 0, false) => Ok(Type::UnsignedChar),
+                        (false, false, false, 0, false) => Ok(Type::Char),
+                        _ => Err(Diagnostic::error(
+                            "invalid character type specifiers",
+                            Some(self.cur_span()),
+                        )),
+                    };
+                }
+                match (unsigned, short, longs) {
+                    (true, true, 0) => Type::UnsignedShort,
+                    (false, true, 0) => Type::Short,
+                    (true, false, 1) => Type::UnsignedLong,
+                    (false, false, 1) => Type::Long,
+                    (true, false, 2) => Type::UnsignedLongLong,
+                    (false, false, 2) => Type::LongLong,
+                    (true, false, 0) => Type::UnsignedInt,
+                    (false, false, 0) if signed => Type::SignedInt,
+                    (false, false, 0) => Type::Int,
+                    _ => {
+                        return Err(Diagnostic::error(
+                            "invalid integer type specifiers",
+                            Some(self.cur_span()),
+                        ))
                     }
-                } else {
-                    self.take(&TokenKind::Int);
-                    Type::UnsignedInt
-                }
-            }
-            TokenKind::Short => {
-                self.p += 1;
-                Type::Short
-            }
-            TokenKind::Long => {
-                self.p += 1;
-                if self.take(&TokenKind::Double) {
-                    Type::LongDouble
-                } else if self.take(&TokenKind::Long) {
-                    Type::LongLong
-                } else {
-                    Type::Long
                 }
             }
             TokenKind::Float => {
@@ -213,10 +224,6 @@ impl Parser {
             TokenKind::Bool => {
                 self.p += 1;
                 Type::Bool
-            }
-            TokenKind::CharKw => {
-                self.p += 1;
-                Type::Char
             }
             TokenKind::Ident(name) if self.aliases.contains_key(name) => {
                 let ty = self.aliases.get(name).cloned().unwrap();

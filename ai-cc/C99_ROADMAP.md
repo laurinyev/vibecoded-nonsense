@@ -89,6 +89,8 @@ Keep `#pragma once` as an extension, but do not use it as a substitute for stand
 
 Replace the current “one name per declaration” parser with C99 declaration-specifier and declarator parsing:
 
+Progress: the parser accepts varied orderings of integer and character type specifiers (for example, `long unsigned`, `int long unsigned`, and `char unsigned`). This is only a partial step; qualifiers and storage-class specifiers in arbitrary order, multiple declarators, and the declarator forms below remain outstanding.
+
 - Arbitrary declaration-specifier ordering.
 - Multiple declarators per declaration.
 - Nested declarators.

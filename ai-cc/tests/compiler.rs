@@ -147,6 +147,12 @@ fn lexical_c99_basics() {
 }
 
 #[test]
+fn integer_declaration_specifiers_allow_c99_ordering() {
+    let source = "int main(void) { unsigned long a = 1; long unsigned b = 2; int long unsigned c = 3; signed short int d = 4; short signed e = 5; char unsigned f = 6; signed char g = 7; long double h; return a + b + c + d + e + f + g; }";
+    ai_cc::compile_preprocessed(source, "declaration-specifiers.c").unwrap();
+}
+
+#[test]
 fn lexer_recognizes_c99_keywords_punctuator_and_integer_radices() {
     use ai_cc::lex::TokenKind as K;
     let tokens = ai_cc::lex::Lexer::new(
