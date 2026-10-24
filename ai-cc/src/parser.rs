@@ -4,6 +4,13 @@ use crate::{
     lex::{Token, TokenKind},
 };
 use std::collections::HashMap;
+
+#[derive(Clone, Copy)]
+enum DeclaratorOp {
+    Pointer,
+    Array(Option<usize>),
+}
+
 pub struct Parser {
     t: Vec<Token>,
     p: usize,
@@ -495,21 +502,50 @@ impl Parser {
     fn declaration(&mut self) -> Result<Stmt, Diagnostic> {
         let start = self.cur_span().start;
         let ty = self.typ()?;
-        let (n, ty) = self.declarator(ty)?;
-        let x = if self.take(&TokenKind::Assign) {
-            Some(self.expr()?)
-        } else {
-            None
-        };
+        let mut declarations = Vec::new();
+        loop {
+            let (n, declared_ty) = self.declarator(ty.clone())?;
+            let init = if self.take(&TokenKind::Assign) {
+                Some(self.assign()?)
+            } else {
+                None
+            };
+            declarations.push((n, declared_ty, init));
+            if !self.take(&TokenKind::Comma) {
+                break;
+            }
+        }
         self.expect(&TokenKind::Semicolon)?;
-        Ok(Stmt::Decl(n, ty, x, self.span_from(start)))
+        if declarations.len() == 1 {
+            let (name, ty, init) = declarations.pop().unwrap();
+            Ok(Stmt::Decl(name, ty, init, self.span_from(start)))
+        } else {
+            Ok(Stmt::Decls(declarations, self.span_from(start)))
+        }
     }
     fn declarator(&mut self, mut ty: Type) -> Result<(String, Type), Diagnostic> {
-        while self.take(&TokenKind::Star) {
-            ty = Type::Pointer(Box::new(ty));
+        let (name, ops) = self.declarator_ops()?;
+        for op in ops.into_iter().rev() {
+            ty = match op {
+                DeclaratorOp::Pointer => Type::Pointer(Box::new(ty)),
+                DeclaratorOp::Array(size) => Type::Array(Box::new(ty), size),
+            };
         }
-        let n = self.ident()?;
-        let mut arrays = Vec::new();
+        Ok((name, ty))
+    }
+
+    fn declarator_ops(&mut self) -> Result<(String, Vec<DeclaratorOp>), Diagnostic> {
+        let mut pointers = 0;
+        while self.take(&TokenKind::Star) {
+            pointers += 1;
+        }
+        let (name, mut ops) = if self.take(&TokenKind::LParen) {
+            let inner = self.declarator_ops()?;
+            self.expect(&TokenKind::RParen)?;
+            inner
+        } else {
+            (self.ident()?, Vec::new())
+        };
         while self.take(&TokenKind::LBracket) {
             let size = if let TokenKind::Number(n) = self.cur().clone() {
                 self.p += 1;
@@ -518,12 +554,10 @@ impl Parser {
                 None
             };
             self.expect(&TokenKind::RBracket)?;
-            arrays.push(size);
+            ops.push(DeclaratorOp::Array(size));
         }
-        for size in arrays.into_iter().rev() {
-            ty = Type::Array(Box::new(ty), size);
-        }
-        Ok((n, ty))
+        ops.extend((0..pointers).map(|_| DeclaratorOp::Pointer));
+        Ok((name, ops))
     }
     fn expr(&mut self) -> Result<Expr, Diagnostic> {
         let mut x = self.assign()?;

@@ -89,13 +89,13 @@ Keep `#pragma once` as an extension, but do not use it as a substitute for stand
 
 Replace the current “one name per declaration” parser with C99 declaration-specifier and declarator parsing:
 
-Progress: the parser accepts varied orderings of integer and character type specifiers (for example, `long unsigned`, `int long unsigned`, and `char unsigned`). This is only a partial step; qualifiers and storage-class specifiers in arbitrary order, multiple declarators, and the declarator forms below remain outstanding.
+Progress: the parser accepts varied orderings of integer and character type specifiers, multiple local declarators with assignment initializers, parenthesized pointer/array declarators (including pointers to arrays), and function prototypes with parameter lists. This is partial coverage: fully arbitrary specifier ordering, nested function declarators/function pointers, storage classes, block-scope typedefs, VLAs, type names, and old-style declarations remain outstanding.
 
 - Arbitrary declaration-specifier ordering.
-- Multiple declarators per declaration.
-- Nested declarators.
-- Function declarators and prototype parameter lists.
-- Function pointers and pointers to arrays.
+- Multiple declarators per declaration (local declarations only; file-scope objects remain unsupported).
+- Fully nested declarators, including function declarators.
+- Function declarators and prototype parameter lists (basic prototypes are supported; remaining declarator forms are outstanding).
+- Function pointers (pointers to arrays are supported).
 - Array qualifiers, `static` array bounds, and variable-length arrays.
 - Type names for casts, `sizeof`, and compound literals.
 - `extern`, `static`, `auto`, `register`, and `inline`.

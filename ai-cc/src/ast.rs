@@ -54,6 +54,7 @@ pub struct Block {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Decl(String, Type, Option<Expr>, Span),
+    Decls(Vec<(String, Type, Option<Expr>)>, Span),
     Expr(Expr, Span),
     Return(Option<Expr>, Span),
     Block(Block, Span),
@@ -75,6 +76,7 @@ impl Stmt {
     pub fn span(&self) -> Span {
         match self {
             Self::Decl(_, _, _, span)
+            | Self::Decls(_, span)
             | Self::Expr(_, span)
             | Self::Return(_, span)
             | Self::Block(_, span)

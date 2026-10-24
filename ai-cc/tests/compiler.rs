@@ -153,6 +153,32 @@ fn integer_declaration_specifiers_allow_c99_ordering() {
 }
 
 #[test]
+fn local_declaration_supports_multiple_declarators_and_initializers() {
+    let source = "int main(void) { int a = 2, b = a + 3, *p, (*row)[3]; p = &b; return *p; }";
+    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    let ast = parser.parse_translation_unit().unwrap();
+    let ai_cc::ast::Stmt::Decls(declarations, _) = &ast.items[0].body.stmts[0] else {
+        panic!("expected declaration group");
+    };
+    assert_eq!(declarations.len(), 4);
+    assert_eq!(
+        declarations[3].1,
+        ai_cc::ast::Type::Pointer(Box::new(ai_cc::ast::Type::Array(
+            Box::new(ai_cc::ast::Type::Int),
+            Some(3)
+        )))
+    );
+    ai_cc::compile_preprocessed(source, "multiple-declarators.c").unwrap();
+}
+
+#[test]
+fn function_prototype_parameter_list_is_accepted() {
+    let source = "int add(int left, int right); int main(void) { return add(2, 3); }";
+    ai_cc::compile_preprocessed(source, "function-prototype.c").unwrap();
+}
+
+#[test]
 fn lexer_recognizes_c99_keywords_punctuator_and_integer_radices() {
     use ai_cc::lex::TokenKind as K;
     let tokens = ai_cc::lex::Lexer::new(

@@ -122,6 +122,26 @@ impl Sema {
                     }
                 }
             }
+            Stmt::Decls(declarations, _) => {
+                for (n, t, x) in declarations {
+                    if !self.valid_object_type(t) {
+                        self.errs.push(Diagnostic::error(
+                            format!("invalid object type for {}", n),
+                            Some(span),
+                        ));
+                    }
+                    self.add(n, t, span);
+                    if let Some(e) = x {
+                        let init = self.expr(e, span);
+                        if !Self::compatible(t, &init) && !matches!(t, Type::Array(_, _)) {
+                            self.errs.push(Diagnostic::error(
+                                format!("initializer is incompatible with {}", Self::describe(t)),
+                                Some(span),
+                            ));
+                        }
+                    }
+                }
+            }
             Stmt::Expr(e, _) => {
                 self.expr(e, span);
             }

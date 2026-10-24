@@ -355,6 +355,20 @@ impl Lowerer {
                     v.push(Instr::Store(x, addr, ty.clone()));
                 }
             }
+            Stmt::Decls(declarations, _) => {
+                for (n, ty, init) in declarations {
+                    let slot = format!("%slot_{}", n);
+                    let size = Self::size(ty).max(1);
+                    self.vars.insert(n.clone(), ty.clone());
+                    self.slots.insert(n.clone(), slot.clone());
+                    v.push(Instr::Alloc(slot, size));
+                    if let Some(e) = init {
+                        let x = self.expr(e, v);
+                        let addr = self.lvalue_addr(&Expr::Var(n.clone()), v);
+                        v.push(Instr::Store(x, addr, ty.clone()));
+                    }
+                }
+            }
             Stmt::Expr(e, _) => {
                 self.expr(e, v);
             }
