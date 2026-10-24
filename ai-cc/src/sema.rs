@@ -69,6 +69,22 @@ impl Sema {
             }
         }
 
+        for f in &ast.items {
+            if self.syms.lookup_current_scope(&f.name).is_none() {
+                let ty = Type::Function(
+                    Box::new(f.ret.clone()),
+                    f.params.iter().map(|(_, ty)| ty.clone()).collect(),
+                    f.is_variadic,
+                    !f.params_unspecified,
+                );
+                let _ = self.syms.insert(Symbol {
+                    name: f.name.clone(),
+                    ty,
+                    is_register: false,
+                });
+            }
+        }
+
         for declaration in &mut ast.declarations {
             if let Some(previous) = self.syms.lookup_current_scope(&declaration.name) {
                 if !Self::compatible(&previous.ty, &declaration.ty) {
@@ -87,7 +103,7 @@ impl Sema {
             }
             if let Some(initializer) = &mut declaration.initializer {
                 self.check_initializer(&mut declaration.ty, initializer, declaration.span);
-                if !Self::constant_initializer_list(initializer) {
+                if !self.constant_initializer_list(initializer) {
                     self.errs.push(Diagnostic::error(
                         "file-scope initializer is not a supported constant expression",
                         Some(declaration.span),
@@ -259,9 +275,9 @@ impl Sema {
                         ));
                     }
                     if *storage == StorageClass::Static
-                        && init.as_ref().is_some_and(|initializer| {
-                            !Self::constant_initializer_list(initializer)
-                        })
+                        && init
+                            .as_ref()
+                            .is_some_and(|initializer| !self.constant_initializer_list(initializer))
                     {
                         self.errs.push(Diagnostic::error(
                             "static local initializer must be a constant expression",
@@ -326,7 +342,7 @@ impl Sema {
             }
             Stmt::Return(e, _) => match (self.current_ret.clone(), e) {
                 (Some(ret), Some(e)) => {
-                    let got = self.expr(e, span);
+                    let got = Self::decay(&self.expr(e, span));
                     if matches!(Self::unqualified(&ret), Type::Void) {
                         self.errs.push(Diagnostic::error(
                             "void function cannot return a value",
@@ -421,7 +437,7 @@ impl Sema {
                 }),
             Expr::Assign(target, value) => {
                 let target_ty = self.expr(target, span);
-                let value_ty = self.expr(value, span);
+                let value_ty = Self::decay(&self.expr(value, span));
                 if !self.is_modifiable_lvalue(target) {
                     self.errs.push(Diagnostic::error(
                         "assignment requires a modifiable lvalue",
@@ -441,8 +457,8 @@ impl Sema {
                 target_ty
             }
             Expr::Binary(op, a, b) => {
-                let left = self.expr(a, span);
-                let right = self.expr(b, span);
+                let left = Self::decay(&self.expr(a, span));
+                let right = Self::decay(&self.expr(b, span));
                 match op {
                     BinOp::Comma => right,
                     BinOp::And | BinOp::Or => {
@@ -605,7 +621,7 @@ impl Sema {
                 }
             }
             Expr::Cast(target, value) => {
-                let source = self.expr(value, span);
+                let source = Self::decay(&self.expr(value, span));
                 if !matches!(Self::unqualified(target), Type::Void)
                     && !(Self::arithmetic(target) && Self::arithmetic(&source))
                     && !(Self::pointer_like(target)
@@ -661,59 +677,25 @@ impl Sema {
                 ty.clone()
             }
             Expr::Call(n, args) => {
-                let arg_types: Vec<_> = args.iter_mut().map(|x| self.expr(x, span)).collect();
-                match self.syms.lookup(n).map(|x| x.ty.clone()) {
-                    Some(Type::Function(ret, params, variadic, has_prototype)) => {
-                        if has_prototype
-                            && ((!variadic && params.len() != arg_types.len())
-                                || (variadic && params.len() > arg_types.len()))
-                        {
-                            self.errs.push(Diagnostic::error(
-                                format!(
-                                    "function {} expects {} argument(s), got {}",
-                                    n,
-                                    params.len(),
-                                    arg_types.len()
-                                ),
-                                Some(span),
-                            ));
-                        }
-                        if has_prototype {
-                            for (index, (expected, got)) in
-                                params.iter().zip(arg_types.iter()).enumerate()
-                            {
-                                if !Self::compatible(expected, got) {
-                                    self.errs.push(Diagnostic::error(
-                                        format!(
-                                            "argument {} to {} has incompatible type",
-                                            index + 1,
-                                            n
-                                        ),
-                                        Some(span),
-                                    ));
-                                }
-                            }
-                        }
-                        *ret
+                if let Some(ty) = self.syms.lookup(n).map(|symbol| symbol.ty.clone()) {
+                    self.finish_call(n, &ty, args, span)
+                } else {
+                    for arg in args.iter_mut() {
+                        self.expr(arg, span);
                     }
-                    Some(_) => {
-                        self.errs.push(Diagnostic::error(
-                            format!("{} is not a function", n),
-                            Some(span),
-                        ));
-                        Type::Int
-                    }
-                    None => {
-                        // Keep the existing external-call extension for hosted libc symbols.
-                        Type::Int
-                    }
+                    // Keep the existing external-call extension for hosted libc symbols.
+                    Type::Int
                 }
+            }
+            Expr::IndirectCall(callee, args) => {
+                let ty = self.expr(callee, span);
+                self.finish_call("called expression", &ty, args, span)
             }
             Expr::Conditional(condition, yes, no) => {
                 let condition_ty = self.expr(condition, span);
                 self.require_scalar(&condition_ty, "conditional condition", span);
-                let yes_ty = self.expr(yes, span);
-                let no_ty = self.expr(no, span);
+                let yes_ty = Self::decay(&self.expr(yes, span));
+                let no_ty = Self::decay(&self.expr(no, span));
                 if !Self::compatible(&yes_ty, &no_ty) {
                     self.errs.push(Diagnostic::error(
                         "conditional operands have incompatible types",
@@ -805,7 +787,7 @@ impl Sema {
         span: crate::diag::Span,
     ) {
         Self::infer_array_bound(target, expr, &mut self.errs, span);
-        let got = self.expr(expr, span);
+        let got = Self::decay(&self.expr(expr, span));
         let null_pointer =
             Self::pointer_like(target) && Self::integer(&got) && matches!(expr, Expr::Int(0));
         if !Self::compatible(target, &got)
@@ -1241,8 +1223,12 @@ impl Sema {
         }
     }
 
-    fn is_constant_initializer(expr: &Expr) -> bool {
+    fn is_constant_initializer(&self, expr: &Expr) -> bool {
         match expr {
+            Expr::Var(name) => self
+                .syms
+                .lookup(name)
+                .is_some_and(|symbol| matches!(Self::unqualified(&symbol.ty), Type::Function(..))),
             Expr::Int(_)
             | Expr::Float(_, _)
             | Expr::Complex(_, _, _)
@@ -1250,33 +1236,33 @@ impl Sema {
             | Expr::String(_) => true,
             Expr::Cast(_, value)
             | Expr::Unary(UnOp::Neg | UnOp::Pos | UnOp::Not | UnOp::BitNot, value) => {
-                Self::is_constant_initializer(value)
+                self.is_constant_initializer(value)
             }
             Expr::Binary(op, left, right) if *op != BinOp::Comma => {
-                Self::is_constant_initializer(left) && Self::is_constant_initializer(right)
+                self.is_constant_initializer(left) && self.is_constant_initializer(right)
             }
             Expr::Conditional(condition, yes, no) => {
-                Self::is_constant_initializer(condition)
-                    && Self::is_constant_initializer(yes)
-                    && Self::is_constant_initializer(no)
+                self.is_constant_initializer(condition)
+                    && self.is_constant_initializer(yes)
+                    && self.is_constant_initializer(no)
             }
             Expr::Unary(UnOp::Address, value) => {
                 matches!(&**value, Expr::Var(_))
-                    || matches!(&**value, Expr::CompoundLiteral(_, initializer) if Self::constant_initializer_list(initializer))
+                    || matches!(&**value, Expr::CompoundLiteral(_, initializer) if self.constant_initializer_list(initializer))
             }
-            Expr::CompoundLiteral(_, initializer) => Self::constant_initializer_list(initializer),
+            Expr::CompoundLiteral(_, initializer) => self.constant_initializer_list(initializer),
             _ => false,
         }
     }
 
-    fn constant_initializer_list(initializer: &Initializer) -> bool {
+    fn constant_initializer_list(&self, initializer: &Initializer) -> bool {
         match initializer {
-            Initializer::Expr(expr) => Self::is_constant_initializer(expr),
+            Initializer::Expr(expr) => self.is_constant_initializer(expr),
             Initializer::List(items) => items.iter().all(|item| {
                 item.designators.iter().all(|designator| match designator {
-                    Designator::Index(expr) => Self::is_constant_initializer(expr),
+                    Designator::Index(expr) => self.is_constant_initializer(expr),
                     Designator::Member(_) => true,
-                }) && Self::constant_initializer_list(&item.value)
+                }) && self.constant_initializer_list(&item.value)
             }),
         }
     }
@@ -1337,6 +1323,67 @@ impl Sema {
         ) && !Self::top_const(&ty)
     }
 
+    fn finish_call(
+        &mut self,
+        label: &str,
+        ty: &Type,
+        args: &mut [Expr],
+        span: crate::diag::Span,
+    ) -> Type {
+        let arg_types: Vec<_> = args
+            .iter_mut()
+            .map(|arg| Self::decay(&self.expr(arg, span)))
+            .collect();
+        let function = match Self::unqualified(ty) {
+            function @ Type::Function(_, _, _, _) => function,
+            Type::Pointer(inner) => match Self::unqualified(&inner) {
+                function @ Type::Function(_, _, _, _) => function,
+                _ => {
+                    self.errs.push(Diagnostic::error(
+                        format!("{} is not a function", label),
+                        Some(span),
+                    ));
+                    return Type::Int;
+                }
+            },
+            _ => {
+                self.errs.push(Diagnostic::error(
+                    format!("{} is not a function", label),
+                    Some(span),
+                ));
+                return Type::Int;
+            }
+        };
+        let Type::Function(ret, params, variadic, has_prototype) = function else {
+            unreachable!()
+        };
+        if has_prototype
+            && ((!variadic && params.len() != arg_types.len())
+                || (variadic && params.len() > arg_types.len()))
+        {
+            self.errs.push(Diagnostic::error(
+                format!(
+                    "function {} expects {} argument(s), got {}",
+                    label,
+                    params.len(),
+                    arg_types.len()
+                ),
+                Some(span),
+            ));
+        }
+        if has_prototype {
+            for (index, (expected, got)) in params.iter().zip(arg_types.iter()).enumerate() {
+                if !Self::compatible(expected, got) {
+                    self.errs.push(Diagnostic::error(
+                        format!("argument {} to {} has incompatible type", index + 1, label),
+                        Some(span),
+                    ));
+                }
+            }
+        }
+        *ret
+    }
+
     fn expr_type(&self, e: &Expr) -> Type {
         match e {
             Expr::Int(_) | Expr::Char(_) => Type::Int,
@@ -1379,9 +1426,10 @@ impl Sema {
             },
             Expr::Unary(_, x) => self.expr_type(x),
             Expr::Call(n, _) => match self.syms.lookup(n).map(|x| x.ty.clone()) {
-                Some(Type::Function(ret, _, _, _)) => *ret,
-                _ => Type::Int,
+                Some(ty) => Self::call_return_type(&ty),
+                None => Type::Int,
             },
+            Expr::IndirectCall(callee, _) => Self::call_return_type(&self.expr_type(callee)),
             Expr::Conditional(_, yes, no) => {
                 let yes = self.expr_type(yes);
                 let no = self.expr_type(no);
@@ -1515,6 +1563,24 @@ impl Sema {
         match t {
             Type::Qualified(inner, _) => Self::unqualified(inner),
             _ => t.clone(),
+        }
+    }
+
+    fn decay(t: &Type) -> Type {
+        match Self::unqualified(t) {
+            Type::Function(_, _, _, _) => Type::Pointer(Box::new(t.clone())),
+            _ => t.clone(),
+        }
+    }
+
+    fn call_return_type(t: &Type) -> Type {
+        match Self::unqualified(t) {
+            Type::Function(ret, _, _, _) => *ret,
+            Type::Pointer(inner) => match Self::unqualified(&inner) {
+                Type::Function(ret, _, _, _) => *ret,
+                _ => Type::Int,
+            },
+            _ => Type::Int,
         }
     }
 

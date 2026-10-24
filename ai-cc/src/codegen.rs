@@ -173,6 +173,9 @@ impl QbeCodegen {
                     }
                     Instr::Const(n, v) => o += &format!("{} =w copy {}\n", n, v),
                     Instr::ConstLong(n, v) => o += &format!("{} =l copy {}\n", n, v),
+                    Instr::FuncAddr(n, name) => {
+                        o += &format!("{} =l copy ${}\n", n, name);
+                    }
                     Instr::ConstFloat(n, v, ty) => {
                         let qbe_ty = Self::ty(ty);
                         let literal = Self::float_literal(*v, ty);
@@ -327,7 +330,8 @@ impl QbeCodegen {
                             }
                         }
                     }
-                    Instr::Call(dst, name, args, fixed, ret) => {
+                    Instr::Call(dst, name, args, fixed, ret)
+                    | Instr::CallIndirect(dst, name, args, fixed, ret) => {
                         let rendered = args
                             .iter()
                             .map(|(x, t)| format!("{} {}", Self::abi_ty(t), x))
@@ -340,16 +344,21 @@ impl QbeCodegen {
                         } else {
                             rendered.join(", ")
                         };
+                        let target = if name.starts_with('$') || name.starts_with('%') {
+                            name.clone()
+                        } else {
+                            format!("${}", name)
+                        };
                         if let Some(dst) = dst {
                             o += &format!(
-                                "{} ={} call ${}({})\n",
+                                "{} ={} call {}({})\n",
                                 dst,
                                 Self::abi_ty(ret),
-                                name,
+                                target,
                                 args
                             );
                         } else {
-                            o += &format!("call ${}({})\n", name, args);
+                            o += &format!("call {}({})\n", target, args);
                         }
                     }
                     Instr::VaStart(ap) => {

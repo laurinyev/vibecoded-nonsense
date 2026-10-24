@@ -289,6 +289,17 @@ fn compound_literals() {
 }
 
 #[test]
+fn function_pointers() {
+    let path = root().join("tests/conformance/valid/function-pointers.c");
+    let work = temp_dir("function-pointers");
+    let executable = work.join("ai-program");
+    compile_ai(&path, &executable);
+    let output = run_sandboxed(&executable, &work);
+    assert_eq!(output.status.code(), Some(0));
+    let _ = fs::remove_dir_all(work);
+}
+
+#[test]
 fn string_arrays() {
     let path = root().join("tests/conformance/valid/string-array-initialization.c");
     let work = temp_dir("string-array-initialization");

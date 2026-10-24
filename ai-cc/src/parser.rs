@@ -169,7 +169,7 @@ impl Parser {
                 while *self.cur() != TokenKind::RBrace && *self.cur() != TokenKind::End {
                     let base = self.typ()?;
                     loop {
-                        let (name, ft) = self.declarator(base.clone())?;
+                        let (name, ft) = self.declarator_full(base.clone())?;
                         let bit_width = if self.take(&TokenKind::Colon) {
                             let width_expr = self.assign()?;
                             let width = Self::integer_constant(&width_expr).ok_or_else(|| {
@@ -2183,6 +2183,20 @@ impl Parser {
                 let index = self.expr()?;
                 self.expect(&TokenKind::RBracket)?;
                 x = Expr::Subscript(Box::new(x), Box::new(index));
+                continue;
+            }
+            if self.take(&TokenKind::LParen) {
+                let mut arguments = Vec::new();
+                if *self.cur() != TokenKind::RParen {
+                    loop {
+                        arguments.push(self.assign()?);
+                        if !self.take(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+                x = Expr::IndirectCall(Box::new(x), arguments);
                 continue;
             }
             let arrow = self.take(&TokenKind::Arrow);

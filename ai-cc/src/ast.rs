@@ -158,6 +158,7 @@ pub enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     Call(String, Vec<Expr>),
+    IndirectCall(Box<Expr>, Vec<Expr>),
     Conditional(Box<Expr>, Box<Expr>, Box<Expr>),
     Member(Box<Expr>, String, bool),
     Subscript(Box<Expr>, Box<Expr>),

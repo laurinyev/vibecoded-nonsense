@@ -42,6 +42,7 @@ pub enum Instr {
     AllocVla(String, String, usize),
     Const(String, i64),
     ConstLong(String, i64),
+    FuncAddr(String, String),
     ConstFloat(String, f64, Type),
     Move(String, String, Type),
     Load(String, String, Type),
@@ -54,6 +55,13 @@ pub enum Instr {
     FloatBin(String, BinOp, String, String, Type),
     Convert(String, String, Type, Type),
     Call(
+        Option<String>,
+        String,
+        Vec<(String, Type)>,
+        Option<usize>,
+        Type,
+    ),
+    CallIndirect(
         Option<String>,
         String,
         Vec<(String, Type)>,
@@ -314,11 +322,15 @@ impl Lowerer {
             Expr::VaStart(_) | Expr::VaEnd(_) | Expr::VaCopy(_, _) => Type::Void,
             Expr::VaArg(_, ty) => ty.clone(),
             Expr::String(_) => Type::Pointer(Box::new(Type::Char)),
-            Expr::Var(n) => self
-                .vars
-                .get(n)
-                .map(|ty| self.resolve_tags(ty))
-                .unwrap_or(Type::Int),
+            Expr::Var(n) => {
+                if let Some(ty) = self.vars.get(n) {
+                    self.resolve_tags(ty)
+                } else if let Some((ret, params, variadic)) = self.functions.get(n) {
+                    Type::Function(Box::new(ret.clone()), params.clone(), *variadic, true)
+                } else {
+                    Type::Int
+                }
+            }
             Expr::Assign(x, _) => self.type_of(x),
             Expr::Unary(UnOp::Address, x) => Type::Pointer(Box::new(self.type_of(x))),
             Expr::Unary(UnOp::Deref, x) => Self::pointee(&self.type_of(x)).unwrap_or(Type::Int),
@@ -369,6 +381,10 @@ impl Lowerer {
                 .functions
                 .get(n)
                 .map(|x| x.0.clone())
+                .unwrap_or(Type::Int),
+            Expr::IndirectCall(callee, _) => self
+                .function_signature(&self.type_of(callee))
+                .map(|x| x.0)
                 .unwrap_or(Type::Int),
             Expr::Member(x, name, arrow) => {
                 let base = if *arrow {
@@ -454,11 +470,17 @@ impl Lowerer {
     fn lvalue_addr(&mut self, e: &Expr, v: &mut Vec<Instr>) -> String {
         match e {
             Expr::CompoundLiteral(ty, values) => self.compound_literal_addr(ty, values, v),
-            Expr::Var(n) => self
-                .slots
-                .get(n)
-                .cloned()
-                .unwrap_or_else(|| format!("%{}", n)),
+            Expr::Var(n) => {
+                if let Some(slot) = self.slots.get(n) {
+                    slot.clone()
+                } else if self.functions.contains_key(n) {
+                    let out = self.tmp();
+                    v.push(Instr::FuncAddr(out.clone(), n.clone()));
+                    out
+                } else {
+                    format!("%{}", n)
+                }
+            }
             Expr::Unary(UnOp::Deref, x) => self.expr(x, v),
             Expr::Member(x, name, arrow) => {
                 let base_type = if *arrow {
@@ -937,11 +959,7 @@ impl Lowerer {
                     self.zero_object(&layout.ty, addr, v);
                 }
             }
-            _ => {
-                let zero = self.tmp();
-                v.push(Instr::Const(zero.clone(), 0));
-                v.push(Instr::Store(zero, addr.to_owned(), ty.clone()));
-            }
+            _ => self.zero_storage(addr.to_owned(), Self::size(ty).max(1), v),
         }
     }
 
@@ -1147,6 +1165,49 @@ impl Lowerer {
         self.store_bitfield(layout, value, addr, v);
     }
 
+    fn function_signature(&self, ty: &Type) -> Option<(Type, Vec<Type>, bool)> {
+        match Self::scalar(ty) {
+            Type::Function(ret, params, variadic, _) => Some((*ret, params, variadic)),
+            Type::Pointer(inner) => match Self::scalar(&inner) {
+                Type::Function(ret, params, variadic, _) => Some((*ret, params, variadic)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn call_arguments(
+        &mut self,
+        args: &[Expr],
+        params: &[Type],
+        v: &mut Vec<Instr>,
+    ) -> Vec<(String, Type)> {
+        let mut values = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            if i < params.len() {
+                let ty = params[i].clone();
+                let value = self.expr_as(arg, &ty, v);
+                values.push((value, ty));
+            } else {
+                let mut ty = self.type_of(arg);
+                let mut value = self.expr(arg, v);
+                if matches!(Self::scalar(&ty), Type::Float) {
+                    let promoted = self.tmp();
+                    v.push(Instr::Convert(
+                        promoted.clone(),
+                        value,
+                        ty.clone(),
+                        Type::Double,
+                    ));
+                    value = promoted;
+                    ty = Type::Double;
+                }
+                values.push((value, ty));
+            }
+        }
+        values
+    }
+
     fn expr(&mut self, e: &Expr, v: &mut Vec<Instr>) -> String {
         match e {
             Expr::Int(n) => {
@@ -1209,6 +1270,11 @@ impl Lowerer {
                 v.push(Instr::Load(out.clone(), addr, ty));
                 out
             }
+            Expr::Var(n) if !self.vars.contains_key(n) && self.functions.contains_key(n) => {
+                let out = self.tmp();
+                v.push(Instr::FuncAddr(out.clone(), n.clone()));
+                out
+            }
             Expr::Var(_) | Expr::Subscript(_, _) => {
                 let ty = self.type_of(e);
                 if matches!(Self::scalar(&ty), Type::Array(_, _, _) | Type::Vla(_, _))
@@ -1245,6 +1311,9 @@ impl Lowerer {
             Expr::Unary(UnOp::Deref, e) => {
                 let ty = self.type_of(e);
                 let addr = self.expr(e, v);
+                if matches!(Self::pointee(&ty), Some(Type::Function(_, _, _, _))) {
+                    return addr;
+                }
                 if Self::is_complex(&ty) {
                     return addr;
                 }
@@ -1449,41 +1518,51 @@ impl Lowerer {
                 "0".into()
             }
             Expr::Call(n, args) => {
-                let (ret, params, variadic) =
-                    self.functions
-                        .get(n)
-                        .cloned()
-                        .unwrap_or((Type::Int, Vec::new(), false));
-                let mut values = Vec::new();
-                for (i, arg) in args.iter().enumerate() {
-                    if i < params.len() {
-                        let ty = params[i].clone();
-                        let value = self.expr_as(arg, &ty, v);
-                        values.push((value, ty));
-                    } else {
-                        let mut ty = self.type_of(arg);
-                        let mut value = self.expr(arg, v);
-                        if matches!(Self::scalar(&ty), Type::Float) {
-                            let promoted = self.tmp();
-                            v.push(Instr::Convert(
-                                promoted.clone(),
-                                value,
-                                ty.clone(),
-                                Type::Double,
-                            ));
-                            value = promoted;
-                            ty = Type::Double;
-                        }
-                        values.push((value, ty));
+                if let Some(ty) = self.vars.get(n).cloned() {
+                    if let Some((ret, params, variadic)) = self.function_signature(&ty) {
+                        let callee = self.expr(&Expr::Var(n.clone()), v);
+                        let values = self.call_arguments(args, &params, v);
+                        let dst = if matches!(Self::scalar(&ret), Type::Void) {
+                            None
+                        } else {
+                            Some(self.tmp())
+                        };
+                        let fixed = if variadic { Some(params.len()) } else { None };
+                        v.push(Instr::CallIndirect(dst.clone(), callee, values, fixed, ret));
+                        return dst.unwrap_or_else(|| "0".into());
                     }
                 }
+                if let Some((ret, params, variadic)) = self.functions.get(n).cloned() {
+                    let values = self.call_arguments(args, &params, v);
+                    let dst = if matches!(Self::scalar(&ret), Type::Void) {
+                        None
+                    } else {
+                        Some(self.tmp())
+                    };
+                    let fixed = if variadic { Some(params.len()) } else { None };
+                    v.push(Instr::Call(dst.clone(), n.clone(), values, fixed, ret));
+                    return dst.unwrap_or_else(|| "0".into());
+                }
+                let ret = Type::Int;
+                let values = self.call_arguments(args, &[], v);
+                let dst = self.tmp();
+                v.push(Instr::Call(Some(dst.clone()), n.clone(), values, None, ret));
+                dst
+            }
+            Expr::IndirectCall(callee, args) => {
+                let ty = self.type_of(callee);
+                let (ret, params, variadic) =
+                    self.function_signature(&ty)
+                        .unwrap_or((Type::Int, Vec::new(), false));
+                let callee = self.expr(callee, v);
+                let values = self.call_arguments(args, &params, v);
                 let dst = if matches!(Self::scalar(&ret), Type::Void) {
                     None
                 } else {
                     Some(self.tmp())
                 };
                 let fixed = if variadic { Some(params.len()) } else { None };
-                v.push(Instr::Call(dst.clone(), n.clone(), values, fixed, ret));
+                v.push(Instr::CallIndirect(dst.clone(), callee, values, fixed, ret));
                 dst.unwrap_or_else(|| "0".into())
             }
         }
@@ -1774,7 +1853,7 @@ impl Lowerer {
                                 let value = init
                                     .as_ref()
                                     .and_then(|initializer| {
-                                        Self::constant_data_value(initializer, &ty)
+                                        self.global_initializer_value(initializer, &ty).ok()
                                     })
                                     .unwrap_or_else(|| Self::zero_data_value(&ty));
                                 self.statics.push((symbol.clone(), ty.clone(), value));
@@ -1933,6 +2012,16 @@ impl Lowerer {
                 _ => {}
             }
         }
+        for f in &ast.items {
+            self.functions.insert(
+                f.name.clone(),
+                (
+                    f.ret.clone(),
+                    f.params.iter().map(|x| x.1.clone()).collect(),
+                    f.is_variadic,
+                ),
+            );
+        }
         for declaration in &ast.declarations {
             let declaration_ty = self.resolve_tags(&declaration.ty);
             if declaration.tentative_definition || declaration.initializer.is_some() {
@@ -1984,16 +2073,6 @@ impl Lowerer {
                         .push((declaration.name.clone(), declaration_ty, value, internal));
                 }
             }
-        }
-        for f in &ast.items {
-            self.functions.insert(
-                f.name.clone(),
-                (
-                    f.ret.clone(),
-                    f.params.iter().map(|x| x.1.clone()).collect(),
-                    f.is_variadic,
-                ),
-            );
         }
         let mut fs = Vec::new();
         for f in ast.items {
@@ -2609,26 +2688,6 @@ impl Lowerer {
         }
     }
 
-    fn constant_data_value(initializer: &Initializer, ty: &Type) -> Option<DataValue> {
-        match initializer {
-            Initializer::Expr(expr) => {
-                if Self::is_float(ty) {
-                    Self::constant_float_value(expr)
-                        .map(|value| DataValue::Float(value, Self::scalar(ty)))
-                } else {
-                    Self::constant_value(expr).ok().map(DataValue::Integer)
-                }
-            }
-            Initializer::List(items) => {
-                let item = items.first()?;
-                if !item.designators.is_empty() {
-                    return None;
-                }
-                Self::constant_data_value(&item.value, ty)
-            }
-        }
-    }
-
     fn constant_complex_value(expr: &Expr) -> Option<(f64, f64)> {
         match expr {
             Expr::Complex(real, imaginary, _) => Some((*real, *imaginary)),
@@ -2766,6 +2825,9 @@ impl Lowerer {
 
     fn global_value(&mut self, expr: &Expr, ty: &Type) -> Result<DataValue, ()> {
         match expr {
+            Expr::Var(name) if self.functions.contains_key(name) => {
+                Ok(DataValue::Address(name.clone()))
+            }
             Expr::Unary(UnOp::Address, value) => match &**value {
                 Expr::Var(name) => Ok(DataValue::Address(name.clone())),
                 Expr::CompoundLiteral(ty, initializer) => {

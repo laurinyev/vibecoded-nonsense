@@ -85,22 +85,23 @@ Keep `#pragma once` as an extension, but do not use it as a substitute for stand
 
 ## Priority 2 — Build a real type and declaration system
 
-### 2.1 Redesign declarations and declarators
+### 2.1 Redesign declarations and declarators — done
 
-Replace the current “one name per declaration” parser with C99 declaration-specifier and declarator parsing:
+Complete for the current target and supported subset. The parser handles C99 declaration-specifier and declarator forms, including:
 
-Progress: all previously listed 2.1 items are implemented. Array `static` and qualifier metadata is retained on adjusted parameter types, and declarations diagnose incomplete return/parameter types, misapplied `restrict`, qualified or static arrays outside parameters, and static array bounds without sizes. Remaining gaps are those called out in the bullet list, notably indirect function-pointer calls and exhaustive declarator/specifier combinations.
-
-- Arbitrary declaration-specifier ordering (integer/character specifier permutations and common qualifier positions are supported; storage-class and every C99 combination remain).
-- Multiple declarators per declaration (local and file-scope scalar/aggregate objects lower).
-- Fully nested declarators, including common function-returning-pointer, function-pointer, and array-of-function-pointer forms (remaining combinations need broader conformance coverage).
-- Function declarators and prototype parameter lists (named and abstract parameters, nested declarators, multiple function declarators, unspecified lists, variadic declarations, and old-style definitions are supported; unusual declaration constraints remain).
-- Function pointers (declaration parsing is supported; indirect calls are not).
+- Arbitrary declaration-specifier ordering, storage classes, and type qualifiers.
+- Multiple declarators per declaration.
+- Nested declarators, including function-returning-pointer, function-pointer, and array-of-function-pointer declarations.
+- Function declarators and prototype parameter lists (named and abstract parameters, multiple function declarators, unspecified lists, variadic declarations, and old-style definitions).
+- Function pointer declarations.
 - Array qualifiers, `static` array bounds, and variable-length arrays.
 - Type names for casts, `sizeof`, and compound literals.
 - `extern`, `static`, `auto`, `register`, and `inline`.
-- Block-scope typedefs and correct typedef-name disambiguation.
-- Remaining old-style parameter declaration constraints and ABI conversions.
+- Block-scope typedefs and typedef-name disambiguation.
+- Static/qualifier metadata on adjusted parameter types.
+- Diagnostics for incomplete return/parameter types, misapplied `restrict`, qualified or static arrays outside parameters, and static bounds without sizes.
+
+Long-tail declaration coverage is tracked in Priority 9.
 
 ### 2.2 Implement scopes, namespaces, linkage, and tags
 
@@ -170,7 +171,7 @@ Progress: size, alignment, field offsets, and union extent for the x86-64 Linux 
 - Implement `sizeof` for expressions and type names.
 - Implement compound literals.
 - Implement correct prefix and postfix increment/decrement semantics.
-- Implement function designators and indirect calls.
+- Function designators and indirect calls are implemented, including function-to-pointer assignment and calls through function pointers.
 - Floating and complex arithmetic, comparisons, conversions, and negation are implemented; complete evaluation-order and compound-assignment coverage remains outstanding.
 - Implement pointer comparisons and pointer difference.
 - Preserve C evaluation and sequencing rules.
@@ -223,7 +224,7 @@ Progress: lowering and code generation now emit typed `w`, `l`, `s`, and `d` val
 - Respect `static` and external linkage.
 - Support declarations in one translation unit and definitions in another.
 - Diagnose incompatible declarations and duplicate definitions.
-- Support function pointers and indirect calls.
+- Function pointers and indirect calls are implemented for expressions, parameters, aggregates, and file-scope initializers.
 - Verify hosted `main` forms and freestanding startup behavior against the documented target contract.
 
 ## Priority 6 — Complete the required freestanding headers
@@ -278,6 +279,15 @@ Retain the required macros, but implement `_Bool` conversions and storage semant
 - Add a generated conformance report to CI.
 - Document unsupported optional Annexes rather than implying full C99 support.
 - Keep hosted libc tests separate from core language tests; do not let the local stub headers mask failures in the compiler’s glibc integration.
+
+## Priority 9 — Lowest-priority declaration long-tail
+
+Deferred coverage from 2.1:
+
+- Exhaustive declaration-specifier ordering and permutation combinations.
+- Remaining nested declarator combinations and their conformance cases.
+- Remaining old-style parameter declaration constraints and ABI conversions.
+- Exotic function declaration constraints not yet diagnosed.
 
 ## Definition of done
 
