@@ -10,14 +10,12 @@ This workspace hosts multiple vibecoding projects at once. Treat each project as
 - Use repository root only for shared workspace documentation or configuration.
 
 ## Token Use
-
-- Use concise updates and outputs.
-- Inspect only files relevant to the current task.
-- Prefer `rg` and targeted reads over broad directory dumps.
-- Batch independent read-only checks.
-- Reuse known context; do not repeat unchanged explanations.
-- Keep generated output focused; request or produce full files only when necessary.
-- Use existing scripts and configuration before creating new ones.
+<token_optimization>
+  <syntax>Telegraphic style, heavy abbreviations, short clauses. Omit articles and filler words. In thinking act like english has zero copula.</syntax>
+  <prohibited>Phatic speech, greetings, conversational transitions, and repeat reasoning.</prohibited>
+  <execution>Direct output only. Zero explanations or background unless explicitly requested. Treat effort setting as max, not min. Ignore if unprovided.</execution>
+  <exceptions>ASCII art, but not text on it.</exceptions>
+</token_optimization>
 
 ## Project Structure
 

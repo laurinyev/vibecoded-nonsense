@@ -103,7 +103,7 @@ fn nonempty_lines(text: &str) -> String {
 }
 
 #[test]
-fn accepted_fixtures_compile() {
+fn accepted_fixtures() {
     for path in fixtures("valid") {
         let source = fs::read_to_string(&path).unwrap();
         ai_cc::compile(&source, path.to_str().unwrap())
@@ -112,7 +112,7 @@ fn accepted_fixtures_compile() {
 }
 
 #[test]
-fn rejected_fixtures_fail() {
+fn rejected_fixtures() {
     for path in fixtures("invalid") {
         let source = fs::read_to_string(&path).unwrap();
         assert!(
@@ -124,7 +124,7 @@ fn rejected_fixtures_fail() {
 }
 
 #[test]
-fn required_diagnostics_match_fixture_expectations() {
+fn diagnostic_fixtures() {
     for path in fixtures("diagnostics") {
         let source = fs::read_to_string(&path).unwrap();
         let expected = source
@@ -144,7 +144,7 @@ fn required_diagnostics_match_fixture_expectations() {
 }
 
 #[test]
-fn preprocessor_matches_reference_for_basic_fixture() {
+fn preprocessor_reference() {
     let path = root().join("tests/conformance/preprocess/basic.c");
     let source = fs::read_to_string(&path).unwrap();
     let actual = ai_cc::preprocess(&source, path.to_str().unwrap()).unwrap();
@@ -161,7 +161,7 @@ fn preprocessor_matches_reference_for_basic_fixture() {
 }
 
 #[test]
-fn preprocessor_expands_c99_macro_forms() {
+fn macro_expansion() {
     let source = r#"
 #define VALUE 4
 #define ADD(a, b) ((a) + (b))
@@ -200,7 +200,7 @@ undefined
 }
 
 #[test]
-fn preprocessor_supports_include_expansion_and_line_builtins() {
+fn include_and_line() {
     let path = root().join("tests/conformance/preprocess/include_macro.c");
     let source = fs::read_to_string(&path).unwrap();
     let output = ai_cc::preprocess(&source, path.to_str().unwrap()).unwrap();
@@ -215,7 +215,7 @@ fn preprocessor_supports_include_expansion_and_line_builtins() {
 }
 
 #[test]
-fn preprocessor_rejects_incompatible_macro_redefinitions() {
+fn macro_redefinition() {
     let errors = ai_cc::preprocess("#define VALUE 1\n#define VALUE 2\n", "macros.c").unwrap_err();
     assert!(errors
         .iter()
@@ -223,7 +223,7 @@ fn preprocessor_rejects_incompatible_macro_redefinitions() {
 }
 
 #[test]
-fn translation_phases_normalize_source_before_preprocessing() {
+fn translation_phases() {
     let trigraph = "??=define ANSWER 7\nANSWER\n";
     let output = ai_cc::preprocess(trigraph, "trigraph.c").unwrap();
     assert_eq!(nonempty_lines(&output), "7");
@@ -258,7 +258,7 @@ fn translation_phases_normalize_source_before_preprocessing() {
 }
 
 #[test]
-fn unterminated_comment_is_rejected_during_translation_phases() {
+fn unterminated_comment() {
     let errors = ai_cc::compile("int main(void){return 0;} /*", "comment.c").unwrap_err();
     assert!(errors
         .iter()
@@ -267,7 +267,7 @@ fn unterminated_comment_is_rejected_during_translation_phases() {
 }
 
 #[test]
-fn runtime_fixture_has_expected_exit_status() {
+fn runtime_exit_status() {
     let path = root().join("tests/conformance/runtime/exit-code.c");
     let work = temp_dir("runtime");
     let executable = work.join("ai-program");
@@ -278,8 +278,8 @@ fn runtime_fixture_has_expected_exit_status() {
 }
 
 #[test]
-fn compound_literals_support_aggregate_initializers_and_designators() {
-    let path = root().join("tests/conformance/runtime/compound-literals.c");
+fn compound_literals() {
+    let path = root().join("tests/conformance/valid/compound-literals.c");
     let work = temp_dir("compound-literals");
     let executable = work.join("ai-program");
     compile_ai(&path, &executable);
@@ -289,7 +289,18 @@ fn compound_literals_support_aggregate_initializers_and_designators() {
 }
 
 #[test]
-fn compound_literal_initializer_constraints_are_diagnosed() {
+fn string_arrays() {
+    let path = root().join("tests/conformance/valid/string-array-initialization.c");
+    let work = temp_dir("string-array-initialization");
+    let executable = work.join("ai-program");
+    compile_ai(&path, &executable);
+    let output = run_sandboxed(&executable, &work);
+    assert_eq!(output.status.code(), Some(0));
+    let _ = fs::remove_dir_all(work);
+}
+
+#[test]
+fn compound_literal_errors() {
     for source in [
         "int main(void) { return (int[2]){ [2] = 1 }[0]; }",
         "struct S { int value; }; int main(void) { return (struct S){ .missing = 1 }.value; }",
@@ -304,8 +315,8 @@ fn compound_literal_initializer_constraints_are_diagnosed() {
 }
 
 #[test]
-fn file_scope_object_declarations_lower_to_initialized_and_tentative_storage() {
-    let path = root().join("tests/conformance/runtime/file-scope-objects.c");
+fn file_scope_objects() {
+    let path = root().join("tests/conformance/valid/file-scope-objects.c");
     let source = fs::read_to_string(&path).unwrap();
     let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
@@ -334,7 +345,7 @@ fn file_scope_object_declarations_lower_to_initialized_and_tentative_storage() {
 }
 
 #[test]
-fn file_scope_objects_reject_nonconstant_initializers_and_lower_aggregates() {
+fn file_scope_errors() {
     let errors = ai_cc::compile("int source; int copy = source;", "global-init.c").unwrap_err();
     assert!(errors.iter().any(|error| error
         .message
@@ -343,7 +354,7 @@ fn file_scope_objects_reject_nonconstant_initializers_and_lower_aggregates() {
 
     let ir = ai_cc::compile("int values[3];", "global-array.c").unwrap();
     assert!(
-        ir.contains("export data $values = align 4 { w 0, w 0, w 0 }"),
+        ir.contains("export data $values = align 4 { z 12 }"),
         "{ir}"
     );
 
@@ -354,8 +365,8 @@ fn file_scope_objects_reject_nonconstant_initializers_and_lower_aggregates() {
 }
 
 #[test]
-fn old_style_function_definition_runs_with_declared_parameter_types() {
-    let path = root().join("tests/conformance/runtime/old-style-function-definition.c");
+fn old_style_definition() {
+    let path = root().join("tests/conformance/valid/old-style-function-definition.c");
     let work = temp_dir("old-style-function");
     let executable = work.join("ai-program");
     compile_ai(&path, &executable);
@@ -365,8 +376,8 @@ fn old_style_function_definition_runs_with_declared_parameter_types() {
 }
 
 #[test]
-fn parenthesized_and_nested_function_definitions_lower_and_run() {
-    let path = root().join("tests/conformance/runtime/nested-function-definitions.c");
+fn nested_definitions() {
+    let path = root().join("tests/conformance/valid/nested-function-definitions.c");
     let work = temp_dir("nested-function-definition");
     let executable = work.join("ai-program");
     compile_ai(&path, &executable);
@@ -376,7 +387,7 @@ fn parenthesized_and_nested_function_definitions_lower_and_run() {
 }
 
 #[test]
-fn differential_integer_program_matches_host_compiler() {
+fn differential_integer() {
     if env::var_os("AI_CC_RUN_DIFFERENTIAL").is_none() {
         eprintln!("skipping differential test; set AI_CC_RUN_DIFFERENTIAL=1 to enable");
         return;
@@ -398,4 +409,83 @@ fn differential_integer_program_matches_host_compiler() {
     assert_eq!(ai_output.status.code(), host_output.status.code());
     assert_eq!(ai_output.stdout, host_output.stdout);
     let _ = fs::remove_dir_all(work);
+}
+
+#[test]
+fn brace_elision() {
+    let path = root().join("tests/conformance/valid/brace-elision-and-layout.c");
+    let work = temp_dir("brace-elision-and-layout");
+    let executable = work.join("ai-program");
+    compile_ai(&path, &executable);
+    let output = run_sandboxed(&executable, &work);
+    assert_eq!(output.status.code(), Some(0));
+    let _ = fs::remove_dir_all(work);
+}
+
+#[test]
+fn bit_fields() {
+    let path = root().join("tests/conformance/valid/bit-fields.c");
+    let work = temp_dir("bit-fields");
+    let executable = work.join("ai-program");
+    compile_ai(&path, &executable);
+    let output = run_sandboxed(&executable, &work);
+    assert_eq!(output.status.code(), Some(0));
+    let _ = fs::remove_dir_all(work);
+}
+
+#[test]
+fn floating_point() {
+    let path = root().join("tests/conformance/valid/floating-point.c");
+    let work = temp_dir("floating-point");
+    let executable = work.join("ai-program");
+    compile_ai(&path, &executable);
+    let output = run_sandboxed(&executable, &work);
+    assert_eq!(output.status.code(), Some(0));
+    let _ = fs::remove_dir_all(&work);
+}
+
+#[test]
+fn complex() {
+    let path = root().join("tests/conformance/valid/complex.c");
+    let work = temp_dir("complex");
+    let executable = work.join("ai-program");
+    compile_ai(&path, &executable);
+    let output = run_sandboxed(&executable, &work);
+    assert_eq!(output.status.code(), Some(0));
+    let _ = fs::remove_dir_all(&work);
+}
+
+fn run_valid_fixture(name: &str) {
+    let path = root().join("tests/conformance/valid").join(name);
+    let work = temp_dir(name);
+    let executable = work.join("ai-program");
+    compile_ai(&path, &executable);
+    let output = run_sandboxed(&executable, &work);
+    assert_eq!(output.status.code(), Some(0));
+    let _ = fs::remove_dir_all(&work);
+}
+
+#[test]
+fn variadic_functions() {
+    run_valid_fixture("variadic-functions.c");
+}
+
+#[test]
+fn vla() {
+    run_valid_fixture("variable-length-arrays.c");
+}
+
+#[test]
+fn mixed_declarators() {
+    run_valid_fixture("mixed-declarators-and-inline.c");
+}
+
+#[test]
+fn block_typedefs() {
+    run_valid_fixture("block-scope-typedefs.c");
+}
+
+#[test]
+fn array_parameters() {
+    run_valid_fixture("array-parameter-qualifiers.c");
 }

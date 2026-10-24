@@ -1,11 +1,11 @@
 use crate::{ast::*, diag::Diagnostic};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 pub struct LoweredProgram {
     pub functions: Vec<LoweredFunction>,
     pub strings: Vec<(String, String)>,
-    pub statics: Vec<(String, Type, i64)>,
+    pub statics: Vec<(String, Type, DataValue)>,
     pub globals: Vec<(String, Type, DataValue, bool)>,
     pub aggregate_data: Vec<DataObject>,
 }
@@ -13,6 +13,7 @@ pub struct LoweredProgram {
 #[derive(Clone, Debug)]
 pub enum DataValue {
     Integer(i64),
+    Float(f64, Type),
     Address(String),
 }
 
@@ -20,7 +21,8 @@ pub enum DataValue {
 pub struct DataObject {
     pub name: String,
     pub ty: Type,
-    pub values: Vec<(Type, DataValue)>,
+    pub bytes: Vec<u8>,
+    pub relocations: Vec<(usize, String)>,
     pub internal: bool,
 }
 
@@ -30,38 +32,80 @@ pub struct LoweredFunction {
     pub ret: Type,
     pub params: Vec<(String, Type)>,
     pub is_static: bool,
+    pub is_variadic: bool,
     pub body: Vec<Instr>,
 }
 
 #[derive(Clone, Debug)]
 pub enum Instr {
     Alloc(String, usize),
+    AllocVla(String, String, usize),
     Const(String, i64),
-    Move(String, String),
+    ConstLong(String, i64),
+    ConstFloat(String, f64, Type),
+    Move(String, String, Type),
     Load(String, String, Type),
+    LoadZero(String, String, usize),
     Store(String, String, Type),
+    StoreSize(String, String, usize),
     Addr(String, String, i64),
     PtrAdd(String, String, String),
     Bin(String, BinOp, String, String),
-    Call(Option<String>, String, Vec<(String, Type)>),
+    FloatBin(String, BinOp, String, String, Type),
+    Convert(String, String, Type, Type),
+    Call(
+        Option<String>,
+        String,
+        Vec<(String, Type)>,
+        Option<usize>,
+        Type,
+    ),
+    VaStart(String),
+    VaArg(String, String, Type),
     Ret(Option<String>),
     Label(String),
     Jump(String),
     Branch(String, String, String),
 }
 
+struct InitCursor<'a> {
+    items: &'a [InitializerItem],
+    position: usize,
+}
+
+impl<'a> InitCursor<'a> {
+    fn new(items: &'a [InitializerItem]) -> Self {
+        Self { items, position: 0 }
+    }
+
+    fn next(&mut self) -> Option<InitializerItem> {
+        let item = self.items.get(self.position)?.clone();
+        self.position += 1;
+        Some(item)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.position >= self.items.len()
+    }
+
+    fn peek(&self) -> Option<&'a InitializerItem> {
+        self.items.get(self.position)
+    }
+}
+
 pub struct Lowerer {
     n: usize,
     strings: Vec<(String, String)>,
-    statics: Vec<(String, Type, i64)>,
+    statics: Vec<(String, Type, DataValue)>,
     globals: Vec<(String, Type, DataValue, bool)>,
     aggregate_data: Vec<DataObject>,
     loops: Vec<(String, String)>,
     vars: HashMap<String, Type>,
     slots: HashMap<String, String>,
-    functions: HashMap<String, (Type, Vec<Type>)>,
+    functions: HashMap<String, (Type, Vec<Type>, bool)>,
     tags: HashMap<String, Type>,
     function_name: String,
+    return_type: Type,
 }
 
 impl Default for Lowerer {
@@ -84,6 +128,7 @@ impl Lowerer {
             functions: HashMap::new(),
             tags: HashMap::new(),
             function_name: String::new(),
+            return_type: Type::Int,
         }
     }
 
@@ -91,6 +136,15 @@ impl Lowerer {
         let x = format!("%t{}", self.n);
         self.n += 1;
         x
+    }
+
+    fn intern_string(&mut self, value: &str) -> String {
+        if let Some((name, _)) = self.strings.iter().find(|(_, text)| text == value) {
+            return name.clone();
+        }
+        let name = format!("$str{}", self.strings.len());
+        self.strings.push((name.clone(), value.to_string()));
+        name
     }
 
     fn scalar(t: &Type) -> Type {
@@ -101,86 +155,164 @@ impl Lowerer {
     }
 
     fn resolve_tags(&self, ty: &Type) -> Type {
+        self.resolve_tags_inner(ty, &mut HashSet::new())
+    }
+
+    fn resolve_tags_inner(&self, ty: &Type, seen: &mut HashSet<String>) -> Type {
         match ty {
-            Type::Struct(name, fields) if fields.is_empty() => self
-                .tags
-                .get(&format!("struct:{name}"))
-                .cloned()
-                .unwrap_or_else(|| ty.clone()),
-            Type::Union(name, fields) if fields.is_empty() => self
-                .tags
-                .get(&format!("union:{name}"))
-                .cloned()
-                .unwrap_or_else(|| ty.clone()),
+            Type::Struct(name, fields) if fields.is_empty() => {
+                let key = format!("struct:{name}");
+                if !seen.insert(key.clone()) {
+                    return ty.clone();
+                }
+                let resolved = self
+                    .tags
+                    .get(&key)
+                    .map(|tag| {
+                        if let Type::Struct(name, fields) = tag {
+                            Type::Struct(
+                                name.clone(),
+                                fields
+                                    .iter()
+                                    .map(|field| Field {
+                                        name: field.name.clone(),
+                                        ty: self.resolve_tags_inner(&field.ty, seen),
+                                        bit_width: field.bit_width,
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            tag.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| ty.clone());
+                seen.remove(&key);
+                resolved
+            }
+            Type::Union(name, fields) if fields.is_empty() => {
+                let key = format!("union:{name}");
+                if !seen.insert(key.clone()) {
+                    return ty.clone();
+                }
+                let resolved = self
+                    .tags
+                    .get(&key)
+                    .map(|tag| {
+                        if let Type::Union(name, fields) = tag {
+                            Type::Union(
+                                name.clone(),
+                                fields
+                                    .iter()
+                                    .map(|field| Field {
+                                        name: field.name.clone(),
+                                        ty: self.resolve_tags_inner(&field.ty, seen),
+                                        bit_width: field.bit_width,
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            tag.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| ty.clone());
+                seen.remove(&key);
+                resolved
+            }
             Type::Enum(name, values) if values.is_empty() => self
                 .tags
                 .get(&format!("enum:{name}"))
                 .cloned()
                 .unwrap_or_else(|| ty.clone()),
-            Type::Pointer(inner) => Type::Pointer(Box::new(self.resolve_tags(inner))),
-            Type::Array(inner, count) => Type::Array(Box::new(self.resolve_tags(inner)), *count),
+            Type::Struct(name, fields) => Type::Struct(
+                name.clone(),
+                fields
+                    .iter()
+                    .map(|field| Field {
+                        name: field.name.clone(),
+                        ty: self.resolve_tags_inner(&field.ty, seen),
+                        bit_width: field.bit_width,
+                    })
+                    .collect(),
+            ),
+            Type::Union(name, fields) => Type::Union(
+                name.clone(),
+                fields
+                    .iter()
+                    .map(|field| Field {
+                        name: field.name.clone(),
+                        ty: self.resolve_tags_inner(&field.ty, seen),
+                        bit_width: field.bit_width,
+                    })
+                    .collect(),
+            ),
+            Type::Pointer(inner) => Type::Pointer(Box::new(self.resolve_tags_inner(inner, seen))),
+            Type::Array(inner, count, is_static) => Type::Array(
+                Box::new(self.resolve_tags_inner(inner, seen)),
+                *count,
+                *is_static,
+            ),
+            Type::Vla(inner, bound) => Type::Vla(
+                Box::new(self.resolve_tags_inner(inner, seen)),
+                bound.clone(),
+            ),
             Type::Qualified(inner, qualifiers) => {
-                Type::Qualified(Box::new(self.resolve_tags(inner)), *qualifiers)
+                Type::Qualified(Box::new(self.resolve_tags_inner(inner, seen)), *qualifiers)
             }
             _ => ty.clone(),
         }
     }
 
     fn size(t: &Type) -> usize {
-        match Self::scalar(t) {
-            Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => 1,
-            Type::Short | Type::UnsignedShort => 2,
-            Type::Int | Type::SignedInt | Type::UnsignedInt | Type::Float => 4,
-            Type::Long
-            | Type::UnsignedLong
-            | Type::LongLong
-            | Type::UnsignedLongLong
-            | Type::Double
-            | Type::Pointer(_) => 8,
-            Type::LongDouble => 16,
-            Type::Array(x, Some(n)) => Self::size(&x) * n,
-            Type::Struct(_, fields) | Type::Union(_, fields) => {
-                fields.iter().map(|(_, x)| Self::size(x)).sum()
-            }
-            _ => 8,
+        crate::layout::size(t)
+    }
+
+    fn sizeof_value(&mut self, ty: &Type, v: &mut Vec<Instr>) -> String {
+        let scalar = Self::scalar(ty);
+        if let Type::Vla(element, bound) = scalar {
+            let count = self.expr(&bound, v);
+            let unit = self.tmp();
+            v.push(Instr::Const(
+                unit.clone(),
+                Self::size(&element).max(1) as i64,
+            ));
+            let out = self.tmp();
+            v.push(Instr::Bin(out.clone(), BinOp::Mul, count, unit));
+            out
+        } else {
+            let out = self.tmp();
+            v.push(Instr::Const(out.clone(), Self::size(&scalar) as i64));
+            out
         }
     }
 
     fn is_pointer(t: &Type) -> bool {
-        matches!(Self::scalar(t), Type::Pointer(_) | Type::Array(_, _))
+        matches!(
+            Self::scalar(t),
+            Type::Pointer(_) | Type::Array(_, _, _) | Type::Vla(_, _)
+        )
     }
 
     fn pointee(t: &Type) -> Option<Type> {
         match Self::scalar(t) {
-            Type::Pointer(x) | Type::Array(x, _) => Some(*x),
+            Type::Pointer(x) | Type::Array(x, _, _) | Type::Vla(x, _) => Some(*x),
             _ => None,
         }
     }
 
-    fn field(t: &Type, name: &str) -> Option<(usize, Type)> {
-        let t = Self::scalar(t);
-        let fields = match t {
-            Type::Struct(_, fields) | Type::Union(_, fields) => fields,
-            _ => return None,
-        };
-        let mut offset = 0;
-        for (field, ty) in fields {
-            if field == name {
-                return Some((offset, ty));
-            }
-            offset += Self::size(&ty);
-        }
-        None
+    fn field(t: &Type, name: &str) -> Option<crate::layout::FieldLayout> {
+        crate::layout::field(t, name)
     }
 
     fn type_of(&self, e: &Expr) -> Type {
         match e {
-            Expr::Int(_) | Expr::Char(_) | Expr::Binary(_, _, _) | Expr::Conditional(_, _, _) => {
-                Type::Int
-            }
+            Expr::Int(_) | Expr::Char(_) => Type::Int,
+            Expr::Float(_, ty) => ty.clone(),
+            Expr::Complex(_, _, ty) => Type::Complex(Box::new(ty.clone())),
             Expr::Cast(ty, _) => ty.clone(),
             Expr::SizeofType(_) | Expr::Unary(UnOp::Sizeof, _) => Type::UnsignedLong,
             Expr::CompoundLiteral(ty, _) => ty.clone(),
+            Expr::VaStart(_) | Expr::VaEnd(_) | Expr::VaCopy(_, _) => Type::Void,
+            Expr::VaArg(_, ty) => ty.clone(),
             Expr::String(_) => Type::Pointer(Box::new(Type::Char)),
             Expr::Var(n) => self
                 .vars
@@ -190,7 +322,49 @@ impl Lowerer {
             Expr::Assign(x, _) => self.type_of(x),
             Expr::Unary(UnOp::Address, x) => Type::Pointer(Box::new(self.type_of(x))),
             Expr::Unary(UnOp::Deref, x) => Self::pointee(&self.type_of(x)).unwrap_or(Type::Int),
+            Expr::Unary(UnOp::Not | UnOp::BitNot, _) => Type::Int,
             Expr::Unary(_, x) => self.type_of(x),
+            Expr::Binary(op, a, b) => match op {
+                BinOp::Comma => self.type_of(b),
+                BinOp::And
+                | BinOp::Or
+                | BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr => Type::Int,
+                BinOp::Add | BinOp::Sub => {
+                    let left = self.type_of(a);
+                    let right = self.type_of(b);
+                    if Self::is_pointer(&left) {
+                        left
+                    } else if Self::is_pointer(&right) {
+                        right
+                    } else {
+                        Self::usual_arithmetic_type(&left, &right)
+                    }
+                }
+                BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                    Self::usual_arithmetic_type(&self.type_of(a), &self.type_of(b))
+                }
+            },
+            Expr::Conditional(_, yes, no) => {
+                let yes = self.type_of(yes);
+                let no = self.type_of(no);
+                if Self::is_pointer(&yes) {
+                    yes
+                } else if Self::is_pointer(&no) {
+                    no
+                } else {
+                    Self::usual_arithmetic_type(&yes, &no)
+                }
+            }
             Expr::Call(n, _) => self
                 .functions
                 .get(n)
@@ -202,9 +376,78 @@ impl Lowerer {
                 } else {
                     self.type_of(x)
                 };
-                Self::field(&base, name).map(|x| x.1).unwrap_or(Type::Int)
+                Self::field(&base, name).map(|x| x.ty).unwrap_or(Type::Int)
             }
             Expr::Subscript(x, _) => Self::pointee(&self.type_of(x)).unwrap_or(Type::Int),
+        }
+    }
+
+    fn is_float(t: &Type) -> bool {
+        matches!(
+            Self::scalar(t),
+            Type::Float | Type::Double | Type::LongDouble
+        )
+    }
+
+    fn is_complex(t: &Type) -> bool {
+        matches!(Self::scalar(t), Type::Complex(_))
+    }
+
+    fn complex_base(t: &Type) -> Option<Type> {
+        match Self::scalar(t) {
+            Type::Complex(inner) => Some(*inner),
+            _ => None,
+        }
+    }
+
+    fn real_type(t: &Type) -> Type {
+        match Self::scalar(t) {
+            Type::Complex(inner) => *inner,
+            other => other,
+        }
+    }
+
+    fn arithmetic(t: &Type) -> bool {
+        matches!(
+            Self::scalar(t),
+            Type::Int
+                | Type::SignedInt
+                | Type::UnsignedInt
+                | Type::Short
+                | Type::UnsignedShort
+                | Type::Long
+                | Type::UnsignedLong
+                | Type::LongLong
+                | Type::UnsignedLongLong
+                | Type::Bool
+                | Type::Char
+                | Type::SignedChar
+                | Type::UnsignedChar
+                | Type::Enum(_, _)
+                | Type::Float
+                | Type::Double
+                | Type::LongDouble
+                | Type::Complex(_)
+        )
+    }
+
+    fn usual_arithmetic_type(a: &Type, b: &Type) -> Type {
+        let complex = Self::is_complex(a) || Self::is_complex(b);
+        let a = Self::real_type(a);
+        let b = Self::real_type(b);
+        let base = if matches!(a, Type::LongDouble) || matches!(b, Type::LongDouble) {
+            Type::LongDouble
+        } else if matches!(a, Type::Double) || matches!(b, Type::Double) {
+            Type::Double
+        } else if matches!(a, Type::Float) || matches!(b, Type::Float) {
+            Type::Float
+        } else {
+            Type::Int
+        };
+        if complex {
+            Type::Complex(Box::new(base))
+        } else {
+            base
         }
     }
 
@@ -228,13 +471,16 @@ impl Lowerer {
                 } else {
                     self.lvalue_addr(x, v)
                 };
-                let offset = Self::field(&base_type, name).map(|x| x.0).unwrap_or(0) as i64;
+                let offset = Self::field(&base_type, name).map(|x| x.offset).unwrap_or(0) as i64;
                 self.add_addr(base, offset, v)
             }
             Expr::Subscript(x, index) => {
                 let element = Self::pointee(&self.type_of(x)).unwrap_or(Type::Int);
                 let base = if Self::is_pointer(&self.type_of(x)) {
-                    if matches!(Self::scalar(&self.type_of(x)), Type::Array(_, _)) {
+                    if matches!(
+                        Self::scalar(&self.type_of(x)),
+                        Type::Array(_, _, _) | Type::Vla(_, _)
+                    ) {
                         self.lvalue_addr(x, v)
                     } else {
                         self.expr(x, v)
@@ -261,6 +507,7 @@ impl Lowerer {
         initializer: &Initializer,
         v: &mut Vec<Instr>,
     ) -> String {
+        let ty = &self.resolve_tags(ty);
         let addr = self.tmp();
         v.push(Instr::Alloc(addr.clone(), Self::size(ty).max(1)));
         self.zero_object(ty, &addr, v);
@@ -275,104 +522,290 @@ impl Lowerer {
         addr: String,
         v: &mut Vec<Instr>,
     ) {
+        let ty = &self.resolve_tags(ty);
         match initializer {
             Initializer::Expr(expr) => {
-                let value = self.expr(expr, v);
-                v.push(Instr::Store(value, addr, ty.clone()));
+                let mut cursor = InitCursor::new(&[]);
+                self.initialize_object_value(ty, expr, &mut cursor, addr, v);
             }
-            Initializer::List(items) => match Self::scalar(ty) {
-                Type::Qualified(inner, _) => self.initialize_object(&inner, initializer, addr, v),
-                Type::Array(element, _) => {
-                    let mut next = 0usize;
-                    for item in items {
-                        let index = match item.designators.first() {
-                            Some(Designator::Index(expr)) => {
-                                Self::constant_value(expr).unwrap_or(next as i64) as usize
-                            }
-                            _ => next,
-                        };
-                        let target =
-                            self.add_addr(addr.clone(), (index * Self::size(&element)) as i64, v);
-                        if item.designators.len() > 1 {
-                            self.initialize_designated(
-                                &element,
+            Initializer::List(items) => {
+                let mut cursor = InitCursor::new(items);
+                self.initialize_object_items(ty, &mut cursor, addr, v);
+            }
+        }
+    }
+
+    fn initialize_object_value(
+        &mut self,
+        ty: &Type,
+        expr: &Expr,
+        cursor: &mut InitCursor,
+        addr: String,
+        v: &mut Vec<Instr>,
+    ) {
+        let scalar = Self::scalar(ty);
+        if let (Type::Array(_, Some(_), _), Expr::String(value)) = (&scalar, expr) {
+            self.store_string_initializer(&scalar, value, &addr, v);
+            return;
+        }
+        if Self::aggregate(&scalar) {
+            if let Expr::CompoundLiteral(_, initializer) = expr {
+                self.initialize_object(&scalar, initializer, addr, v);
+            } else {
+                self.initialize_object_elided(&scalar, expr, cursor, addr, v);
+            }
+            return;
+        }
+        let value = self.expr_as(expr, &scalar, v);
+        if Self::is_complex(&scalar) {
+            self.copy_storage(addr, value, Self::size(&scalar), v);
+        } else {
+            v.push(Instr::Store(value, addr, scalar));
+        }
+    }
+
+    fn initialize_object_from_value(
+        &mut self,
+        ty: &Type,
+        value: &Initializer,
+        cursor: &mut InitCursor,
+        addr: String,
+        v: &mut Vec<Instr>,
+    ) {
+        match value {
+            Initializer::Expr(expr) => self.initialize_object_value(ty, expr, cursor, addr, v),
+            Initializer::List(items) => {
+                let mut nested = InitCursor::new(items);
+                self.initialize_object_items(ty, &mut nested, addr, v);
+            }
+        }
+    }
+
+    fn initialize_object_items(
+        &mut self,
+        ty: &Type,
+        cursor: &mut InitCursor,
+        addr: String,
+        v: &mut Vec<Instr>,
+    ) {
+        match Self::scalar(ty) {
+            Type::Qualified(inner, _) => self.initialize_object_items(&inner, cursor, addr, v),
+            Type::Array(element, count, _) => {
+                let stride = Self::size(&element);
+                let mut next = 0usize;
+                while !cursor.is_empty()
+                    && (!count.is_some_and(|n| next >= n)
+                        || cursor
+                            .peek()
+                            .is_some_and(|item| !item.designators.is_empty()))
+                {
+                    let Some(item) = cursor.next() else { break };
+                    let index = match item.designators.first() {
+                        Some(Designator::Index(expr)) => {
+                            Self::constant_value(expr).unwrap_or(next as i64).max(0) as usize
+                        }
+                        Some(Designator::Member(_)) => return,
+                        None => next,
+                    };
+                    let target = self.add_addr(addr.clone(), (index * stride) as i64, v);
+                    if item.designators.len() > 1 {
+                        self.initialize_object_designated(
+                            &element,
+                            &item.designators[1..],
+                            &item.value,
+                            target,
+                            v,
+                        );
+                    } else {
+                        self.initialize_object_from_value(&element, &item.value, cursor, target, v);
+                    }
+                    next = index + 1;
+                }
+            }
+            Type::Struct(_, fields) => {
+                let layouts = crate::layout::struct_layout(&fields).1;
+                let mut next = Self::next_initializable(&fields, 0);
+                while !cursor.is_empty()
+                    && (next < fields.len()
+                        || cursor
+                            .peek()
+                            .is_some_and(|item| !item.designators.is_empty()))
+                {
+                    let Some(item) = cursor.next() else { break };
+                    let index = match item.designators.first() {
+                        Some(Designator::Member(name)) => fields
+                            .iter()
+                            .position(|field| field.name.as_deref() == Some(name))
+                            .unwrap_or(next),
+                        _ => next,
+                    };
+                    if let Some(layout) = layouts.get(index) {
+                        let target = self.add_addr(addr.clone(), layout.offset as i64, v);
+                        if layout.width.is_some_and(|width| width > 0) {
+                            self.initialize_bitfield(layout, &item.value, target, v);
+                        } else if item.designators.len() > 1 {
+                            self.initialize_object_designated(
+                                &layout.ty,
                                 &item.designators[1..],
                                 &item.value,
                                 target,
                                 v,
                             );
                         } else {
-                            self.initialize_object(&element, &item.value, target, v);
-                        }
-                        next = index + 1;
-                    }
-                }
-                Type::Struct(_, fields) => {
-                    let mut next = 0usize;
-                    for item in items {
-                        let index = match item.designators.first() {
-                            Some(Designator::Member(name)) => fields
-                                .iter()
-                                .position(|(field, _)| field == name)
-                                .unwrap_or(next),
-                            _ => next,
-                        };
-                        if let Some((_, field)) = fields.get(index) {
-                            let offset = fields
-                                .iter()
-                                .take(index)
-                                .map(|(_, field)| Self::size(field))
-                                .sum::<usize>();
-                            let target = self.add_addr(addr.clone(), offset as i64, v);
-                            if item.designators.len() > 1 {
-                                self.initialize_designated(
-                                    field,
-                                    &item.designators[1..],
-                                    &item.value,
-                                    target,
-                                    v,
-                                );
-                            } else {
-                                self.initialize_object(field, &item.value, target, v);
-                            }
-                        }
-                        next = index + 1;
-                    }
-                }
-                Type::Union(_, fields) => {
-                    for item in items {
-                        let index = match item.designators.first() {
-                            Some(Designator::Member(name)) => fields
-                                .iter()
-                                .position(|(field, _)| field == name)
-                                .unwrap_or(0),
-                            _ => 0,
-                        };
-                        if let Some((_, field)) = fields.get(index) {
-                            if item.designators.len() > 1 {
-                                self.initialize_designated(
-                                    field,
-                                    &item.designators[1..],
-                                    &item.value,
-                                    addr.clone(),
-                                    v,
-                                );
-                            } else {
-                                self.initialize_object(field, &item.value, addr.clone(), v);
-                            }
+                            self.initialize_object_from_value(
+                                &layout.ty,
+                                &item.value,
+                                cursor,
+                                target,
+                                v,
+                            );
                         }
                     }
+                    next = Self::next_initializable(&fields, index + 1);
                 }
-                _ => {
-                    if let Some(item) = items.first() {
-                        self.initialize_object(ty, &item.value, addr, v);
+            }
+            Type::Union(_, fields) => {
+                let Some(item) = cursor.next() else { return };
+                let index = match item.designators.first() {
+                    Some(Designator::Member(name)) => fields
+                        .iter()
+                        .position(|field| field.name.as_deref() == Some(name))
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                if let Some(layout) = crate::layout::union_layout(&fields).1.get(index) {
+                    if layout.width.is_some_and(|width| width > 0) {
+                        self.initialize_bitfield(layout, &item.value, addr, v);
+                    } else if item.designators.len() > 1 {
+                        self.initialize_object_designated(
+                            &layout.ty,
+                            &item.designators[1..],
+                            &item.value,
+                            addr,
+                            v,
+                        );
+                    } else {
+                        self.initialize_object_from_value(&layout.ty, &item.value, cursor, addr, v);
                     }
                 }
-            },
+            }
+            _ => {
+                let Some(item) = cursor.next() else { return };
+                if item.designators.is_empty() {
+                    self.initialize_object_from_value(ty, &item.value, cursor, addr, v);
+                }
+            }
         }
     }
 
-    fn initialize_designated(
+    fn initialize_object_elided(
+        &mut self,
+        ty: &Type,
+        first: &Expr,
+        cursor: &mut InitCursor,
+        addr: String,
+        v: &mut Vec<Instr>,
+    ) {
+        match Self::scalar(ty) {
+            Type::Array(element, count, _) => {
+                let stride = Self::size(&element);
+                self.initialize_object_value(&element, first, cursor, addr.clone(), v);
+                let mut next = 1usize;
+                while !cursor.is_empty()
+                    && (!count.is_some_and(|n| next >= n)
+                        || cursor
+                            .peek()
+                            .is_some_and(|item| !item.designators.is_empty()))
+                {
+                    let Some(item) = cursor.next() else { break };
+                    let index = match item.designators.first() {
+                        Some(Designator::Index(expr)) => {
+                            Self::constant_value(expr).unwrap_or(next as i64).max(0) as usize
+                        }
+                        Some(Designator::Member(_)) => return,
+                        None => next,
+                    };
+                    let target = self.add_addr(addr.clone(), (index * stride) as i64, v);
+                    if item.designators.len() > 1 {
+                        self.initialize_object_designated(
+                            &element,
+                            &item.designators[1..],
+                            &item.value,
+                            target,
+                            v,
+                        );
+                    } else {
+                        self.initialize_object_from_value(&element, &item.value, cursor, target, v);
+                    }
+                    next = index + 1;
+                }
+            }
+            Type::Struct(_, fields) => {
+                let layouts = crate::layout::struct_layout(&fields).1;
+                let first_index = Self::next_initializable(&fields, 0);
+                let Some(layout) = layouts.get(first_index) else {
+                    return;
+                };
+                let target = self.add_addr(addr.clone(), layout.offset as i64, v);
+                if layout.width.is_some_and(|width| width > 0) {
+                    self.initialize_bitfield_expr(layout, first, target, v);
+                } else {
+                    self.initialize_object_value(&layout.ty, first, cursor, target, v);
+                }
+                let mut next = Self::next_initializable(&fields, first_index + 1);
+                while !cursor.is_empty()
+                    && (next < fields.len()
+                        || cursor
+                            .peek()
+                            .is_some_and(|item| !item.designators.is_empty()))
+                {
+                    let Some(item) = cursor.next() else { break };
+                    let index = match item.designators.first() {
+                        Some(Designator::Member(name)) => fields
+                            .iter()
+                            .position(|field| field.name.as_deref() == Some(name))
+                            .unwrap_or(next),
+                        _ => next,
+                    };
+                    if let Some(layout) = layouts.get(index) {
+                        let target = self.add_addr(addr.clone(), layout.offset as i64, v);
+                        if layout.width.is_some_and(|width| width > 0) {
+                            self.initialize_bitfield(layout, &item.value, target, v);
+                        } else if item.designators.len() > 1 {
+                            self.initialize_object_designated(
+                                &layout.ty,
+                                &item.designators[1..],
+                                &item.value,
+                                target,
+                                v,
+                            );
+                        } else {
+                            self.initialize_object_from_value(
+                                &layout.ty,
+                                &item.value,
+                                cursor,
+                                target,
+                                v,
+                            );
+                        }
+                    }
+                    next = Self::next_initializable(&fields, index + 1);
+                }
+            }
+            Type::Union(_, fields) => {
+                if let Some(layout) = crate::layout::union_layout(&fields).1.first().cloned() {
+                    if layout.width.is_some_and(|width| width > 0) {
+                        self.initialize_bitfield_expr(&layout, first, addr, v);
+                    } else {
+                        self.initialize_object_value(&layout.ty, first, cursor, addr, v);
+                    }
+                }
+            }
+            _ => self.initialize_object_value(ty, first, cursor, addr, v),
+        }
+    }
+
+    fn initialize_object_designated(
         &mut self,
         ty: &Type,
         designators: &[Designator],
@@ -384,41 +817,91 @@ impl Lowerer {
             self.initialize_object(ty, value, addr, v);
             return;
         }
-        match (ty, &designators[0]) {
+        match (Self::scalar(ty), &designators[0]) {
             (Type::Qualified(inner, _), _) => {
-                self.initialize_designated(inner, designators, value, addr, v)
+                self.initialize_object_designated(&inner, designators, value, addr, v)
             }
-            (Type::Array(element, _), Designator::Index(index)) => {
-                let index = Self::constant_value(index).unwrap_or(0) as usize;
-                let target = self.add_addr(addr, (index * Self::size(element)) as i64, v);
-                self.initialize_designated(element, &designators[1..], value, target, v);
+            (Type::Array(element, _, _), Designator::Index(index)) => {
+                let index = Self::constant_value(index).unwrap_or(0).max(0) as usize;
+                let target = self.add_addr(addr, (index * Self::size(&element)) as i64, v);
+                self.initialize_object_designated(&element, &designators[1..], value, target, v);
             }
             (Type::Struct(_, fields) | Type::Union(_, fields), Designator::Member(name)) => {
-                if let Some((index, (_, field))) = fields
+                if let Some(index) = fields
                     .iter()
-                    .enumerate()
-                    .find(|(_, (field, _))| field == name)
+                    .position(|field| field.name.as_deref() == Some(name))
                 {
-                    let offset = if matches!(ty, Type::Union(_, _)) {
-                        0
+                    let layout =
+                        crate::layout::member(ty, index).unwrap_or(crate::layout::FieldLayout {
+                            offset: 0,
+                            bit_offset: 0,
+                            width: None,
+                            ty: Type::Int,
+                        });
+                    let target = self.add_addr(addr, layout.offset as i64, v);
+                    if layout.width.is_some_and(|width| width > 0) {
+                        self.initialize_bitfield(&layout, value, target, v);
                     } else {
-                        fields
-                            .iter()
-                            .take(index)
-                            .map(|(_, field)| Self::size(field))
-                            .sum::<usize>()
-                    };
-                    let target = self.add_addr(addr, offset as i64, v);
-                    self.initialize_designated(field, &designators[1..], value, target, v);
+                        self.initialize_object_designated(
+                            &layout.ty,
+                            &designators[1..],
+                            value,
+                            target,
+                            v,
+                        );
+                    }
                 }
             }
             _ => {}
         }
     }
 
+    fn store_string_initializer(&mut self, ty: &Type, value: &str, addr: &str, v: &mut Vec<Instr>) {
+        self.zero_object(ty, addr, v);
+        let Type::Array(element, Some(count), _) = Self::scalar(ty) else {
+            return;
+        };
+        for (index, value) in value.bytes().take(count).enumerate() {
+            let target = self.add_addr(addr.to_owned(), index as i64, v);
+            let byte = self.tmp();
+            v.push(Instr::Const(byte.clone(), value as i64));
+            v.push(Instr::Store(byte, target, (*element).clone()));
+        }
+    }
+
+    fn allocate_local(&mut self, slot: &str, ty: &Type, v: &mut Vec<Instr>) {
+        if let Type::Vla(element, bound) = Self::scalar(ty) {
+            let count = self.expr(&bound, v);
+            v.push(Instr::AllocVla(
+                slot.to_string(),
+                count,
+                Self::size(&element).max(1),
+            ));
+        } else {
+            v.push(Instr::Alloc(slot.to_string(), Self::size(ty).max(1)));
+        }
+    }
+
+    fn initialize_local(
+        &mut self,
+        name: &str,
+        ty: &Type,
+        init: Option<&Initializer>,
+        v: &mut Vec<Instr>,
+    ) {
+        let Some(initializer) = init else {
+            return;
+        };
+        let addr = self.lvalue_addr(&Expr::Var(name.to_string()), v);
+        if matches!(initializer, Initializer::List(_)) || Self::aggregate(ty) {
+            self.zero_object(ty, &addr, v);
+        }
+        self.initialize_object(ty, initializer, addr, v);
+    }
+
     fn zero_object(&mut self, ty: &Type, addr: &str, v: &mut Vec<Instr>) {
         match Self::scalar(ty) {
-            Type::Array(ref element, Some(count)) => {
+            Type::Array(ref element, Some(count), _) => {
                 for i in 0..count {
                     let target =
                         self.add_addr(addr.to_owned(), (i * Self::size(element)) as i64, v);
@@ -426,16 +909,32 @@ impl Lowerer {
                 }
             }
             Type::Struct(_, ref fields) => {
-                let mut offset = 0;
-                for (_, field) in fields {
-                    let target = self.add_addr(addr.to_owned(), offset as i64, v);
-                    self.zero_object(field, &target, v);
-                    offset += Self::size(field);
+                let (_, layouts) = crate::layout::struct_layout(fields);
+                for layout in layouts {
+                    if let Some(width) = layout.width {
+                        if width > 0 {
+                            let target = self.add_addr(addr.to_owned(), layout.offset as i64, v);
+                            self.zero_storage(target, Self::size(&layout.ty), v);
+                        }
+                    } else {
+                        let target = self.add_addr(addr.to_owned(), layout.offset as i64, v);
+                        self.zero_object(&layout.ty, &target, v);
+                    }
                 }
             }
+            Type::Complex(_) => {
+                self.zero_storage(addr.to_owned(), Self::size(ty), v);
+            }
             Type::Union(_, ref fields) => {
-                if let Some((_, field)) = fields.first() {
-                    self.zero_object(field, addr, v);
+                let Some(layout) = crate::layout::union_layout(fields).1.first().cloned() else {
+                    return;
+                };
+                if let Some(width) = layout.width {
+                    if width > 0 {
+                        self.zero_storage(addr.to_owned(), Self::size(&layout.ty), v);
+                    }
+                } else {
+                    self.zero_object(&layout.ty, addr, v);
                 }
             }
             _ => {
@@ -443,6 +942,22 @@ impl Lowerer {
                 v.push(Instr::Const(zero.clone(), 0));
                 v.push(Instr::Store(zero, addr.to_owned(), ty.clone()));
             }
+        }
+    }
+
+    fn zero_storage(&mut self, addr: String, size: usize, v: &mut Vec<Instr>) {
+        let mut offset = 0usize;
+        while offset < size {
+            let chunk = (size - offset).min(8);
+            let target = self.add_addr(addr.clone(), offset as i64, v);
+            let zero = self.tmp();
+            if chunk == 8 {
+                v.push(Instr::ConstLong(zero.clone(), 0));
+            } else {
+                v.push(Instr::Const(zero.clone(), 0));
+            }
+            v.push(Instr::StoreSize(zero, target, chunk));
+            offset += chunk;
         }
     }
 
@@ -457,6 +972,181 @@ impl Lowerer {
         out
     }
 
+    fn member_layout(&self, e: &Expr) -> Option<crate::layout::FieldLayout> {
+        let Expr::Member(base, name, arrow) = e else {
+            return None;
+        };
+        let base_ty = if *arrow {
+            Self::pointee(&self.type_of(base)).unwrap_or(Type::Int)
+        } else {
+            self.type_of(base)
+        };
+        let base_ty = self.resolve_tags(&base_ty);
+        Self::field(&base_ty, name)
+    }
+
+    fn bitfield_signed(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Char
+                | Type::SignedChar
+                | Type::Short
+                | Type::Int
+                | Type::SignedInt
+                | Type::Enum(_, _)
+                | Type::Qualified(_, _)
+        ) && !matches!(
+            Self::scalar(ty),
+            Type::Bool | Type::UnsignedChar | Type::UnsignedShort | Type::UnsignedInt
+        )
+    }
+
+    fn bitfield_width_mask(width: u32) -> i64 {
+        if width >= 32 {
+            -1
+        } else {
+            ((1u64 << width) - 1) as u32 as i32 as i64
+        }
+    }
+
+    fn bitfield_unit_mask(size: usize) -> i64 {
+        if size >= 8 {
+            -1
+        } else {
+            ((1u64 << (size * 8)) - 1) as u32 as i32 as i64
+        }
+    }
+
+    fn load_bitfield(
+        &mut self,
+        e: &Expr,
+        layout: &crate::layout::FieldLayout,
+        v: &mut Vec<Instr>,
+    ) -> String {
+        let width = layout.width.unwrap_or(0);
+        let addr = self.lvalue_addr(e, v);
+        let unit = self.tmp();
+        v.push(Instr::LoadZero(unit.clone(), addr, Self::size(&layout.ty)));
+        let mut value = unit;
+        if layout.bit_offset > 0 {
+            let shift = self.tmp();
+            v.push(Instr::Const(shift.clone(), layout.bit_offset as i64));
+            let shifted = self.tmp();
+            v.push(Instr::Bin(shifted.clone(), BinOp::Shr, value, shift));
+            value = shifted;
+        }
+        if width < 32 {
+            let mask = self.tmp();
+            v.push(Instr::Const(mask.clone(), Self::bitfield_width_mask(width)));
+            let masked = self.tmp();
+            v.push(Instr::Bin(masked.clone(), BinOp::BitAnd, value, mask));
+            value = masked;
+        }
+        if Self::bitfield_signed(&layout.ty) && width < 32 {
+            let shift = 32 - width;
+            let shift_value = self.tmp();
+            v.push(Instr::Const(shift_value.clone(), shift as i64));
+            let left = self.tmp();
+            v.push(Instr::Bin(
+                left.clone(),
+                BinOp::Shl,
+                value,
+                shift_value.clone(),
+            ));
+            let right = self.tmp();
+            v.push(Instr::Bin(right.clone(), BinOp::Shr, left, shift_value));
+            value = right;
+        }
+        value
+    }
+
+    fn store_bitfield(
+        &mut self,
+        layout: &crate::layout::FieldLayout,
+        value: String,
+        addr: String,
+        v: &mut Vec<Instr>,
+    ) {
+        let width = layout.width.unwrap_or(0);
+        if width == 0 {
+            return;
+        }
+        let size = Self::size(&layout.ty);
+        let mut value = value;
+        if width < 32 {
+            let mask = self.tmp();
+            v.push(Instr::Const(mask.clone(), Self::bitfield_width_mask(width)));
+            let masked = self.tmp();
+            v.push(Instr::Bin(masked.clone(), BinOp::BitAnd, value, mask));
+            value = masked;
+        }
+        if layout.bit_offset > 0 {
+            let shift = self.tmp();
+            v.push(Instr::Const(shift.clone(), layout.bit_offset as i64));
+            let shifted = self.tmp();
+            v.push(Instr::Bin(shifted.clone(), BinOp::Shl, value, shift));
+            value = shifted;
+        }
+        let field_mask = (Self::bitfield_width_mask(width) as u64) << layout.bit_offset;
+        let clear_mask =
+            (!field_mask & (Self::bitfield_unit_mask(size) as u64)) as u32 as i32 as i64;
+        let old = self.tmp();
+        v.push(Instr::LoadZero(old.clone(), addr.clone(), size));
+        let mut merged = old;
+        if clear_mask != 0 {
+            let clear = self.tmp();
+            v.push(Instr::Const(clear.clone(), clear_mask));
+            let cleared = self.tmp();
+            v.push(Instr::Bin(cleared.clone(), BinOp::BitAnd, merged, clear));
+            merged = cleared;
+        }
+        let combined = self.tmp();
+        v.push(Instr::Bin(combined.clone(), BinOp::BitOr, merged, value));
+        v.push(Instr::StoreSize(combined, addr, size));
+    }
+
+    fn initializer_scalar_expr(initializer: &Initializer) -> Option<&Expr> {
+        match initializer {
+            Initializer::Expr(expr) => Some(expr),
+            Initializer::List(items) => items
+                .first()
+                .filter(|item| item.designators.is_empty())
+                .and_then(|item| Self::initializer_scalar_expr(&item.value)),
+        }
+    }
+
+    fn next_initializable(fields: &[Field], mut index: usize) -> usize {
+        while index < fields.len() && fields[index].name.is_none() {
+            index += 1;
+        }
+        index
+    }
+
+    fn initialize_bitfield(
+        &mut self,
+        layout: &crate::layout::FieldLayout,
+        initializer: &Initializer,
+        addr: String,
+        v: &mut Vec<Instr>,
+    ) {
+        let Some(expr) = Self::initializer_scalar_expr(initializer) else {
+            return;
+        };
+        let value = self.expr(expr, v);
+        self.store_bitfield(layout, value, addr, v);
+    }
+
+    fn initialize_bitfield_expr(
+        &mut self,
+        layout: &crate::layout::FieldLayout,
+        expr: &Expr,
+        addr: String,
+        v: &mut Vec<Instr>,
+    ) {
+        let value = self.expr_as(expr, &layout.ty, v);
+        self.store_bitfield(layout, value, addr, v);
+    }
+
     fn expr(&mut self, e: &Expr, v: &mut Vec<Instr>) -> String {
         match e {
             Expr::Int(n) => {
@@ -464,42 +1154,66 @@ impl Lowerer {
                 v.push(Instr::Const(x.clone(), *n));
                 x
             }
-            Expr::Cast(_, value) => self.expr(value, v),
+            Expr::Float(value, ty) => {
+                let x = self.tmp();
+                v.push(Instr::ConstFloat(x.clone(), *value, ty.clone()));
+                x
+            }
+            Expr::Complex(real, imaginary, base) => {
+                let real = {
+                    let x = self.tmp();
+                    v.push(Instr::ConstFloat(x.clone(), *real, base.clone()));
+                    x
+                };
+                let imaginary = {
+                    let x = self.tmp();
+                    v.push(Instr::ConstFloat(x.clone(), *imaginary, base.clone()));
+                    x
+                };
+                self.make_complex(base, real, imaginary, v)
+            }
+            Expr::Cast(target, value) => self.expr_as(value, target, v),
             Expr::CompoundLiteral(ty, values) => {
-                let addr = self.compound_literal_addr(ty, values, v);
-                if matches!(Self::scalar(ty), Type::Array(_, _)) {
+                let ty = self.resolve_tags(ty);
+                let addr = self.compound_literal_addr(&ty, values, v);
+                if matches!(Self::scalar(&ty), Type::Array(_, _, _)) || Self::is_complex(&ty) {
                     addr
                 } else {
                     let out = self.tmp();
-                    v.push(Instr::Load(out.clone(), addr, ty.clone()));
+                    v.push(Instr::Load(out.clone(), addr, ty));
                     out
                 }
             }
             Expr::SizeofType(ty) => {
-                let x = self.tmp();
-                v.push(Instr::Const(x.clone(), Self::size(ty) as i64));
-                x
+                let ty = self.resolve_tags(ty);
+                self.sizeof_value(&ty, v)
             }
             Expr::Char(c) => {
                 let x = self.tmp();
                 v.push(Instr::Const(x.clone(), *c as i64));
                 x
             }
-            Expr::String(value) => {
-                let index = self
-                    .strings
-                    .iter()
-                    .position(|(_, x)| x == value)
-                    .unwrap_or_else(|| {
-                        let index = self.strings.len();
-                        self.strings.push((format!("$str{}", index), value.clone()));
-                        index
-                    });
-                self.strings[index].0.clone()
-            }
-            Expr::Var(_) | Expr::Member(_, _, _) | Expr::Subscript(_, _) => {
+            Expr::String(value) => self.intern_string(value),
+            Expr::Member(_, _, _) => {
+                if let Some(layout) = self.member_layout(e) {
+                    if layout.width.is_some_and(|width| width > 0) {
+                        return self.load_bitfield(e, &layout, v);
+                    }
+                }
                 let ty = self.type_of(e);
-                if matches!(Self::scalar(&ty), Type::Array(_, _)) {
+                if Self::is_complex(&ty) {
+                    return self.lvalue_addr(e, v);
+                }
+                let addr = self.lvalue_addr(e, v);
+                let out = self.tmp();
+                v.push(Instr::Load(out.clone(), addr, ty));
+                out
+            }
+            Expr::Var(_) | Expr::Subscript(_, _) => {
+                let ty = self.type_of(e);
+                if matches!(Self::scalar(&ty), Type::Array(_, _, _) | Type::Vla(_, _))
+                    || Self::is_complex(&ty)
+                {
                     self.lvalue_addr(e, v)
                 } else {
                     let addr = self.lvalue_addr(e, v);
@@ -509,45 +1223,128 @@ impl Lowerer {
                 }
             }
             Expr::Assign(target, e) => {
-                let x = self.expr(e, v);
+                let target_ty = self.type_of(target);
+                let x = self.expr_as(e, &target_ty, v);
+                if Self::is_complex(&target_ty) {
+                    let addr = self.lvalue_addr(target, v);
+                    self.copy_storage(addr.clone(), x, Self::size(&target_ty), v);
+                    return addr;
+                }
+                if let Some(layout) = self.member_layout(target) {
+                    if layout.width.is_some_and(|width| width > 0) {
+                        let addr = self.lvalue_addr(target, v);
+                        self.store_bitfield(&layout, x.clone(), addr, v);
+                        return x;
+                    }
+                }
                 let addr = self.lvalue_addr(target, v);
-                v.push(Instr::Store(x.clone(), addr, self.type_of(target)));
+                v.push(Instr::Store(x.clone(), addr, target_ty));
                 x
             }
             Expr::Unary(UnOp::Address, e) => self.lvalue_addr(e, v),
             Expr::Unary(UnOp::Deref, e) => {
+                let ty = self.type_of(e);
                 let addr = self.expr(e, v);
+                if Self::is_complex(&ty) {
+                    return addr;
+                }
                 let out = self.tmp();
-                v.push(Instr::Load(out.clone(), addr, self.type_of(e)));
+                v.push(Instr::Load(out.clone(), addr, ty));
                 out
             }
             Expr::Unary(UnOp::Neg, e) => {
+                let ty = self.type_of(e);
+                if let Some(base) = Self::complex_base(&ty) {
+                    let addr = self.expr(e, v);
+                    let (real, imaginary) = self.load_complex_parts(&addr, &base, v);
+                    let real = {
+                        let zero = self.tmp();
+                        let out = self.tmp();
+                        v.push(Instr::ConstFloat(zero.clone(), 0.0, base.clone()));
+                        v.push(Instr::FloatBin(
+                            out.clone(),
+                            BinOp::Sub,
+                            zero,
+                            real,
+                            base.clone(),
+                        ));
+                        out
+                    };
+                    let imaginary = {
+                        let zero = self.tmp();
+                        let out = self.tmp();
+                        v.push(Instr::ConstFloat(zero.clone(), 0.0, base.clone()));
+                        v.push(Instr::FloatBin(
+                            out.clone(),
+                            BinOp::Sub,
+                            zero,
+                            imaginary,
+                            base.clone(),
+                        ));
+                        out
+                    };
+                    return self.make_complex(&base, real, imaginary, v);
+                }
                 let x = self.expr(e, v);
                 let z = self.tmp();
-                v.push(Instr::Bin(z.clone(), BinOp::Sub, "0".into(), x));
+                if Self::is_float(&ty) {
+                    let zero = self.tmp();
+                    v.push(Instr::ConstFloat(zero.clone(), 0.0, ty.clone()));
+                    v.push(Instr::FloatBin(z.clone(), BinOp::Sub, zero, x, ty));
+                } else {
+                    v.push(Instr::Bin(z.clone(), BinOp::Sub, "0".into(), x));
+                }
                 z
             }
             Expr::Unary(UnOp::Not, e) => {
+                let ty = self.type_of(e);
+                if Self::is_complex(&ty) {
+                    let condition = self.condition(e, v);
+                    let z = self.tmp();
+                    v.push(Instr::Bin(z.clone(), BinOp::Eq, condition, "0".into()));
+                    return z;
+                }
                 let x = self.expr(e, v);
                 let z = self.tmp();
-                v.push(Instr::Bin(z.clone(), BinOp::Eq, x, "0".into()));
+                if Self::is_float(&ty) {
+                    let zero = self.tmp();
+                    v.push(Instr::ConstFloat(zero.clone(), 0.0, ty.clone()));
+                    v.push(Instr::FloatBin(z.clone(), BinOp::Eq, x, zero, ty));
+                } else {
+                    v.push(Instr::Bin(z.clone(), BinOp::Eq, x, "0".into()));
+                }
                 z
             }
             Expr::Unary(UnOp::Pos, e) => self.expr(e, v),
-            Expr::Unary(UnOp::Sizeof, e) => {
-                let x = self.tmp();
-                v.push(Instr::Const(x.clone(), Self::size(&self.type_of(e)) as i64));
-                x
-            }
             Expr::Unary(UnOp::BitNot, e) => {
                 let x = self.expr(e, v);
                 let z = self.tmp();
                 v.push(Instr::Bin(z.clone(), BinOp::BitXor, x, "-1".into()));
                 z
             }
+            Expr::Unary(UnOp::Sizeof, e) => {
+                let ty = self.resolve_tags(&self.type_of(e));
+                self.sizeof_value(&ty, v)
+            }
             Expr::Binary(op, a, b) => {
-                let x = self.expr(a, v);
+                let left_ty = self.type_of(a);
+                let right_ty = self.type_of(b);
+                if Self::is_complex(&left_ty) || Self::is_complex(&right_ty) {
+                    match op {
+                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                            let result_ty = self.type_of(e);
+                            if let Some(base) = Self::complex_base(&result_ty) {
+                                return self.complex_arithmetic(*op, a, b, &base, v);
+                            }
+                        }
+                        BinOp::Eq | BinOp::Ne => {
+                            return self.complex_equality(*op, a, b, v);
+                        }
+                        _ => {}
+                    }
+                }
                 if matches!(op, BinOp::And | BinOp::Or) {
+                    let x = self.condition(a, v);
                     let i = self.n;
                     self.n += 1;
                     let rhs = format!("@logicrhs{}", i);
@@ -566,23 +1363,53 @@ impl Lowerer {
                         v.push(Instr::Jump(end.clone()));
                     }
                     v.push(Instr::Label(rhs));
-                    let y = self.expr(b, v);
-                    v.push(Instr::Move(z.clone(), y));
+                    let y = self.condition(b, v);
+                    v.push(Instr::Move(z.clone(), y, Type::Int));
                     v.push(Instr::Jump(end.clone()));
                     v.push(Instr::Label(end));
                     return z;
                 }
-                let y = self.expr(b, v);
                 if matches!(op, BinOp::Comma) {
-                    y
-                } else {
-                    let z = self.tmp();
-                    v.push(Instr::Bin(z.clone(), *op, x, y));
-                    z
+                    self.expr(a, v);
+                    return self.expr(b, v);
                 }
+                let arithmetic = matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Rem
+                        | BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge
+                ) && !Self::is_pointer(&left_ty)
+                    && !Self::is_pointer(&right_ty);
+                let common = Self::usual_arithmetic_type(&left_ty, &right_ty);
+                let x = if arithmetic {
+                    self.expr_as(a, &common, v)
+                } else {
+                    self.expr(a, v)
+                };
+                let y = if arithmetic {
+                    self.expr_as(b, &common, v)
+                } else {
+                    self.expr(b, v)
+                };
+                let z = self.tmp();
+                if arithmetic && (Self::is_float(&common)) {
+                    v.push(Instr::FloatBin(z.clone(), *op, x, y, common));
+                } else {
+                    v.push(Instr::Bin(z.clone(), *op, x, y));
+                }
+                z
             }
             Expr::Conditional(c, a, b) => {
-                let c = self.expr(c, v);
+                let c = self.condition(c, v);
+                let result_ty = self.type_of(e);
                 let i = self.n;
                 self.n += 1;
                 let t = format!("@condt{}", i);
@@ -591,36 +1418,337 @@ impl Lowerer {
                 let z = self.tmp();
                 v.push(Instr::Branch(c, t.clone(), f.clone()));
                 v.push(Instr::Label(t));
-                let x = self.expr(a, v);
-                v.push(Instr::Move(z.clone(), x));
+                let x = self.expr_as(a, &result_ty, v);
+                v.push(Instr::Move(z.clone(), x, result_ty.clone()));
                 v.push(Instr::Jump(e.clone()));
                 v.push(Instr::Label(f));
-                let x = self.expr(b, v);
-                v.push(Instr::Move(z.clone(), x));
+                let x = self.expr_as(b, &result_ty, v);
+                v.push(Instr::Move(z.clone(), x, result_ty.clone()));
                 v.push(Instr::Jump(e.clone()));
                 v.push(Instr::Label(e));
                 z
             }
+            Expr::VaStart(ap) => {
+                let addr = self.lvalue_addr(ap, v);
+                v.push(Instr::VaStart(addr));
+                "0".into()
+            }
+            Expr::VaArg(ap, ty) => {
+                let ty = self.resolve_tags(ty);
+                let addr = self.lvalue_addr(ap, v);
+                let out = self.tmp();
+                v.push(Instr::VaArg(out.clone(), addr, ty));
+                out
+            }
+            Expr::VaEnd(_) => "0".into(),
+            Expr::VaCopy(destination, source) => {
+                let dst = self.lvalue_addr(destination, v);
+                let src = self.lvalue_addr(source, v);
+                let size = Self::size(&self.type_of(source)).max(1);
+                self.copy_storage(dst, src, size, v);
+                "0".into()
+            }
             Expr::Call(n, args) => {
-                let (ret, params) = self
-                    .functions
-                    .get(n)
-                    .cloned()
-                    .unwrap_or((Type::Int, Vec::new()));
+                let (ret, params, variadic) =
+                    self.functions
+                        .get(n)
+                        .cloned()
+                        .unwrap_or((Type::Int, Vec::new(), false));
                 let mut values = Vec::new();
                 for (i, arg) in args.iter().enumerate() {
-                    let value = self.expr(arg, v);
-                    let ty = params.get(i).cloned().unwrap_or_else(|| self.type_of(arg));
-                    values.push((value, ty));
+                    if i < params.len() {
+                        let ty = params[i].clone();
+                        let value = self.expr_as(arg, &ty, v);
+                        values.push((value, ty));
+                    } else {
+                        let mut ty = self.type_of(arg);
+                        let mut value = self.expr(arg, v);
+                        if matches!(Self::scalar(&ty), Type::Float) {
+                            let promoted = self.tmp();
+                            v.push(Instr::Convert(
+                                promoted.clone(),
+                                value,
+                                ty.clone(),
+                                Type::Double,
+                            ));
+                            value = promoted;
+                            ty = Type::Double;
+                        }
+                        values.push((value, ty));
+                    }
                 }
                 let dst = if matches!(Self::scalar(&ret), Type::Void) {
                     None
                 } else {
                     Some(self.tmp())
                 };
-                v.push(Instr::Call(dst.clone(), n.clone(), values));
+                let fixed = if variadic { Some(params.len()) } else { None };
+                v.push(Instr::Call(dst.clone(), n.clone(), values, fixed, ret));
                 dst.unwrap_or_else(|| "0".into())
             }
+        }
+    }
+
+    fn float_bin(
+        &mut self,
+        op: BinOp,
+        x: String,
+        y: String,
+        ty: &Type,
+        v: &mut Vec<Instr>,
+    ) -> String {
+        let out = self.tmp();
+        v.push(Instr::FloatBin(out.clone(), op, x, y, ty.clone()));
+        out
+    }
+
+    fn load_complex_parts(
+        &mut self,
+        addr: &str,
+        base: &Type,
+        v: &mut Vec<Instr>,
+    ) -> (String, String) {
+        let real = self.tmp();
+        v.push(Instr::Load(real.clone(), addr.to_string(), base.clone()));
+        let imaginary_addr = self.add_addr(addr.to_string(), Self::size(base) as i64, v);
+        let imaginary = self.tmp();
+        v.push(Instr::Load(imaginary.clone(), imaginary_addr, base.clone()));
+        (real, imaginary)
+    }
+
+    fn store_complex_parts(
+        &mut self,
+        addr: &str,
+        base: &Type,
+        real: String,
+        imaginary: String,
+        v: &mut Vec<Instr>,
+    ) {
+        v.push(Instr::Store(real, addr.to_string(), base.clone()));
+        let imaginary_addr = self.add_addr(addr.to_string(), Self::size(base) as i64, v);
+        v.push(Instr::Store(imaginary, imaginary_addr, base.clone()));
+    }
+
+    fn make_complex(
+        &mut self,
+        base: &Type,
+        real: String,
+        imaginary: String,
+        v: &mut Vec<Instr>,
+    ) -> String {
+        let addr = self.tmp();
+        v.push(Instr::Alloc(addr.clone(), Self::size(base) * 2));
+        self.store_complex_parts(&addr, base, real, imaginary, v);
+        addr
+    }
+
+    fn complex_operand(&mut self, e: &Expr, base: &Type, v: &mut Vec<Instr>) -> (String, String) {
+        let ty = self.type_of(e);
+        if let Some(source_base) = Self::complex_base(&ty) {
+            let addr = self.expr(e, v);
+            let (real, imaginary) = self.load_complex_parts(&addr, &source_base, v);
+            (
+                self.convert_value(real, &source_base, base, v),
+                self.convert_value(imaginary, &source_base, base, v),
+            )
+        } else {
+            let real = self.expr_as(e, base, v);
+            let imaginary = self.tmp();
+            v.push(Instr::ConstFloat(imaginary.clone(), 0.0, base.clone()));
+            (real, imaginary)
+        }
+    }
+
+    fn complex_arithmetic(
+        &mut self,
+        op: BinOp,
+        a: &Expr,
+        b: &Expr,
+        base: &Type,
+        v: &mut Vec<Instr>,
+    ) -> String {
+        let (ar, ai) = self.complex_operand(a, base, v);
+        let (br, bi) = self.complex_operand(b, base, v);
+        let (real, imaginary) = match op {
+            BinOp::Add => (
+                self.float_bin(BinOp::Add, ar, br, base, v),
+                self.float_bin(BinOp::Add, ai, bi, base, v),
+            ),
+            BinOp::Sub => (
+                self.float_bin(BinOp::Sub, ar, br, base, v),
+                self.float_bin(BinOp::Sub, ai, bi, base, v),
+            ),
+            BinOp::Mul => {
+                let ac = self.float_bin(BinOp::Mul, ar.clone(), br.clone(), base, v);
+                let bd = self.float_bin(BinOp::Mul, ai.clone(), bi.clone(), base, v);
+                let ad = self.float_bin(BinOp::Mul, ar, bi, base, v);
+                let bc = self.float_bin(BinOp::Mul, ai, br, base, v);
+                (
+                    self.float_bin(BinOp::Sub, ac, bd, base, v),
+                    self.float_bin(BinOp::Add, ad, bc, base, v),
+                )
+            }
+            BinOp::Div => {
+                let c2 = self.float_bin(BinOp::Mul, br.clone(), br.clone(), base, v);
+                let d2 = self.float_bin(BinOp::Mul, bi.clone(), bi.clone(), base, v);
+                let denominator = self.float_bin(BinOp::Add, c2, d2, base, v);
+                let ac = self.float_bin(BinOp::Mul, ar.clone(), br.clone(), base, v);
+                let bd = self.float_bin(BinOp::Mul, ai.clone(), bi.clone(), base, v);
+                let bc = self.float_bin(BinOp::Mul, ai.clone(), br, base, v);
+                let ad = self.float_bin(BinOp::Mul, ar, bi, base, v);
+                let real = self.float_bin(BinOp::Add, ac, bd, base, v);
+                let imaginary = self.float_bin(BinOp::Sub, bc, ad, base, v);
+                (
+                    self.float_bin(BinOp::Div, real, denominator.clone(), base, v),
+                    self.float_bin(BinOp::Div, imaginary, denominator, base, v),
+                )
+            }
+            _ => unreachable!(),
+        };
+        self.make_complex(base, real, imaginary, v)
+    }
+
+    fn complex_equality(&mut self, op: BinOp, a: &Expr, b: &Expr, v: &mut Vec<Instr>) -> String {
+        let common = Self::usual_arithmetic_type(&self.type_of(a), &self.type_of(b));
+        let base = Self::real_type(&common);
+        let (ar, ai) = self.complex_operand(a, &base, v);
+        let (br, bi) = self.complex_operand(b, &base, v);
+        let (compare, combine) = if matches!(op, BinOp::Eq) {
+            (BinOp::Eq, BinOp::And)
+        } else {
+            (BinOp::Ne, BinOp::Or)
+        };
+        let real = self.float_bin(compare, ar, br, &base, v);
+        let imaginary = self.float_bin(compare, ai, bi, &base, v);
+        let out = self.tmp();
+        v.push(Instr::Bin(out.clone(), combine, real, imaginary));
+        out
+    }
+
+    fn convert_complex(
+        &mut self,
+        value: String,
+        source: &Type,
+        target: &Type,
+        v: &mut Vec<Instr>,
+    ) -> String {
+        let source_base = Self::complex_base(source).unwrap_or_else(|| Self::real_type(source));
+        let target_base = Self::complex_base(target).unwrap_or_else(|| Self::real_type(target));
+        if Self::is_complex(target) {
+            let (real, imaginary) = if Self::is_complex(source) {
+                let (real, imaginary) = self.load_complex_parts(&value, &source_base, v);
+                let real = self.convert_value(real, &source_base, &target_base, v);
+                let imaginary = self.convert_value(imaginary, &source_base, &target_base, v);
+                (real, imaginary)
+            } else {
+                let real = self.convert_value(value, &source_base, &target_base, v);
+                let imaginary = self.tmp();
+                v.push(Instr::ConstFloat(
+                    imaginary.clone(),
+                    0.0,
+                    target_base.clone(),
+                ));
+                (real, imaginary)
+            };
+            self.make_complex(&target_base, real, imaginary, v)
+        } else {
+            let (real, _) = self.load_complex_parts(&value, &source_base, v);
+            self.convert_value(real, &source_base, target, v)
+        }
+    }
+
+    fn copy_storage(
+        &mut self,
+        destination: String,
+        source: String,
+        size: usize,
+        v: &mut Vec<Instr>,
+    ) {
+        let mut offset = 0usize;
+        while offset < size {
+            let chunk = (size - offset).min(8);
+            let source_addr = self.add_addr(source.clone(), offset as i64, v);
+            let destination_addr = self.add_addr(destination.clone(), offset as i64, v);
+            let value = self.tmp();
+            v.push(Instr::LoadZero(value.clone(), source_addr, chunk));
+            v.push(Instr::StoreSize(value, destination_addr, chunk));
+            offset += chunk;
+        }
+    }
+
+    fn expr_as(&mut self, e: &Expr, target: &Type, v: &mut Vec<Instr>) -> String {
+        let source = self.type_of(e);
+        let value = self.expr(e, v);
+        self.convert_value(value, &source, target, v)
+    }
+
+    fn convert_value(
+        &mut self,
+        value: String,
+        source: &Type,
+        target: &Type,
+        v: &mut Vec<Instr>,
+    ) -> String {
+        let source = Self::scalar(source);
+        let target = Self::scalar(target);
+        if source == target {
+            return value;
+        }
+        if Self::is_complex(&source) || Self::is_complex(&target) {
+            return self.convert_complex(value, &source, &target, v);
+        }
+        if (Self::is_float(&source) || Self::is_float(&target))
+            && Self::arithmetic(&source)
+            && Self::arithmetic(&target)
+        {
+            let out = self.tmp();
+            v.push(Instr::Convert(
+                out.clone(),
+                value,
+                source.clone(),
+                target.clone(),
+            ));
+            return out;
+        }
+        value
+    }
+
+    fn condition(&mut self, e: &Expr, v: &mut Vec<Instr>) -> String {
+        let ty = self.type_of(e);
+        if let Some(base) = Self::complex_base(&ty) {
+            let addr = self.expr(e, v);
+            let (real_value, imaginary_value) = self.load_complex_parts(&addr, &base, v);
+            let zero = self.tmp();
+            v.push(Instr::ConstFloat(zero.clone(), 0.0, base.clone()));
+            let real = self.tmp();
+            v.push(Instr::FloatBin(
+                real.clone(),
+                BinOp::Ne,
+                real_value,
+                zero.clone(),
+                base.clone(),
+            ));
+            let imaginary = self.tmp();
+            v.push(Instr::FloatBin(
+                imaginary.clone(),
+                BinOp::Ne,
+                imaginary_value,
+                zero,
+                base,
+            ));
+            let out = self.tmp();
+            v.push(Instr::Bin(out.clone(), BinOp::Or, real, imaginary));
+            return out;
+        }
+        let value = self.expr(e, v);
+        if Self::is_float(&ty) {
+            let zero = self.tmp();
+            v.push(Instr::ConstFloat(zero.clone(), 0.0, ty.clone()));
+            let out = self.tmp();
+            v.push(Instr::FloatBin(out.clone(), BinOp::Ne, value, zero, ty));
+            out
+        } else {
+            value
         }
     }
 
@@ -628,18 +1756,31 @@ impl Lowerer {
         match s {
             Stmt::StorageDecl(storage, declarations, _) => {
                 for (name, ty, init) in declarations {
+                    let ty = self.resolve_tags(ty);
                     self.vars.insert(name.clone(), ty.clone());
                     match storage {
                         StorageClass::Static => {
                             let symbol =
                                 format!("{}_{}_{}", self.function_name, name, self.statics.len());
-                            let value = init
-                                .as_ref()
-                                .and_then(|e| Self::constant_value(e).ok())
-                                .unwrap_or(0);
-                            self.statics.push((symbol.clone(), ty.clone(), value));
-                            self.slots
-                                .insert(name.clone(), format!("$static_{}", symbol));
+                            if Self::is_complex(&ty) {
+                                let data_name = format!("static_{}", symbol);
+                                let mut data = Self::new_data_object(data_name.clone(), &ty, true);
+                                if let Some(initializer) = init {
+                                    let _ = self.data_initialize(&mut data, 0, &ty, initializer);
+                                }
+                                self.aggregate_data.push(data);
+                                self.slots.insert(name.clone(), format!("${}", data_name));
+                            } else {
+                                let value = init
+                                    .as_ref()
+                                    .and_then(|initializer| {
+                                        Self::constant_data_value(initializer, &ty)
+                                    })
+                                    .unwrap_or_else(|| Self::zero_data_value(&ty));
+                                self.statics.push((symbol.clone(), ty.clone(), value));
+                                self.slots
+                                    .insert(name.clone(), format!("$static_{}", symbol));
+                            }
                         }
                         StorageClass::Extern => {
                             self.slots.insert(name.clone(), format!("${name}"));
@@ -647,12 +1788,8 @@ impl Lowerer {
                         StorageClass::Auto | StorageClass::Register => {
                             let slot = format!("%slot_{}", name);
                             self.slots.insert(name.clone(), slot.clone());
-                            v.push(Instr::Alloc(slot, Self::size(ty).max(1)));
-                            if let Some(e) = init {
-                                let x = self.expr(e, v);
-                                let addr = self.lvalue_addr(&Expr::Var(name.clone()), v);
-                                v.push(Instr::Store(x, addr, ty.clone()));
-                            }
+                            self.allocate_local(&slot, &ty, v);
+                            self.initialize_local(name, &ty, init.as_ref(), v);
                         }
                     }
                 }
@@ -660,36 +1797,29 @@ impl Lowerer {
             Stmt::Typedef(_, _, _) => {}
             Stmt::Typedefs(_, _) => {}
             Stmt::Decl(n, ty, init, _) => {
+                let ty = self.resolve_tags(ty);
                 let slot = format!("%slot_{}", n);
-                let size = Self::size(ty).max(1);
                 self.vars.insert(n.clone(), ty.clone());
                 self.slots.insert(n.clone(), slot.clone());
-                v.push(Instr::Alloc(slot, size));
-                if let Some(e) = init {
-                    let x = self.expr(e, v);
-                    let addr = self.lvalue_addr(&Expr::Var(n.clone()), v);
-                    v.push(Instr::Store(x, addr, ty.clone()));
-                }
+                self.allocate_local(&slot, &ty, v);
+                self.initialize_local(n, &ty, init.as_ref(), v);
             }
             Stmt::Decls(declarations, _) => {
                 for (n, ty, init) in declarations {
+                    let ty = self.resolve_tags(ty);
                     let slot = format!("%slot_{}", n);
-                    let size = Self::size(ty).max(1);
                     self.vars.insert(n.clone(), ty.clone());
                     self.slots.insert(n.clone(), slot.clone());
-                    v.push(Instr::Alloc(slot, size));
-                    if let Some(e) = init {
-                        let x = self.expr(e, v);
-                        let addr = self.lvalue_addr(&Expr::Var(n.clone()), v);
-                        v.push(Instr::Store(x, addr, ty.clone()));
-                    }
+                    self.allocate_local(&slot, &ty, v);
+                    self.initialize_local(n, &ty, init.as_ref(), v);
                 }
             }
             Stmt::Expr(e, _) => {
                 self.expr(e, v);
             }
             Stmt::Return(e, _) => {
-                let value = e.as_ref().map(|x| self.expr(x, v));
+                let return_type = self.return_type.clone();
+                let value = e.as_ref().map(|x| self.expr_as(x, &return_type, v));
                 v.push(Instr::Ret(value));
             }
             Stmt::Block(b, _) => {
@@ -698,7 +1828,7 @@ impl Lowerer {
                 }
             }
             Stmt::If(c, a, b, _) => {
-                let x = self.expr(c, v);
+                let x = self.condition(c, v);
                 let i = self.n;
                 self.n += 1;
                 let t = format!("@then{}", i);
@@ -722,7 +1852,7 @@ impl Lowerer {
                 let x = format!("@body{}", i);
                 let e = format!("@done{}", i);
                 v.push(Instr::Label(h.clone()));
-                let y = self.expr(c, v);
+                let y = self.condition(c, v);
                 v.push(Instr::Branch(y, x.clone(), e.clone()));
                 v.push(Instr::Label(x));
                 self.loops.push((e.clone(), h.clone()));
@@ -740,7 +1870,7 @@ impl Lowerer {
                 v.push(Instr::Label(h.clone()));
                 self.stmt(b, v);
                 self.loops.pop();
-                let y = self.expr(c, v);
+                let y = self.condition(c, v);
                 v.push(Instr::Branch(y, h, e.clone()));
                 v.push(Instr::Label(e));
             }
@@ -756,7 +1886,7 @@ impl Lowerer {
                 let n = format!("@forstep{}", i);
                 v.push(Instr::Label(h.clone()));
                 if let Some(c) = c {
-                    let y = self.expr(c, v);
+                    let y = self.condition(c, v);
                     v.push(Instr::Branch(y, x.clone(), e.clone()));
                 } else {
                     v.push(Instr::Jump(x.clone()));
@@ -807,10 +1937,11 @@ impl Lowerer {
             let declaration_ty = self.resolve_tags(&declaration.ty);
             if declaration.tentative_definition || declaration.initializer.is_some() {
                 let internal = declaration.storage == Some(StorageClass::Static);
-                if Self::aggregate(&declaration_ty) {
-                    let mut values = Self::zero_data(&declaration_ty);
-                    if let Some(Expr::CompoundLiteral(ty, initializer)) = &declaration.initializer {
-                        self.data_initialize(ty, initializer, &mut values, 0)
+                if Self::aggregate(&declaration_ty) || Self::is_complex(&declaration_ty) {
+                    let mut data =
+                        Self::new_data_object(declaration.name.clone(), &declaration_ty, internal);
+                    if let Some(initializer) = &declaration.initializer {
+                        self.data_initialize(&mut data, 0, &declaration_ty, initializer)
                             .map_err(|_| {
                                 vec![Diagnostic::error(
                                     format!(
@@ -820,34 +1951,23 @@ impl Lowerer {
                                     Some(declaration.span),
                                 )]
                             })?;
-                    } else if declaration.initializer.is_some() {
-                        return Err(vec![Diagnostic::error(
-                            format!(
-                                "unsupported file-scope initializer for {}",
-                                declaration.name
-                            ),
-                            Some(declaration.span),
-                        )]);
                     }
-                    self.aggregate_data.push(DataObject {
-                        name: declaration.name.clone(),
-                        ty: declaration_ty.clone(),
-                        values,
-                        internal,
-                    });
+                    self.aggregate_data.push(data);
                     continue;
                 }
                 let value = match &declaration.initializer {
-                    Some(expr) => self.global_value(expr).map_err(|_| {
-                        vec![Diagnostic::error(
-                            format!(
-                                "unsupported file-scope initializer for {}",
-                                declaration.name
-                            ),
-                            Some(declaration.span),
-                        )]
-                    })?,
-                    None => DataValue::Integer(0),
+                    Some(initializer) => self
+                        .global_initializer_value(initializer, &declaration_ty)
+                        .map_err(|_| {
+                            vec![Diagnostic::error(
+                                format!(
+                                    "unsupported file-scope initializer for {}",
+                                    declaration.name
+                                ),
+                                Some(declaration.span),
+                            )]
+                        })?,
+                    None => Self::zero_data_value(&declaration_ty),
                 };
                 if let Some(existing) = self
                     .globals
@@ -871,6 +1991,7 @@ impl Lowerer {
                 (
                     f.ret.clone(),
                     f.params.iter().map(|x| x.1.clone()).collect(),
+                    f.is_variadic,
                 ),
             );
         }
@@ -881,6 +2002,7 @@ impl Lowerer {
             }
             self.n = 0;
             self.function_name = f.name.clone();
+            self.return_type = f.ret.clone();
             self.vars.clear();
             self.slots.clear();
             self.loops.clear();
@@ -896,23 +2018,33 @@ impl Lowerer {
                 self.vars.insert(n.clone(), ty.clone());
                 self.slots.insert(n.clone(), slot.clone());
                 b.push(Instr::Alloc(slot.clone(), Self::size(ty).max(8)));
-                b.push(Instr::Store(format!("%{}", n), slot, ty.clone()));
+                if Self::is_complex(ty) {
+                    self.copy_storage(slot, format!("%{}", n), Self::size(ty), &mut b);
+                } else {
+                    b.push(Instr::Store(format!("%{}", n), slot, ty.clone()));
+                }
             }
             for s in &f.body.stmts {
                 self.stmt(s, &mut b)
             }
             if !matches!(b.last(), Some(Instr::Ret(_))) {
-                b.push(Instr::Ret(if matches!(Self::scalar(&f.ret), Type::Void) {
+                let value = if matches!(Self::scalar(&f.ret), Type::Void) {
                     None
+                } else if Self::is_float(&f.ret) {
+                    let zero = self.tmp();
+                    b.push(Instr::ConstFloat(zero.clone(), 0.0, f.ret.clone()));
+                    Some(zero)
                 } else {
                     Some("0".into())
-                }))
+                };
+                b.push(Instr::Ret(value));
             }
             fs.push(LoweredFunction {
                 name: f.name,
                 ret: f.ret,
                 params: f.params,
                 is_static: f.is_static,
+                is_variadic: f.is_variadic,
                 body: b,
             })
         }
@@ -928,202 +2060,740 @@ impl Lowerer {
     fn aggregate(ty: &Type) -> bool {
         matches!(
             Self::scalar(ty),
-            Type::Array(_, _) | Type::Struct(_, _) | Type::Union(_, _)
+            Type::Array(_, _, _) | Type::Struct(_, _) | Type::Union(_, _)
         )
     }
 
-    fn zero_data(ty: &Type) -> Vec<(Type, DataValue)> {
-        let mut values = Vec::new();
-        Self::data_leaves(ty, &mut values);
-        values
+    fn new_data_object(name: String, ty: &Type, internal: bool) -> DataObject {
+        DataObject {
+            name,
+            ty: ty.clone(),
+            bytes: vec![0; Self::size(ty)],
+            relocations: Vec::new(),
+            internal,
+        }
     }
 
-    fn data_leaves(ty: &Type, values: &mut Vec<(Type, DataValue)>) {
-        match Self::scalar(ty) {
-            Type::Array(element, Some(count)) => {
-                for _ in 0..count {
-                    Self::data_leaves(&element, values);
-                }
-            }
-            Type::Struct(_, fields) => {
-                for (_, field) in fields {
-                    Self::data_leaves(&field, values);
-                }
-            }
-            Type::Union(_, fields) => {
-                if let Some((_, field)) = fields.first() {
-                    Self::data_leaves(field, values);
-                }
-            }
-            scalar => values.push((scalar, DataValue::Integer(0))),
+    fn write_data_value(
+        &mut self,
+        data: &mut DataObject,
+        offset: usize,
+        ty: &Type,
+        value: DataValue,
+    ) -> Result<(), ()> {
+        let width = Self::size(ty);
+        if width == 0 {
+            return Err(());
         }
+        let end = offset
+            .checked_add(width)
+            .filter(|end| *end <= data.bytes.len())
+            .ok_or(())?;
+        data.relocations
+            .retain(|(at, _)| *at < offset || *at >= end);
+        match value {
+            DataValue::Integer(value) => {
+                let bytes = value.to_le_bytes();
+                let copy = width.min(bytes.len());
+                data.bytes[offset..offset + copy].copy_from_slice(&bytes[..copy]);
+                data.bytes[offset + copy..end].fill(0);
+            }
+            DataValue::Float(value, ty) => {
+                data.bytes[offset..end].fill(0);
+                if matches!(ty, Type::Float) {
+                    data.bytes[offset..offset + 4].copy_from_slice(&(value as f32).to_le_bytes());
+                } else {
+                    data.bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            DataValue::Address(name) => {
+                data.bytes[offset..end].fill(0);
+                data.relocations.push((offset, name));
+            }
+        }
+        Ok(())
+    }
+
+    fn write_data_bytes(
+        &mut self,
+        data: &mut DataObject,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), ()> {
+        let end = offset
+            .checked_add(bytes.len())
+            .filter(|end| *end <= data.bytes.len())
+            .ok_or(())?;
+        data.relocations
+            .retain(|(at, _)| *at < offset || *at >= end);
+        data.bytes[offset..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn write_data_bitfield(
+        &mut self,
+        data: &mut DataObject,
+        base: usize,
+        layout: &crate::layout::FieldLayout,
+        value: i64,
+    ) -> Result<(), ()> {
+        let width = layout.width.unwrap_or(0);
+        if width == 0 {
+            return Ok(());
+        }
+        let size = Self::size(&layout.ty);
+        let end = base
+            .checked_add(size)
+            .filter(|end| *end <= data.bytes.len())
+            .ok_or(())?;
+        data.relocations.retain(|(at, _)| *at < base || *at >= end);
+        let mut unit = [0u8; 8];
+        unit[..size].copy_from_slice(&data.bytes[base..end]);
+        let mut unit = u64::from_le_bytes(unit);
+        let width_mask = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+        let field_mask = width_mask << layout.bit_offset;
+        unit = (unit & !field_mask) | ((value as u64 & width_mask) << layout.bit_offset);
+        data.bytes[base..end].copy_from_slice(&unit.to_le_bytes()[..size]);
+        Ok(())
     }
 
     fn data_initialize(
         &mut self,
+        data: &mut DataObject,
+        base: usize,
         ty: &Type,
         initializer: &Initializer,
-        values: &mut [(Type, DataValue)],
-        start: usize,
     ) -> Result<(), ()> {
-        match initializer {
-            Initializer::Expr(expr) => {
-                if Self::aggregate(ty) {
-                    return Err(());
-                }
-                values[start].1 = self.global_value(expr)?;
-            }
-            Initializer::List(items) => match Self::scalar(ty) {
-                Type::Array(element, _) => {
-                    let stride = Self::zero_data(&element).len();
-                    let mut next = 0usize;
-                    for item in items {
-                        let index = match item.designators.first() {
-                            Some(Designator::Index(index)) => Self::constant_value(index)? as usize,
-                            _ => next,
+        if let Some(real_ty) = Self::complex_base(ty) {
+            return match initializer {
+                Initializer::Expr(expr) => self.data_initialize_complex(data, base, &real_ty, expr),
+                Initializer::List(items) => {
+                    let Some(first) = items.first() else {
+                        return Ok(());
+                    };
+                    if !first.designators.is_empty() {
+                        return Err(());
+                    }
+                    let Initializer::Expr(real) = &first.value else {
+                        return Err(());
+                    };
+                    self.data_initialize_complex(data, base, &real_ty, real)?;
+                    if let Some(second) = items.get(1) {
+                        if !second.designators.is_empty() {
+                            return Err(());
+                        }
+                        let Initializer::Expr(imaginary) = &second.value else {
+                            return Err(());
                         };
-                        if item.designators.len() > 1 {
-                            self.data_initialize_designated(
-                                &element,
-                                &item.designators[1..],
-                                &item.value,
-                                values,
-                                start + index * stride,
-                            )?;
-                        } else {
-                            self.data_initialize(
-                                &element,
-                                &item.value,
-                                values,
-                                start + index * stride,
-                            )?;
-                        }
-                        next = index + 1;
+                        self.data_initialize_complex(
+                            data,
+                            base + Self::size(&real_ty),
+                            &real_ty,
+                            imaginary,
+                        )?;
                     }
+                    Ok(())
                 }
-                Type::Struct(_, fields) => {
-                    let mut next = 0usize;
-                    for item in items {
-                        let index = match item.designators.first() {
-                            Some(Designator::Member(name)) => fields
-                                .iter()
-                                .position(|(field, _)| field == name)
-                                .ok_or(())?,
-                            _ => next,
-                        };
-                        let offset: usize = fields
-                            .iter()
-                            .take(index)
-                            .map(|(_, field)| Self::zero_data(field).len())
-                            .sum();
-                        let field = &fields[index].1;
-                        if item.designators.len() > 1 {
-                            self.data_initialize_designated(
-                                field,
-                                &item.designators[1..],
-                                &item.value,
-                                values,
-                                start + offset,
-                            )?;
-                        } else {
-                            self.data_initialize(field, &item.value, values, start + offset)?;
-                        }
-                        next = index + 1;
-                    }
-                }
-                Type::Union(_, fields) => {
-                    if let Some((_, field)) = fields.first() {
-                        if let Some(item) = items.first() {
-                            self.data_initialize(field, &item.value, values, start)?;
-                        }
-                    }
-                }
-                _ => {
-                    if let Some(item) = items.first() {
-                        self.data_initialize(ty, &item.value, values, start)?;
-                    }
-                }
-            },
+            };
         }
+        match initializer {
+            Initializer::Expr(expr) => self.data_initialize_value(data, base, ty, expr),
+            Initializer::List(items) => {
+                let mut cursor = InitCursor::new(items);
+                self.data_initialize_items(data, base, ty, &mut cursor)
+            }
+        }
+    }
+
+    fn data_initialize_complex(
+        &mut self,
+        data: &mut DataObject,
+        base: usize,
+        real_ty: &Type,
+        expr: &Expr,
+    ) -> Result<(), ()> {
+        let (real, imaginary) = Self::constant_complex_value(expr).ok_or(())?;
+        self.write_data_value(data, base, real_ty, DataValue::Float(real, real_ty.clone()))?;
+        self.write_data_value(
+            data,
+            base + Self::size(real_ty),
+            real_ty,
+            DataValue::Float(imaginary, real_ty.clone()),
+        )
+    }
+
+    fn data_initialize_value(
+        &mut self,
+        data: &mut DataObject,
+        base: usize,
+        ty: &Type,
+        expr: &Expr,
+    ) -> Result<(), ()> {
+        let scalar = Self::scalar(ty);
+        if let (Type::Array(_, Some(count), _), Expr::String(value)) = (&scalar, expr) {
+            let bytes = value.as_bytes();
+            let count = bytes.len().min(*count);
+            return self.write_data_bytes(data, base, &bytes[..count]);
+        }
+        if Self::aggregate(&scalar) {
+            if let Expr::CompoundLiteral(_, initializer) = expr {
+                return self.data_initialize(data, base, &scalar, initializer);
+            }
+            return Err(());
+        }
+        let value = self.global_value(expr, &scalar)?;
+        self.write_data_value(data, base, &scalar, value)
+    }
+
+    fn data_initialize_from_value(
+        &mut self,
+        data: &mut DataObject,
+        base: usize,
+        ty: &Type,
+        value: &Initializer,
+        cursor: &mut InitCursor,
+    ) -> Result<(), ()> {
+        match value {
+            Initializer::List(items) => {
+                let mut nested = InitCursor::new(items);
+                self.data_initialize_items(data, base, ty, &mut nested)
+            }
+            Initializer::Expr(expr) => self.data_assign_expr(data, base, ty, expr, cursor),
+        }
+    }
+
+    fn data_assign_expr(
+        &mut self,
+        data: &mut DataObject,
+        base: usize,
+        ty: &Type,
+        expr: &Expr,
+        cursor: &mut InitCursor,
+    ) -> Result<(), ()> {
+        let scalar = Self::scalar(ty);
+        if let Some(real_ty) = Self::complex_base(&scalar) {
+            if let Expr::CompoundLiteral(_, initializer) = expr {
+                return self.data_initialize(data, base, &scalar, initializer);
+            }
+            return self.data_initialize_complex(data, base, &real_ty, expr);
+        }
+        if let (Type::Array(_, Some(count), _), Expr::String(value)) = (&scalar, expr) {
+            let bytes = value.as_bytes();
+            let count = bytes.len().min(*count);
+            return self.write_data_bytes(data, base, &bytes[..count]);
+        }
+        if Self::aggregate(&scalar) {
+            if let Expr::CompoundLiteral(_, initializer) = expr {
+                return self.data_initialize(data, base, &scalar, initializer);
+            }
+            return self.data_initialize_elided(data, base, &scalar, expr, cursor);
+        }
+        let value = self.global_value(expr, &scalar)?;
+        self.write_data_value(data, base, &scalar, value)
+    }
+
+    fn data_initialize_items(
+        &mut self,
+        data: &mut DataObject,
+        base: usize,
+        ty: &Type,
+        cursor: &mut InitCursor,
+    ) -> Result<(), ()> {
+        match Self::scalar(ty) {
+            Type::Qualified(inner, _) => {
+                self.data_initialize_items(data, base, &inner, cursor)?;
+            }
+            Type::Array(element, count, _) => {
+                let stride = Self::size(&element);
+                let mut next = 0usize;
+                while !cursor.is_empty()
+                    && (!count.is_some_and(|n| next >= n)
+                        || cursor
+                            .peek()
+                            .is_some_and(|item| !item.designators.is_empty()))
+                {
+                    let Some(item) = cursor.next() else { break };
+                    let index = match item.designators.first() {
+                        Some(Designator::Index(expr)) => {
+                            Self::constant_value(expr).unwrap_or(next as i64).max(0) as usize
+                        }
+                        Some(Designator::Member(_)) => return Err(()),
+                        None => next,
+                    };
+                    let target = base + index * stride;
+                    if item.designators.len() > 1 {
+                        self.data_initialize_designated(
+                            data,
+                            target,
+                            &element,
+                            &item.designators[1..],
+                            &item.value,
+                        )?;
+                    } else {
+                        self.data_initialize_from_value(
+                            data,
+                            target,
+                            &element,
+                            &item.value,
+                            cursor,
+                        )?;
+                    }
+                    next = index + 1;
+                }
+            }
+            Type::Struct(_, fields) => {
+                let layouts = crate::layout::struct_layout(&fields).1;
+                let mut next = Self::next_initializable(&fields, 0);
+                while !cursor.is_empty()
+                    && (next < fields.len()
+                        || cursor
+                            .peek()
+                            .is_some_and(|item| !item.designators.is_empty()))
+                {
+                    let Some(item) = cursor.next() else { break };
+                    let index = match item.designators.first() {
+                        Some(Designator::Member(name)) => fields
+                            .iter()
+                            .position(|field| field.name.as_deref() == Some(name))
+                            .unwrap_or(next),
+                        _ => next,
+                    };
+                    if let Some(layout) = layouts.get(index) {
+                        let target = base + layout.offset;
+                        if layout.width.is_some_and(|width| width > 0) {
+                            let value = Self::constant_initializer_value(&item.value).ok_or(())?;
+                            self.write_data_bitfield(data, target, layout, value)?;
+                        } else if item.designators.len() > 1 {
+                            self.data_initialize_designated(
+                                data,
+                                target,
+                                &layout.ty,
+                                &item.designators[1..],
+                                &item.value,
+                            )?;
+                        } else {
+                            self.data_initialize_from_value(
+                                data,
+                                target,
+                                &layout.ty,
+                                &item.value,
+                                cursor,
+                            )?;
+                        }
+                    }
+                    next = Self::next_initializable(&fields, index + 1);
+                }
+            }
+            Type::Union(_, fields) => {
+                let Some(item) = cursor.next() else {
+                    return Ok(());
+                };
+                let index = match item.designators.first() {
+                    Some(Designator::Member(name)) => fields
+                        .iter()
+                        .position(|field| field.name.as_deref() == Some(name))
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                if let Some(layout) = crate::layout::union_layout(&fields).1.get(index) {
+                    if layout.width.is_some_and(|width| width > 0) {
+                        let value = Self::constant_initializer_value(&item.value).ok_or(())?;
+                        self.write_data_bitfield(data, base, layout, value)?;
+                    } else if item.designators.len() > 1 {
+                        self.data_initialize_designated(
+                            data,
+                            base,
+                            &layout.ty,
+                            &item.designators[1..],
+                            &item.value,
+                        )?;
+                    } else {
+                        self.data_initialize_from_value(
+                            data,
+                            base,
+                            &layout.ty,
+                            &item.value,
+                            cursor,
+                        )?;
+                    }
+                }
+            }
+            _ => {
+                let Some(item) = cursor.next() else {
+                    return Ok(());
+                };
+                if item.designators.is_empty() {
+                    self.data_initialize_from_value(data, base, ty, &item.value, cursor)?;
+                }
+            }
+        };
+        Ok(())
+    }
+
+    fn data_initialize_elided(
+        &mut self,
+        data: &mut DataObject,
+        base: usize,
+        ty: &Type,
+        first: &Expr,
+        cursor: &mut InitCursor,
+    ) -> Result<(), ()> {
+        match Self::scalar(ty) {
+            Type::Array(element, count, _) => {
+                let stride = Self::size(&element);
+                self.data_assign_expr(data, base, &element, first, cursor)?;
+                let mut next = 1usize;
+                while !cursor.is_empty()
+                    && (!count.is_some_and(|n| next >= n)
+                        || cursor
+                            .peek()
+                            .is_some_and(|item| !item.designators.is_empty()))
+                {
+                    let Some(item) = cursor.next() else { break };
+                    let index = match item.designators.first() {
+                        Some(Designator::Index(expr)) => {
+                            Self::constant_value(expr).unwrap_or(next as i64).max(0) as usize
+                        }
+                        Some(Designator::Member(_)) => return Err(()),
+                        None => next,
+                    };
+                    let target = base + index * stride;
+                    if item.designators.len() > 1 {
+                        self.data_initialize_designated(
+                            data,
+                            target,
+                            &element,
+                            &item.designators[1..],
+                            &item.value,
+                        )?;
+                    } else {
+                        self.data_initialize_from_value(
+                            data,
+                            target,
+                            &element,
+                            &item.value,
+                            cursor,
+                        )?;
+                    }
+                    next = index + 1;
+                }
+            }
+            Type::Struct(_, fields) => {
+                let layouts = crate::layout::struct_layout(&fields).1;
+                let first_index = Self::next_initializable(&fields, 0);
+                let Some(layout) = layouts.get(first_index) else {
+                    return Ok(());
+                };
+                let target = base + layout.offset;
+                if layout.width.is_some_and(|width| width > 0) {
+                    self.write_data_bitfield(data, target, layout, Self::constant_value(first)?)?;
+                } else {
+                    self.data_assign_expr(data, target, &layout.ty, first, cursor)?;
+                }
+                let mut next = Self::next_initializable(&fields, first_index + 1);
+                while !cursor.is_empty()
+                    && (next < fields.len()
+                        || cursor
+                            .peek()
+                            .is_some_and(|item| !item.designators.is_empty()))
+                {
+                    let Some(item) = cursor.next() else { break };
+                    let index = match item.designators.first() {
+                        Some(Designator::Member(name)) => fields
+                            .iter()
+                            .position(|field| field.name.as_deref() == Some(name))
+                            .unwrap_or(next),
+                        _ => next,
+                    };
+                    if let Some(layout) = layouts.get(index) {
+                        let target = base + layout.offset;
+                        if layout.width.is_some_and(|width| width > 0) {
+                            let value = Self::constant_initializer_value(&item.value).ok_or(())?;
+                            self.write_data_bitfield(data, target, layout, value)?;
+                        } else if item.designators.len() > 1 {
+                            self.data_initialize_designated(
+                                data,
+                                target,
+                                &layout.ty,
+                                &item.designators[1..],
+                                &item.value,
+                            )?;
+                        } else {
+                            self.data_initialize_from_value(
+                                data,
+                                target,
+                                &layout.ty,
+                                &item.value,
+                                cursor,
+                            )?;
+                        }
+                    }
+                    next = Self::next_initializable(&fields, index + 1);
+                }
+            }
+            Type::Union(_, fields) => {
+                if let Some(layout) = crate::layout::union_layout(&fields).1.first().cloned() {
+                    if layout.width.is_some_and(|width| width > 0) {
+                        self.write_data_bitfield(
+                            data,
+                            base,
+                            &layout,
+                            Self::constant_value(first)?,
+                        )?;
+                    } else {
+                        self.data_assign_expr(data, base, &layout.ty, first, cursor)?;
+                    }
+                }
+            }
+            _ => self.data_assign_expr(data, base, ty, first, cursor)?,
+        };
         Ok(())
     }
 
     fn data_initialize_designated(
         &mut self,
+        data: &mut DataObject,
+        base: usize,
         ty: &Type,
         designators: &[Designator],
         value: &Initializer,
-        values: &mut [(Type, DataValue)],
-        start: usize,
     ) -> Result<(), ()> {
         if designators.is_empty() {
-            return self.data_initialize(ty, value, values, start);
+            return self.data_initialize(data, base, ty, value);
         }
         match (Self::scalar(ty), &designators[0]) {
-            (Type::Array(element, _), Designator::Index(index)) => self.data_initialize_designated(
-                &element,
-                &designators[1..],
-                value,
-                values,
-                start + Self::constant_value(index)? as usize * Self::zero_data(&element).len(),
-            ),
-            (Type::Struct(_, fields), Designator::Member(name)) => {
-                let index = fields
-                    .iter()
-                    .position(|(field, _)| field == name)
-                    .ok_or(())?;
-                let offset: usize = fields
-                    .iter()
-                    .take(index)
-                    .map(|(_, field)| Self::zero_data(field).len())
-                    .sum();
+            (Type::Qualified(inner, _), _) => {
+                self.data_initialize_designated(data, base, &inner, designators, value)
+            }
+            (Type::Array(element, _, _), Designator::Index(index)) => {
+                let index = Self::constant_value(index).unwrap_or(0).max(0) as usize;
                 self.data_initialize_designated(
-                    &fields[index].1,
+                    data,
+                    base + index * Self::size(&element),
+                    &element,
                     &designators[1..],
                     value,
-                    values,
-                    start + offset,
                 )
             }
-            (Type::Union(_, fields), Designator::Member(name)) => {
-                let field = fields.iter().find(|(field, _)| field == name).ok_or(())?;
-                self.data_initialize_designated(&field.1, &designators[1..], value, values, start)
+            (Type::Struct(_, fields) | Type::Union(_, fields), Designator::Member(name)) => {
+                let index = fields
+                    .iter()
+                    .position(|field| field.name.as_deref() == Some(name))
+                    .ok_or(())?;
+                let layout = crate::layout::member(ty, index).ok_or(())?;
+                if layout.width.is_some_and(|width| width > 0) {
+                    let value = Self::constant_initializer_value(value).ok_or(())?;
+                    return self.write_data_bitfield(data, base + layout.offset, &layout, value);
+                }
+                self.data_initialize_designated(
+                    data,
+                    base + layout.offset,
+                    &layout.ty,
+                    &designators[1..],
+                    value,
+                )
             }
             _ => Err(()),
         }
     }
 
-    fn global_value(&mut self, expr: &Expr) -> Result<DataValue, ()> {
+    fn zero_data_value(ty: &Type) -> DataValue {
+        if Self::is_float(ty) {
+            DataValue::Float(0.0, Self::scalar(ty))
+        } else {
+            DataValue::Integer(0)
+        }
+    }
+
+    fn constant_data_value(initializer: &Initializer, ty: &Type) -> Option<DataValue> {
+        match initializer {
+            Initializer::Expr(expr) => {
+                if Self::is_float(ty) {
+                    Self::constant_float_value(expr)
+                        .map(|value| DataValue::Float(value, Self::scalar(ty)))
+                } else {
+                    Self::constant_value(expr).ok().map(DataValue::Integer)
+                }
+            }
+            Initializer::List(items) => {
+                let item = items.first()?;
+                if !item.designators.is_empty() {
+                    return None;
+                }
+                Self::constant_data_value(&item.value, ty)
+            }
+        }
+    }
+
+    fn constant_complex_value(expr: &Expr) -> Option<(f64, f64)> {
+        match expr {
+            Expr::Complex(real, imaginary, _) => Some((*real, *imaginary)),
+            Expr::Float(value, _) => Some((*value, 0.0)),
+            Expr::Int(value) => Some((*value as f64, 0.0)),
+            Expr::Char(value) => Some((*value as u32 as f64, 0.0)),
+            Expr::Cast(ty, value) => {
+                let (real, imaginary) = Self::constant_complex_value(value)?;
+                if Self::is_complex(ty) {
+                    Some((real, imaginary))
+                } else {
+                    Some((real, 0.0))
+                }
+            }
+            Expr::Unary(UnOp::Pos, value) => Self::constant_complex_value(value),
+            Expr::Unary(UnOp::Neg, value) => {
+                let (real, imaginary) = Self::constant_complex_value(value)?;
+                Some((-real, -imaginary))
+            }
+            Expr::Unary(UnOp::Not, value) => {
+                let (real, imaginary) = Self::constant_complex_value(value)?;
+                Some(((real == 0.0 && imaginary == 0.0) as i64 as f64, 0.0))
+            }
+            Expr::Binary(op, a, b) => {
+                let (ar, ai) = Self::constant_complex_value(a)?;
+                let (br, bi) = Self::constant_complex_value(b)?;
+                match op {
+                    BinOp::Add => Some((ar + br, ai + bi)),
+                    BinOp::Sub => Some((ar - br, ai - bi)),
+                    BinOp::Mul => Some((ar * br - ai * bi, ar * bi + ai * br)),
+                    BinOp::Div => {
+                        let denominator = br * br + bi * bi;
+                        Some((
+                            (ar * br + ai * bi) / denominator,
+                            (ai * br - ar * bi) / denominator,
+                        ))
+                    }
+                    BinOp::Eq => Some(((ar == br && ai == bi) as i64 as f64, 0.0)),
+                    BinOp::Ne => Some(((ar != br || ai != bi) as i64 as f64, 0.0)),
+                    _ => None,
+                }
+            }
+            Expr::Conditional(condition, yes, no) => {
+                let (real, imaginary) = Self::constant_complex_value(condition)?;
+                if real != 0.0 || imaginary != 0.0 {
+                    Self::constant_complex_value(yes)
+                } else {
+                    Self::constant_complex_value(no)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn constant_float_value(expr: &Expr) -> Option<f64> {
+        match expr {
+            Expr::Float(value, _) => Some(*value),
+            Expr::Int(value) => Some(*value as f64),
+            Expr::Char(value) => Some(*value as u32 as f64),
+            Expr::Cast(ty, value) => {
+                let value = Self::constant_float_value(value)
+                    .or_else(|| Self::constant_value(value).ok().map(|x| x as f64))?;
+                if Self::is_float(ty) {
+                    Some(value)
+                } else {
+                    Some((value as i64) as f64)
+                }
+            }
+            Expr::Unary(UnOp::Pos, value) => Self::constant_float_value(value),
+            Expr::Unary(UnOp::Neg, value) => Some(-Self::constant_float_value(value)?),
+            Expr::Unary(UnOp::Not, value) => {
+                Some((Self::constant_float_value(value)? == 0.0) as i64 as f64)
+            }
+            Expr::Binary(op, a, b) => {
+                let (x, y) = (
+                    Self::constant_float_value(a)?,
+                    Self::constant_float_value(b)?,
+                );
+                match op {
+                    BinOp::Add => Some(x + y),
+                    BinOp::Sub => Some(x - y),
+                    BinOp::Mul => Some(x * y),
+                    BinOp::Div => Some(x / y),
+                    BinOp::Eq => Some((x == y) as i64 as f64),
+                    BinOp::Ne => Some((x != y) as i64 as f64),
+                    BinOp::Lt => Some((x < y) as i64 as f64),
+                    BinOp::Le => Some((x <= y) as i64 as f64),
+                    BinOp::Gt => Some((x > y) as i64 as f64),
+                    BinOp::Ge => Some((x >= y) as i64 as f64),
+                    BinOp::And => Some((x != 0.0 && y != 0.0) as i64 as f64),
+                    BinOp::Or => Some((x != 0.0 || y != 0.0) as i64 as f64),
+                    _ => None,
+                }
+            }
+            Expr::Conditional(c, yes, no) => {
+                if Self::constant_float_value(c)? != 0.0 {
+                    Self::constant_float_value(yes)
+                } else {
+                    Self::constant_float_value(no)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn constant_initializer_value(initializer: &Initializer) -> Option<i64> {
+        match initializer {
+            Initializer::Expr(expr) => Self::constant_value(expr).ok(),
+            Initializer::List(items) => {
+                let item = items.first()?;
+                if !item.designators.is_empty() {
+                    return None;
+                }
+                Self::constant_initializer_value(&item.value)
+            }
+        }
+    }
+
+    fn global_initializer_value(
+        &mut self,
+        initializer: &Initializer,
+        ty: &Type,
+    ) -> Result<DataValue, ()> {
+        match initializer {
+            Initializer::Expr(expr) => self.global_value(expr, ty),
+            Initializer::List(items) => {
+                let item = items.first().ok_or(())?;
+                if !item.designators.is_empty() {
+                    return Err(());
+                }
+                self.global_initializer_value(&item.value, ty)
+            }
+        }
+    }
+
+    fn global_value(&mut self, expr: &Expr, ty: &Type) -> Result<DataValue, ()> {
         match expr {
             Expr::Unary(UnOp::Address, value) => match &**value {
                 Expr::Var(name) => Ok(DataValue::Address(name.clone())),
                 Expr::CompoundLiteral(ty, initializer) => {
                     let name = format!("compound_literal_{}", self.aggregate_data.len());
-                    let mut values = Self::zero_data(ty);
-                    self.data_initialize(ty, initializer, &mut values, 0)?;
-                    self.aggregate_data.push(DataObject {
-                        name: name.clone(),
-                        ty: ty.clone(),
-                        values,
-                        internal: true,
-                    });
+                    let mut data = Self::new_data_object(name.clone(), ty, true);
+                    self.data_initialize(&mut data, 0, ty, initializer)?;
+                    self.aggregate_data.push(data);
                     Ok(DataValue::Address(name))
                 }
                 _ => Err(()),
             },
             Expr::CompoundLiteral(ty, initializer) if Self::aggregate(ty) => {
                 let name = format!("compound_literal_{}", self.aggregate_data.len());
-                let mut values = Self::zero_data(ty);
-                self.data_initialize(ty, initializer, &mut values, 0)?;
-                self.aggregate_data.push(DataObject {
-                    name: name.clone(),
-                    ty: ty.clone(),
-                    values,
-                    internal: true,
-                });
+                let mut data = Self::new_data_object(name.clone(), ty, true);
+                self.data_initialize(&mut data, 0, ty, initializer)?;
+                self.aggregate_data.push(data);
                 Ok(DataValue::Address(name))
             }
-            _ => Ok(DataValue::Integer(Self::constant_value(expr)?)),
+            Expr::String(value) => Ok(DataValue::Address(self.intern_string(value))),
+            _ if Self::is_float(ty) => Self::constant_float_value(expr)
+                .map(|value| DataValue::Float(value, Self::scalar(ty)))
+                .ok_or(()),
+            _ => match Self::constant_value(expr) {
+                Ok(value) => Ok(DataValue::Integer(value)),
+                Err(()) => Self::constant_float_value(expr)
+                    .map(|value| DataValue::Integer(value as i64))
+                    .ok_or(()),
+            },
         }
     }
 
@@ -1131,7 +2801,13 @@ impl Lowerer {
         match expr {
             Expr::Int(n) => Ok(*n),
             Expr::Char(c) => Ok(*c as i64),
-            Expr::Cast(_, x) | Expr::Unary(UnOp::Pos, x) => Self::constant_value(x),
+            Expr::Cast(_, x) => match Self::constant_value(x) {
+                Ok(value) => Ok(value),
+                Err(()) => Self::constant_float_value(x)
+                    .map(|value| value as i64)
+                    .ok_or(()),
+            },
+            Expr::Unary(UnOp::Pos, x) => Self::constant_value(x),
             Expr::Unary(UnOp::Not, x) => Ok((Self::constant_value(x)? == 0) as i64),
             Expr::Unary(UnOp::Neg, x) => Self::constant_value(x)?.checked_neg().ok_or(()),
             Expr::Unary(UnOp::BitNot, x) => Ok(!Self::constant_value(x)?),

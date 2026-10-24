@@ -11,9 +11,9 @@ The target is a documented, test-backed C99 implementation for one declared targ
 - Roadmap item 0.3 is complete for the current subset: categorized valid/invalid/diagnostic/preprocessor/runtime fixtures are exercised by `tests/conformance.rs`, optional integer differential testing is available against the host compiler, and warning/sanitizer commands are documented.
 - Roadmap item 1.1 is complete for the current translation pipeline: newlines are normalized, trigraphs and backslash-newline splices are processed before directives, comments become whitespace while retaining newlines, malformed comments/literals are diagnosed, preprocessing tokens are independently tokenized, and UCNs are accepted in identifiers and literals.
 - Roadmap item 1.2 is implemented for the current supported preprocessor subset: macro replacement is token-based with recursive-expansion suppression, stringification, token pasting, variadics, `#if` evaluation, macro-expanded includes, `#undef`, `#line`, `_Pragma`, required predefined macros, and conditional/redefinition diagnostics. Full C99 corner-case recovery and expression grammar remain follow-up work.
-- Roadmap item 1.3 is in progress: C99 keyword tokens, integer radix/suffix spelling recognition, decimal and hexadecimal floating-constant tokenization, ellipsis, all ordinary C punctuators (including `#`/`##`), and bracket/brace digraphs are covered. Integer type selection/ranges beyond the signed internal value, semantic use of floating constants, complete escape decoding, wide literals, multi-character constants, and precise malformed-number validation still need implementation.
-- Current compiler tests pass, but they cover only a small language subset.
-- The compiler currently has no complete type checker, no complete C99 preprocessor, no global objects, no floating-point implementation, and no reliable target ABI model.
+- Roadmap item 1.3 is in progress: C99 keyword tokens, integer radix/suffix spelling recognition, decimal and hexadecimal floating-constant tokenization (including imaginary suffixes), ellipsis, all ordinary C punctuators (including `#`/`##`), and bracket/brace digraphs are covered. Integer type selection/ranges beyond the signed internal value, complete escape decoding, wide literals, multi-character constants, and precise malformed-number validation still need implementation.
+- Current compiler tests pass, but they cover only part of the language.
+- The compiler has partial global-object, floating-point, `_Complex`, and target ABI support, but no complete type checker or C99 preprocessor; `_Imaginary` is diagnosed as unsupported.
 - Existing behavior should be preserved only where it is covered by new conformance tests; several current tests encode stubs rather than C99 behavior.
 
 ## Priority 0 — Make the compiler safe and diagnostically trustworthy
@@ -89,7 +89,7 @@ Keep `#pragma once` as an extension, but do not use it as a substitute for stand
 
 Replace the current “one name per declaration” parser with C99 declaration-specifier and declarator parsing:
 
-Progress: the parser accepts varied orderings of integer and character type specifiers (including interspersed qualifiers), multiple local declarators with assignment initializers, file-scope object declarations with multiple declarators, multiple function declarators in a declaration, parenthesized pointer/array declarators (including pointers to arrays), nested function declarators (including functions returning function pointers and arrays of function pointers), prototypes with named or abstract pointer parameters, unspecified parameter lists, variadic declarators, identifier-list declarations, old-style function definitions with following parameter declarations, local and file-scope typedef declarations with multiple declarators, scoped typedef lookup and ordinary-name hiding, array declarator syntax for qualifiers, `static`, and expression bounds, and type names in casts, `sizeof`, and compound literals. File-scope scalar and aggregate objects lower to initialized or zero-initialized QBE data; tentative definitions, `extern` declarations, and internal `static` objects are covered. Parameter arrays and function parameters are adjusted to pointer types; array parameter qualifiers are applied to the adjusted pointer. Block-scope `auto`, `register`, `static`, and `extern` are represented; static scalar locals receive persistent storage and constant initialization, register objects reject address-taking, and static functions use internal QBE linkage. `inline` is parsed and retained but its C99 definition/linkage rules are not implemented. Array `static` metadata is not retained, VLA bounds are not evaluated or lowered, and block-scope typedef state is parser-only rather than part of semantic scopes. Compound literals support recursive aggregate lists, member and array designators, inferred array bounds, zero-fill, lvalue operations, and static-duration data at file scope. Brace elision, string-literal array initialization, and complete ABI layout remain outstanding. Mixed function/object declarator lists, variadic function bodies, and variable-argument lowering remain outstanding; other unusual function declaration constraints need more coverage. This remains partial coverage.
+Progress: all previously listed 2.1 items are implemented. Array `static` and qualifier metadata is retained on adjusted parameter types, and declarations diagnose incomplete return/parameter types, misapplied `restrict`, qualified or static arrays outside parameters, and static array bounds without sizes. Remaining gaps are those called out in the bullet list, notably indirect function-pointer calls and exhaustive declarator/specifier combinations.
 
 - Arbitrary declaration-specifier ordering (integer/character specifier permutations and common qualifier positions are supported; storage-class and every C99 combination remain).
 - Multiple declarators per declaration (local and file-scope scalar/aggregate objects lower).
@@ -120,7 +120,11 @@ Progress: the parser accepts varied orderings of integer and character type spec
 - Track incomplete types and reject invalid object/function uses.
 - Add compatibility and composite-type computation.
 
+Progress: floating and `_Complex` types are modeled for `float`, `double`, and `long double` bases, including arithmetic, comparisons, conversions, negation, function parameters/returns, block and file-scope initialization (including designated aggregate members), and `sizeof`. `_Imaginary` is parsed and rejected with a diagnostic rather than silently accepted. Incomplete-type and composite-type handling remain incomplete.
+
 ### 2.4 Add target layout and representation
+
+Progress: size, alignment, field offsets, and union extent for the x86-64 Linux target are centralized in `src/layout.rs`; aggregate initializers, including brace elision and designated items, use the same layout. Data emission writes aggregate bytes and relocations against the resulting layout. Bit-field offsets, widths, masks, and storage-unit layout are shared with the initializer and code-generation paths. Floating constants and `_Complex` objects (`float` and `double` bases) are represented and emitted in static data. `_Bool` normalization, `long double`'s distinct x87 representation, and complete complex calling-convention coverage remain outstanding.
 
 - Centralize size, alignment, rank, and representation rules in a target data-layout module.
 - Correctly lay out structure padding and alignment.
@@ -155,7 +159,7 @@ Progress: the parser accepts varied orderings of integer and character type spec
 
 - Build an integer constant-expression evaluator.
 - Use it for enum values, array bounds, bit-field widths, case labels, static initializers, and `#if` where appropriate.
-- Implement floating constant-expression handling where required.
+- Integer and floating constant expressions are evaluated for static initializers; extend the evaluator to all required contexts and diagnose representability failures uniformly.
 - Detect invalid constant expressions and representability failures.
 
 ## Priority 4 — Complete expressions and statements
@@ -167,7 +171,7 @@ Progress: the parser accepts varied orderings of integer and character type spec
 - Implement compound literals.
 - Implement correct prefix and postfix increment/decrement semantics.
 - Implement function designators and indirect calls.
-- Implement floating and complex operators.
+- Floating and complex arithmetic, comparisons, conversions, and negation are implemented; complete evaluation-order and compound-assignment coverage remains outstanding.
 - Implement pointer comparisons and pointer difference.
 - Preserve C evaluation and sequencing rules.
 - Ensure short-circuit operators and conditional expressions evaluate only the permitted operand.
@@ -194,6 +198,8 @@ Progress: the parser accepts varied orderings of integer and character type spec
 ## Priority 5 — Correct code generation and ABI integration
 
 ### 5.1 Replace the integer-only QBE lowering
+
+Progress: lowering and code generation now emit typed `w`, `l`, `s`, and `d` values for integer, pointer, floating, and `_Complex` operations, including conversions, comparisons, returns, and typed call results. Aggregate and complex calls use QBE aggregate types where implemented. Full aggregate argument/return ABI edge cases, unsigned conversion variants, and `long double`'s distinct representation remain outstanding.
 
 - Emit QBE `w`, `l`, `s`, and `d` values according to C types.
 - Generate signed and unsigned division, remainder, comparisons, and shifts correctly.
@@ -240,6 +246,8 @@ Provide all required limits, including `CHAR_MIN`, `CHAR_MAX`, `MB_LEN_MAX`, `LL
 - Implement target-ABI variable argument lowering.
 - Provide working `va_list`, `va_start`, `va_arg`, `va_copy`, and `va_end` behavior.
 - Add tests for integer, pointer, floating, and aggregate variadic arguments.
+
+Progress: scalar integer, pointer, and floating variadic arguments work through QBE `vastart`/`vaarg`; aggregate `va_arg` remains unsupported.
 
 ### 6.5 `<stdbool.h>`
 

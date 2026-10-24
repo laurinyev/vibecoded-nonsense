@@ -9,8 +9,10 @@ the source of truth for language coverage.
 `conformance/valid`, `conformance/invalid`, `conformance/diagnostics`,
 `conformance/preprocess`, and `conformance/runtime`. Invalid fixtures must be
 rejected; diagnostic fixtures carry an `EXPECT-DIAGNOSTIC` marker; the
-preprocessor fixture is compared with the host `cc`; and the runtime fixture is
-compiled, linked, sandboxed, and checked by exit status.
+preprocessor fixture is compared with the host `cc`; valid fixtures are
+compiled and selected ones are executed by behavior tests; and the runtime
+fixture is compiled, linked, sandboxed, and checked for its expected exit
+status.
 
 The translation-phase tests also cover CRLF/CR normalization, trigraphs,
 backslash-newline splicing, comment whitespace/newline behavior, malformed

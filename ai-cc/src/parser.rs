@@ -8,8 +8,15 @@ use std::collections::HashMap;
 #[derive(Clone)]
 enum DeclaratorOp {
     Pointer(Qualifiers),
-    Array(Option<usize>, Qualifiers, bool),
+    Array(ArrayBound, Qualifiers, bool),
     Function(Vec<(String, Type)>, bool, bool),
+}
+
+#[derive(Clone)]
+enum ArrayBound {
+    Fixed(usize),
+    Unspecified,
+    Vla(Box<Expr>),
 }
 
 enum ExternalDecl {
@@ -17,11 +24,22 @@ enum ExternalDecl {
     Object,
 }
 
+struct DeclaratorDetails {
+    name: String,
+    ty: Type,
+    params: Vec<(String, Type)>,
+    is_variadic: bool,
+    has_prototype: bool,
+    is_function_declarator: bool,
+}
+
 pub struct Parser {
     t: Vec<Token>,
     p: usize,
     errors: Vec<Diagnostic>,
     aliases: Vec<HashMap<String, Option<Type>>>,
+    pending_functions: Vec<Function>,
+    pending_declarations: Vec<GlobalDecl>,
     eof: TokenKind,
 }
 impl Parser {
@@ -31,6 +49,8 @@ impl Parser {
             p: 0,
             errors: Vec::new(),
             aliases: vec![HashMap::new()],
+            pending_functions: Vec::new(),
+            pending_declarations: Vec::new(),
             eof: TokenKind::End,
         }
     }
@@ -104,30 +124,115 @@ impl Parser {
                     ..Default::default()
                 },
             };
-            return Ok(Type::Qualified(Box::new(self.typ()?), q));
+            return Ok(Self::qualified_type_specifier(self.typ()?, q));
+        }
+        if self.take(&TokenKind::Complex) {
+            let base = if matches!(
+                self.cur(),
+                TokenKind::Float
+                    | TokenKind::Double
+                    | TokenKind::Long
+                    | TokenKind::Const
+                    | TokenKind::Volatile
+            ) {
+                self.typ()?
+            } else {
+                Type::Double
+            };
+            let base = match base {
+                Type::Float | Type::Double | Type::LongDouble => base,
+                Type::Qualified(inner, qualifiers)
+                    if matches!(*inner, Type::Float | Type::Double | Type::LongDouble) =>
+                {
+                    return Ok(Type::Qualified(Box::new(Type::Complex(inner)), qualifiers))
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        "_Complex requires a floating type",
+                        Some(self.cur_span()),
+                    ))
+                }
+            };
+            return Ok(Type::Complex(Box::new(base)));
+        }
+        if self.take(&TokenKind::Imaginary) {
+            return Err(Diagnostic::error(
+                "_Imaginary types are not supported",
+                Some(self.cur_span()),
+            ));
         }
         if self.take(&TokenKind::Struct) || self.take(&TokenKind::Union) {
             let union = self.t[self.p - 1].kind == TokenKind::Union;
             let tag = self.ident().unwrap_or_default();
-            let mut fields = Vec::new();
+            let mut fields: Vec<Field> = Vec::new();
             if self.take(&TokenKind::LBrace) {
                 while *self.cur() != TokenKind::RBrace && *self.cur() != TokenKind::End {
-                    let ft = self.typ()?;
-                    let (name, ft) = self.declarator(ft)?;
-                    if name.is_empty() {
-                        return Err(Diagnostic::error(
-                            "member declarator requires a name",
-                            Some(self.cur_span()),
-                        ));
+                    let base = self.typ()?;
+                    loop {
+                        let (name, ft) = self.declarator(base.clone())?;
+                        let bit_width = if self.take(&TokenKind::Colon) {
+                            let width_expr = self.assign()?;
+                            let width = Self::integer_constant(&width_expr).ok_or_else(|| {
+                                Diagnostic::error(
+                                    "bit-field width requires an integer constant expression",
+                                    Some(self.cur_span()),
+                                )
+                            })?;
+                            let width = u32::try_from(width).map_err(|_| {
+                                Diagnostic::error(
+                                    "bit-field width must be nonnegative",
+                                    Some(self.cur_span()),
+                                )
+                            })?;
+                            if width == 0 && !name.is_empty() {
+                                return Err(Diagnostic::error(
+                                    "named bit-field cannot have zero width",
+                                    Some(self.cur_span()),
+                                ));
+                            }
+                            if width > (crate::layout::size(&ft) * 8) as u32 {
+                                return Err(Diagnostic::error(
+                                    "bit-field width exceeds its declared type",
+                                    Some(self.cur_span()),
+                                ));
+                            }
+                            if !Self::bitfield_type(&ft) {
+                                return Err(Diagnostic::error(
+                                    "bit-field has an invalid base type",
+                                    Some(self.cur_span()),
+                                ));
+                            }
+                            Some(width)
+                        } else {
+                            None
+                        };
+                        if name.is_empty() && bit_width.is_none() {
+                            return Err(Diagnostic::error(
+                                "member declarator requires a name",
+                                Some(self.cur_span()),
+                            ));
+                        }
+                        if !name.is_empty()
+                            && fields
+                                .iter()
+                                .any(|field| field.name.as_deref() == Some(name.as_str()))
+                        {
+                            return Err(Diagnostic::error(
+                                format!("duplicate member {}", name),
+                                Some(self.cur_span()),
+                            ));
+                        }
+                        fields.push(match bit_width {
+                            Some(width) => {
+                                Field::bitfield((!name.is_empty()).then_some(name), ft, width)
+                            }
+                            None => Field::named(name, ft),
+                        });
+                        if !self.take(&TokenKind::Comma) {
+                            break;
+                        }
                     }
                     self.expect(&TokenKind::Semicolon)?;
-                    if fields.iter().any(|(n, _)| n == &name) {
-                        return Err(Diagnostic::error(
-                            format!("duplicate member {}", name),
-                            Some(self.cur_span()),
-                        ));
-                    }
-                    fields.push((name, ft));
                 }
                 self.expect(&TokenKind::RBrace)?;
             }
@@ -205,7 +310,15 @@ impl Parser {
                     && !saw_int
                     && self.take(&TokenKind::Double)
                 {
-                    return Ok(Type::LongDouble);
+                    let mut ty = Type::LongDouble;
+                    if self.take(&TokenKind::Complex) {
+                        ty = Type::Complex(Box::new(ty));
+                    }
+                    return Ok(if qualifiers == Qualifiers::default() {
+                        ty
+                    } else {
+                        Self::qualified(ty, qualifiers)
+                    });
                 }
                 if saw_char {
                     let ty = match (signed, unsigned, short, longs, saw_int) {
@@ -250,11 +363,25 @@ impl Parser {
             }
             TokenKind::Float => {
                 self.p += 1;
-                Type::Float
+                let mut ty = Type::Float;
+                if self.take(&TokenKind::Complex) {
+                    ty = Type::Complex(Box::new(ty));
+                }
+                while let Some(qualifier) = self.take_qualifier() {
+                    ty = Self::qualified(ty, qualifier);
+                }
+                ty
             }
             TokenKind::Double => {
                 self.p += 1;
-                Type::Double
+                let mut ty = Type::Double;
+                if self.take(&TokenKind::Complex) {
+                    ty = Type::Complex(Box::new(ty));
+                }
+                while let Some(qualifier) = self.take_qualifier() {
+                    ty = Self::qualified(ty, qualifier);
+                }
+                ty
             }
             TokenKind::Bool => {
                 self.p += 1;
@@ -315,13 +442,21 @@ impl Parser {
                     .map(|()| ExternalDecl::Object)
             };
             match parsed {
-                Ok(ExternalDecl::Functions(functions)) => {
+                Ok(ExternalDecl::Functions(mut functions)) => {
+                    functions.append(&mut self.pending_functions);
                     for function in functions {
                         self.aliases[0].insert(function.name.clone(), None);
                         v.push(function);
                     }
+                    declarations.append(&mut self.pending_declarations);
                 }
-                Ok(ExternalDecl::Object) => {}
+                Ok(ExternalDecl::Object) => {
+                    for function in self.pending_functions.drain(..) {
+                        self.aliases[0].insert(function.name.clone(), None);
+                        v.push(function);
+                    }
+                    declarations.append(&mut self.pending_declarations);
+                }
                 Err(x) => {
                     e.push(x);
                     self.synchronize(false);
@@ -415,9 +550,9 @@ impl Parser {
             .typ()
             .ok()
             .and_then(|base| self.declarator_full_details(base).ok())
-            .is_some_and(|(_, ty, _, _, _, is_function_declarator)| {
-                is_function_declarator
-                    && matches!(ty, Type::Function(_, _, _, _))
+            .is_some_and(|details| {
+                details.is_function_declarator
+                    && matches!(details.ty, Type::Function(_, _, _, _))
                     && (*self.cur() == TokenKind::LBrace || self.is_type())
             });
         self.p = start;
@@ -426,12 +561,13 @@ impl Parser {
 
     fn complex_function_definition(&mut self) -> Result<Function, Diagnostic> {
         let mut is_static = false;
+        let mut is_extern = false;
         let mut is_inline = false;
         loop {
             if self.take(&TokenKind::Static) {
                 is_static = true;
             } else if self.take(&TokenKind::Extern) {
-                // External linkage is the default in the current function AST.
+                is_extern = true;
             } else if self.take(&TokenKind::Inline) {
                 is_inline = true;
             } else {
@@ -439,8 +575,14 @@ impl Parser {
             }
         }
         let base = self.typ()?;
-        let (name, ty, mut params, is_variadic, has_prototype, is_function_declarator) =
-            self.declarator_full_details(base)?;
+        let DeclaratorDetails {
+            name,
+            ty,
+            mut params,
+            is_variadic,
+            has_prototype,
+            is_function_declarator,
+        } = self.declarator_full_details(base)?;
         let Type::Function(ret, _, _, _) = ty else {
             return Err(Diagnostic::error(
                 "function definition declarator must have function type",
@@ -468,7 +610,7 @@ impl Parser {
             params,
             !has_prototype,
             is_variadic,
-            is_static,
+            is_static || (is_inline && !is_extern),
             is_inline,
         )
     }
@@ -531,12 +673,13 @@ impl Parser {
     fn nested_function_declaration(&mut self) -> Result<Function, Diagnostic> {
         let start = self.cur_span().start;
         let mut is_static = false;
+        let mut is_extern = false;
         let mut is_inline = false;
         loop {
             if self.take(&TokenKind::Static) {
                 is_static = true;
             } else if self.take(&TokenKind::Extern) {
-                // External linkage is the default in the current function AST.
+                is_extern = true;
             } else if self.take(&TokenKind::Inline) {
                 is_inline = true;
             } else {
@@ -560,7 +703,7 @@ impl Parser {
             is_variadic,
             body: Block { stmts: Vec::new() },
             external: true,
-            is_static,
+            is_static: is_static || (is_inline && !is_extern),
             is_inline,
             span: self.span_from(start),
         })
@@ -621,6 +764,7 @@ impl Parser {
             ));
         }
         let mut declarations_here = Vec::new();
+        let mut saw_function = false;
         loop {
             let (name, ty) = self.declarator_full(base.clone())?;
             if name.is_empty() {
@@ -629,14 +773,35 @@ impl Parser {
                     Some(self.cur_span()),
                 ));
             }
-            if matches!(ty, Type::Function(_, _, _, _)) {
-                return Err(Diagnostic::error(
-                    "use a function declaration for file-scope function prototypes",
-                    Some(self.cur_span()),
-                ));
+            if let Type::Function(ret, params, is_variadic, has_prototype) = ty {
+                if self.take(&TokenKind::Assign) {
+                    return Err(Diagnostic::error(
+                        "function declaration cannot have an initializer",
+                        Some(self.cur_span()),
+                    ));
+                }
+                self.aliases[0].insert(name.clone(), None);
+                self.pending_functions.push(Function {
+                    name,
+                    ret: *ret,
+                    params: params.into_iter().map(|ty| (String::new(), ty)).collect(),
+                    params_unspecified: !has_prototype,
+                    is_variadic,
+                    body: Block { stmts: Vec::new() },
+                    external: true,
+                    is_static: storage == Some(StorageClass::Static)
+                        || (is_inline && storage != Some(StorageClass::Extern)),
+                    is_inline,
+                    span: self.span_from(start),
+                });
+                saw_function = true;
+                if !self.take(&TokenKind::Comma) {
+                    break;
+                }
+                continue;
             }
             let initializer = if self.take(&TokenKind::Assign) {
-                Some(self.assign()?)
+                Some(self.initializer()?)
             } else {
                 None
             };
@@ -663,7 +828,7 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::Semicolon)?;
-        if declarations_here.is_empty() {
+        if declarations_here.is_empty() && !saw_function {
             types.push(base);
         } else {
             declarations.extend(declarations_here);
@@ -702,7 +867,12 @@ impl Parser {
             ));
         }
         let ret = self.typ()?;
-        self.function_after_type(ret, storage == Some(StorageClass::Static), is_inline)
+        self.function_after_type(
+            ret,
+            storage == Some(StorageClass::Static)
+                || (is_inline && storage != Some(StorageClass::Extern)),
+            is_inline,
+        )
     }
     fn function_after_type(
         &mut self,
@@ -912,13 +1082,42 @@ impl Parser {
                 return Ok(functions);
             }
             self.expect(&TokenKind::Comma)?;
-            let (name, ty, params, is_variadic, has_prototype, is_function_declarator) =
-                self.declarator_full_details(declaration_base.clone())?;
+            let DeclaratorDetails {
+                name,
+                ty,
+                params,
+                is_variadic,
+                has_prototype,
+                is_function_declarator,
+            } = self.declarator_full_details(declaration_base.clone())?;
+            if !matches!(ty, Type::Function(_, _, _, _)) {
+                if is_inline {
+                    return Err(Diagnostic::error(
+                        "inline is only valid on a function declaration",
+                        Some(self.cur_span()),
+                    ));
+                }
+                let initializer = if self.take(&TokenKind::Assign) {
+                    Some(self.initializer()?)
+                } else {
+                    None
+                };
+                let storage = is_static.then_some(StorageClass::Static);
+                self.aliases[0].insert(name.clone(), None);
+                self.pending_declarations.push(GlobalDecl {
+                    name,
+                    ty,
+                    storage,
+                    tentative_definition: storage != Some(StorageClass::Extern)
+                        || initializer.is_some(),
+                    initializer,
+                    is_inline: false,
+                    span: self.span_from(self.cur_span().start),
+                });
+                continue;
+            }
             let Type::Function(ret, _, _, _) = ty else {
-                return Err(Diagnostic::error(
-                    "mixed function and object declarators in one declaration are not yet supported",
-                    Some(self.cur_span()),
-                ));
+                unreachable!()
             };
             if !is_function_declarator {
                 return Err(Diagnostic::error(
@@ -1132,6 +1331,8 @@ impl Parser {
                     | TokenKind::Long
                     | TokenKind::Float
                     | TokenKind::Double
+                    | TokenKind::Complex
+                    | TokenKind::Imaginary
                     | TokenKind::Auto
                     | TokenKind::Extern
                     | TokenKind::Register
@@ -1238,7 +1439,7 @@ impl Parser {
                 ));
             }
             let init = if self.take(&TokenKind::Assign) {
-                Some(self.assign()?)
+                Some(self.initializer()?)
             } else {
                 None
             };
@@ -1270,10 +1471,7 @@ impl Parser {
         self.declarator_inner(&mut ty, true)
     }
 
-    fn declarator_full_details(
-        &mut self,
-        mut ty: Type,
-    ) -> Result<(String, Type, Vec<(String, Type)>, bool, bool, bool), Diagnostic> {
+    fn declarator_full_details(&mut self, mut ty: Type) -> Result<DeclaratorDetails, Diagnostic> {
         while let Some(qualifier) = self.take_qualifier() {
             ty = Self::qualified(ty, qualifier);
         }
@@ -1285,14 +1483,14 @@ impl Parser {
             _ => (Vec::new(), false, false, false),
         };
         ty = Self::apply_declarator_ops(ty, ops);
-        Ok((
+        Ok(DeclaratorDetails {
             name,
             ty,
             params,
-            variadic,
+            is_variadic: variadic,
             has_prototype,
             is_function_declarator,
-        ))
+        })
     }
 
     fn declarator_inner(
@@ -1319,8 +1517,19 @@ impl Parser {
                         Type::Qualified(Box::new(pointer), q)
                     }
                 }
-                DeclaratorOp::Array(size, qualifiers, _is_static) => {
-                    let array = Type::Array(Box::new(ty.clone()), size);
+                DeclaratorOp::Array(bound, mut qualifiers, is_static) => {
+                    let array = match bound {
+                        ArrayBound::Fixed(size) => {
+                            Type::Array(Box::new(ty.clone()), Some(size), is_static)
+                        }
+                        ArrayBound::Unspecified => {
+                            Type::Array(Box::new(ty.clone()), None, is_static)
+                        }
+                        ArrayBound::Vla(bound) => {
+                            qualifiers.is_static |= is_static;
+                            Type::Vla(Box::new(ty.clone()), bound)
+                        }
+                    };
                     if qualifiers == Qualifiers::default() {
                         array
                     } else {
@@ -1362,12 +1571,23 @@ impl Parser {
         Some(qualifier)
     }
 
+    fn qualified_type_specifier(ty: Type, q: Qualifiers) -> Type {
+        match ty {
+            Type::Array(element, count, is_static) => {
+                Type::Array(Box::new(Self::qualified(*element, q)), count, is_static)
+            }
+            Type::Vla(element, bound) => Type::Vla(Box::new(Self::qualified(*element, q)), bound),
+            ty => Self::qualified(ty, q),
+        }
+    }
+
     fn qualified(ty: Type, q: Qualifiers) -> Type {
         match ty {
             Type::Qualified(inner, mut existing) => {
                 existing.is_const |= q.is_const;
                 existing.is_volatile |= q.is_volatile;
                 existing.is_restrict |= q.is_restrict;
+                existing.is_static |= q.is_static;
                 Type::Qualified(inner, existing)
             }
             ty => Type::Qualified(Box::new(ty), q),
@@ -1376,10 +1596,24 @@ impl Parser {
 
     fn adjust_parameter_type(ty: Type) -> Type {
         match ty {
-            Type::Array(element, _) => Type::Pointer(element),
+            Type::Array(element, _, is_static) => Self::qualified(
+                Type::Pointer(element),
+                Qualifiers {
+                    is_static,
+                    ..Default::default()
+                },
+            ),
+            Type::Vla(element, _) => Type::Pointer(element),
             Type::Function(_, _, _, _) => Type::Pointer(Box::new(ty)),
             Type::Qualified(inner, q) => match *inner {
-                Type::Array(element, _) => Self::qualified(Type::Pointer(element), q),
+                Type::Array(element, _, is_static) => Self::qualified(
+                    Type::Pointer(element),
+                    Qualifiers {
+                        is_static: q.is_static || is_static,
+                        ..q
+                    },
+                ),
+                Type::Vla(element, _) => Self::qualified(Type::Pointer(element), q),
                 Type::Function(_, _, _, _) => Self::qualified(Type::Pointer(inner), q),
                 other => Self::qualified(other, q),
             },
@@ -1420,23 +1654,30 @@ impl Parser {
                     qualifiers.is_restrict |= q.is_restrict;
                 }
                 is_static |= self.take(&TokenKind::Static);
-                let size = if matches!(self.cur(), TokenKind::Number(_)) {
+                let bound = if matches!(self.cur(), TokenKind::Number(_)) {
                     if let TokenKind::Number(n) = self.cur().clone() {
                         self.p += 1;
-                        usize::try_from(n).ok()
+                        usize::try_from(n)
+                            .map(ArrayBound::Fixed)
+                            .unwrap_or(ArrayBound::Unspecified)
                     } else {
                         unreachable!()
                     }
                 } else if self.take(&TokenKind::Star) {
-                    None
+                    ArrayBound::Unspecified
                 } else if *self.cur() != TokenKind::RBracket {
-                    let _bound = self.assign()?;
-                    None
+                    ArrayBound::Vla(Box::new(self.assign()?))
                 } else {
-                    None
+                    ArrayBound::Unspecified
                 };
+                if is_static && matches!(bound, ArrayBound::Unspecified) {
+                    return Err(Diagnostic::error(
+                        "a static array parameter requires a size",
+                        Some(self.cur_span()),
+                    ));
+                }
                 self.expect(&TokenKind::RBracket)?;
-                ops.push(DeclaratorOp::Array(size, qualifiers, is_static));
+                ops.push(DeclaratorOp::Array(bound, qualifiers, is_static));
                 continue;
             }
             if allow_function && self.take(&TokenKind::LParen) {
@@ -1652,6 +1893,66 @@ impl Parser {
         self.primary()
     }
 
+    fn bitfield_type(ty: &Type) -> bool {
+        match ty {
+            Type::Qualified(inner, _) => Self::bitfield_type(inner),
+            Type::Bool
+            | Type::Char
+            | Type::SignedChar
+            | Type::UnsignedChar
+            | Type::Short
+            | Type::UnsignedShort
+            | Type::Int
+            | Type::SignedInt
+            | Type::UnsignedInt
+            | Type::Enum(_, _) => true,
+            _ => false,
+        }
+    }
+
+    fn integer_constant(expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Int(n) => Some(*n),
+            Expr::Char(c) => Some(*c as i64),
+            Expr::Cast(_, x) | Expr::Unary(UnOp::Pos, x) => Self::integer_constant(x),
+            Expr::Unary(UnOp::Neg, x) => Self::integer_constant(x)?.checked_neg(),
+            Expr::Unary(UnOp::Not, x) => Some((Self::integer_constant(x)? == 0) as i64),
+            Expr::Unary(UnOp::BitNot, x) => Some(!Self::integer_constant(x)?),
+            Expr::Binary(op, a, b) => {
+                let (a, b) = (Self::integer_constant(a)?, Self::integer_constant(b)?);
+                match op {
+                    BinOp::Add => a.checked_add(b),
+                    BinOp::Sub => a.checked_sub(b),
+                    BinOp::Mul => a.checked_mul(b),
+                    BinOp::Div => a.checked_div(b),
+                    BinOp::Rem => a.checked_rem(b),
+                    BinOp::Shl => a.checked_shl(u32::try_from(b).ok()?),
+                    BinOp::Shr => a.checked_shr(u32::try_from(b).ok()?),
+                    BinOp::BitAnd => Some(a & b),
+                    BinOp::BitOr => Some(a | b),
+                    BinOp::BitXor => Some(a ^ b),
+                    BinOp::Eq => Some((a == b) as i64),
+                    BinOp::Ne => Some((a != b) as i64),
+                    BinOp::Lt => Some((a < b) as i64),
+                    BinOp::Le => Some((a <= b) as i64),
+                    BinOp::Gt => Some((a > b) as i64),
+                    BinOp::Ge => Some((a >= b) as i64),
+                    BinOp::And => Some((a != 0 && b != 0) as i64),
+                    BinOp::Or => Some((a != 0 || b != 0) as i64),
+                    BinOp::Comma => Some(b),
+                }
+            }
+            Expr::Conditional(condition, yes, no) => {
+                if Self::integer_constant(condition)? != 0 {
+                    Self::integer_constant(yes)
+                } else {
+                    Self::integer_constant(no)
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn initializer(&mut self) -> Result<Initializer, Diagnostic> {
         if self.take(&TokenKind::LBrace) {
             self.initializer_list_after_lbrace()
@@ -1690,6 +1991,52 @@ impl Parser {
         Ok(Initializer::List(items))
     }
 
+    fn parse_float_constant(spelling: &str) -> Option<Expr> {
+        let imaginary = matches!(spelling.chars().last(), Some('i' | 'j'));
+        let spelling = if imaginary {
+            &spelling[..spelling.len() - 1]
+        } else {
+            spelling
+        };
+        let (body, ty) = match spelling.chars().last() {
+            Some('f' | 'F') => (&spelling[..spelling.len() - 1], Type::Float),
+            Some('l' | 'L') => (&spelling[..spelling.len() - 1], Type::LongDouble),
+            _ => (spelling, Type::Double),
+        };
+        let value = if body.starts_with("0x") || body.starts_with("0X") {
+            Self::parse_hex_float(body)?
+        } else {
+            body.parse::<f64>().ok()?
+        };
+        Some(if imaginary {
+            Expr::Complex(0.0, value, ty)
+        } else {
+            Expr::Float(value, ty)
+        })
+    }
+
+    fn parse_hex_float(body: &str) -> Option<f64> {
+        let body = body
+            .strip_prefix("0x")
+            .or_else(|| body.strip_prefix("0X"))?;
+        let (mantissa, exponent) = body.split_once(['p', 'P'])?;
+        let exponent = exponent.parse::<i32>().ok()?;
+        let (whole, fraction) = match mantissa.split_once('.') {
+            Some((whole, fraction)) => (whole, fraction),
+            None => (mantissa, ""),
+        };
+        let mut value = 0.0f64;
+        for digit in whole.chars() {
+            value = value * 16.0 + digit.to_digit(16)? as f64;
+        }
+        let mut place = 1.0 / 16.0;
+        for digit in fraction.chars() {
+            value += digit.to_digit(16)? as f64 * place;
+            place /= 16.0;
+        }
+        Some(value * 2f64.powi(exponent))
+    }
+
     fn lookahead_starts_type_name(&self) -> bool {
         match self.t.get(self.p + 1).map(|t| &t.kind) {
             Some(TokenKind::Ident(name)) => self.alias_type(name).is_some(),
@@ -1705,6 +2052,8 @@ impl Parser {
                     | TokenKind::Long
                     | TokenKind::Float
                     | TokenKind::Double
+                    | TokenKind::Complex
+                    | TokenKind::Imaginary
                     | TokenKind::Struct
                     | TokenKind::Union
                     | TokenKind::Enum
@@ -1732,11 +2081,11 @@ impl Parser {
                 self.p += 1;
                 Expr::Int(n)
             }
-            TokenKind::FloatConstant(_) => {
-                return Err(Diagnostic::error(
-                    "floating expressions are not implemented",
-                    Some(self.cur_span()),
-                ))
+            TokenKind::FloatConstant(spelling) => {
+                self.p += 1;
+                Self::parse_float_constant(&spelling).ok_or_else(|| {
+                    Diagnostic::error("invalid floating constant", Some(self.cur_span()))
+                })?
             }
             TokenKind::Char(c) => {
                 self.p += 1;
@@ -1754,17 +2103,42 @@ impl Parser {
             TokenKind::Ident(n) => {
                 self.p += 1;
                 if self.take(&TokenKind::LParen) {
-                    let mut a = Vec::new();
-                    if *self.cur() != TokenKind::RParen {
-                        loop {
-                            a.push(self.assign()?);
-                            if !self.take(&TokenKind::Comma) {
-                                break;
+                    if matches!(n.as_str(), "va_arg" | "__builtin_va_arg") {
+                        let ap = self.assign()?;
+                        self.expect(&TokenKind::Comma)?;
+                        let ty = self.type_name()?;
+                        self.expect(&TokenKind::RParen)?;
+                        Expr::VaArg(Box::new(ap), ty)
+                    } else if matches!(n.as_str(), "va_start" | "__builtin_va_start") {
+                        let ap = self.assign()?;
+                        if self.take(&TokenKind::Comma) {
+                            let _last = self.assign()?;
+                        }
+                        self.expect(&TokenKind::RParen)?;
+                        Expr::VaStart(Box::new(ap))
+                    } else if matches!(n.as_str(), "va_end" | "__builtin_va_end") {
+                        let ap = self.assign()?;
+                        self.expect(&TokenKind::RParen)?;
+                        Expr::VaEnd(Box::new(ap))
+                    } else if matches!(n.as_str(), "va_copy" | "__builtin_va_copy") {
+                        let destination = self.assign()?;
+                        self.expect(&TokenKind::Comma)?;
+                        let source = self.assign()?;
+                        self.expect(&TokenKind::RParen)?;
+                        Expr::VaCopy(Box::new(destination), Box::new(source))
+                    } else {
+                        let mut a = Vec::new();
+                        if *self.cur() != TokenKind::RParen {
+                            loop {
+                                a.push(self.assign()?);
+                                if !self.take(&TokenKind::Comma) {
+                                    break;
+                                }
                             }
                         }
+                        self.expect(&TokenKind::RParen)?;
+                        Expr::Call(n, a)
                     }
-                    self.expect(&TokenKind::RParen)?;
-                    Expr::Call(n, a)
                 } else {
                     let x = Expr::Var(n.clone());
                     if self.take(&TokenKind::PlusPlus) {

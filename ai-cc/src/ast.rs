@@ -17,20 +17,48 @@ pub enum Type {
     Float,
     Double,
     LongDouble,
+    Complex(Box<Type>),
     Void,
     Pointer(Box<Type>),
-    Array(Box<Type>, Option<usize>),
+    Array(Box<Type>, Option<usize>, bool),
+    Vla(Box<Type>, Box<Expr>),
     Function(Box<Type>, Vec<Type>, bool, bool),
-    Struct(String, Vec<(String, Type)>),
-    Union(String, Vec<(String, Type)>),
+    Struct(String, Vec<Field>),
+    Union(String, Vec<Field>),
     Enum(String, Vec<(String, i64)>),
     Qualified(Box<Type>, Qualifiers),
 }
+#[derive(Clone, Debug, PartialEq)]
+pub struct Field {
+    pub name: Option<String>,
+    pub ty: Type,
+    pub bit_width: Option<u32>,
+}
+
+impl Field {
+    pub fn named(name: String, ty: Type) -> Self {
+        Self {
+            name: Some(name),
+            ty,
+            bit_width: None,
+        }
+    }
+
+    pub fn bitfield(name: Option<String>, ty: Type, bit_width: u32) -> Self {
+        Self {
+            name,
+            ty,
+            bit_width: Some(bit_width),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Qualifiers {
     pub is_const: bool,
     pub is_volatile: bool,
     pub is_restrict: bool,
+    pub is_static: bool,
 }
 #[derive(Clone, Debug)]
 pub struct TranslationUnit {
@@ -44,7 +72,7 @@ pub struct GlobalDecl {
     pub name: String,
     pub ty: Type,
     pub storage: Option<StorageClass>,
-    pub initializer: Option<Expr>,
+    pub initializer: Option<Initializer>,
     pub tentative_definition: bool,
     pub is_inline: bool,
     pub span: Span,
@@ -68,11 +96,11 @@ pub struct Block {
 }
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    StorageDecl(StorageClass, Vec<(String, Type, Option<Expr>)>, Span),
+    StorageDecl(StorageClass, Vec<(String, Type, Option<Initializer>)>, Span),
     Typedef(String, Type, Span),
     Typedefs(Vec<(String, Type)>, Span),
-    Decl(String, Type, Option<Expr>, Span),
-    Decls(Vec<(String, Type, Option<Expr>)>, Span),
+    Decl(String, Type, Option<Initializer>, Span),
+    Decls(Vec<(String, Type, Option<Initializer>)>, Span),
     Expr(Expr, Span),
     Return(Option<Expr>, Span),
     Block(Block, Span),
@@ -118,9 +146,11 @@ impl Stmt {
         }
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Int(i64),
+    Float(f64, Type),
+    Complex(f64, f64, Type),
     Char(char),
     String(String),
     Var(String),
@@ -134,21 +164,25 @@ pub enum Expr {
     Cast(Type, Box<Expr>),
     SizeofType(Type),
     CompoundLiteral(Type, Initializer),
+    VaStart(Box<Expr>),
+    VaArg(Box<Expr>, Type),
+    VaEnd(Box<Expr>),
+    VaCopy(Box<Expr>, Box<Expr>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Initializer {
     Expr(Box<Expr>),
     List(Vec<InitializerItem>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InitializerItem {
     pub designators: Vec<Designator>,
     pub value: Initializer,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Designator {
     Index(Expr),
     Member(String),

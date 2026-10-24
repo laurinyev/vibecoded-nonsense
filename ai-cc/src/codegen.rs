@@ -15,22 +15,46 @@ impl QbeCodegen {
 
     fn ty(t: &Type) -> &'static str {
         match t {
-            Type::Pointer(_) | Type::Array(_, _) => "l",
+            Type::Pointer(_) | Type::Array(_, _, _) | Type::Vla(_, _) => "l",
+            Type::Float => "s",
+            Type::Double | Type::LongDouble => "d",
+            Type::Complex(_) => "l",
             Type::Qualified(x, _) => Self::ty(x),
             _ => "w",
         }
     }
 
-    fn value(x: &str) -> &str {
-        if x.starts_with("$str") {
-            "l"
+    fn abi_ty(t: &Type) -> String {
+        match t {
+            Type::Qualified(inner, _) => Self::abi_ty(inner),
+            Type::Complex(inner) => {
+                if Self::ty(inner) == "s" {
+                    ":c_s".to_string()
+                } else {
+                    ":c_d".to_string()
+                }
+            }
+            _ => Self::ty(t).to_string(),
+        }
+    }
+
+    fn float_literal(value: f64, ty: &Type) -> String {
+        let value = if matches!(ty, Type::Float) {
+            value as f32 as f64
         } else {
-            "w"
+            value
+        };
+        let text = format!("{value:?}");
+        if text.contains('.') || text.contains('e') || text.contains('E') {
+            text
+        } else {
+            format!("{text}.0")
         }
     }
 
     pub fn emit_program(&mut self, p: &LoweredProgram) -> Result<String, Vec<Diagnostic>> {
         let mut o = String::new();
+        o.push_str("type :c_s = { s, s }\ntype :c_d = { d, d }\n\n");
         for (name, ty, value, internal) in &p.globals {
             let mut base_ty = ty;
             while let Type::Qualified(inner, _) = base_ty {
@@ -39,6 +63,8 @@ impl QbeCodegen {
             let (directive, alignment) = match base_ty {
                 Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => ("b", 1),
                 Type::Short | Type::UnsignedShort => ("h", 2),
+                Type::Float => ("s", 4),
+                Type::Double | Type::LongDouble => ("d", 8),
                 Type::Long
                 | Type::UnsignedLong
                 | Type::LongLong
@@ -54,20 +80,12 @@ impl QbeCodegen {
             );
         }
         for data in &p.aggregate_data {
-            let alignment = Self::alignment(&data.ty);
-            let values = data
-                .values
-                .iter()
-                .map(|(ty, value)| {
-                    let directive = Self::data_directive(ty);
-                    format!("{} {}", directive, Self::data_value(value, directive))
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
+            let alignment = crate::layout::align(&data.ty);
+            let items = Self::data_items(data);
             let linkage = if data.internal { "data" } else { "export data" };
             o += &format!(
                 "{} ${} = align {} {{ {} }}\n",
-                linkage, data.name, alignment, values
+                linkage, data.name, alignment, items
             );
         }
         for (name, ty, value) in &p.statics {
@@ -78,6 +96,8 @@ impl QbeCodegen {
             let alignment = match base_ty {
                 Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => 1,
                 Type::Short | Type::UnsignedShort => 2,
+                Type::Float => 4,
+                Type::Double | Type::LongDouble => 8,
                 Type::Long
                 | Type::UnsignedLong
                 | Type::LongLong
@@ -85,18 +105,19 @@ impl QbeCodegen {
                 | Type::Pointer(_) => 8,
                 _ => 4,
             };
-            let (directive, value) = match base_ty {
-                Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => {
-                    ("b", *value as u8 as i64)
-                }
-                Type::Short | Type::UnsignedShort => ("h", *value as u16 as i64),
+            let directive = match base_ty {
+                Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => "b",
+                Type::Short | Type::UnsignedShort => "h",
+                Type::Float => "s",
+                Type::Double | Type::LongDouble => "d",
                 Type::Long
                 | Type::UnsignedLong
                 | Type::LongLong
                 | Type::UnsignedLongLong
-                | Type::Pointer(_) => ("l", *value),
-                _ => ("w", *value as i32 as i64),
+                | Type::Pointer(_) => "l",
+                _ => "w",
             };
+            let value = Self::data_value(value, directive);
             o += &format!(
                 "data $static_{} = align {} {{ {} {} }}\n",
                 name, alignment, directive, value
@@ -112,13 +133,22 @@ impl QbeCodegen {
             let params = f
                 .params
                 .iter()
-                .map(|(x, t)| format!("{} %{}", Self::ty(t), x))
+                .map(|(x, t)| format!("{} %{}", Self::abi_ty(t), x))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let params = if f.is_variadic {
+                if params.is_empty() {
+                    "...".to_string()
+                } else {
+                    format!("{}, ...", params)
+                }
+            } else {
+                params
+            };
             let ret = if matches!(f.ret, Type::Void) {
                 String::new()
             } else {
-                format!("{} ", Self::ty(&f.ret))
+                format!("{} ", Self::abi_ty(&f.ret))
             };
             let linkage = if f.is_static {
                 "function"
@@ -129,32 +159,74 @@ impl QbeCodegen {
             let mut terminated = false;
             for x in &f.body {
                 match x {
-                    Instr::Alloc(n, size) => o += &format!("{} =l alloc4 {}\n", n, size),
+                    Instr::Alloc(n, size) => {
+                        let op = if *size > 4 { "alloc8" } else { "alloc4" };
+                        o += &format!("{} =l {} {}\n", n, op, size)
+                    }
+                    Instr::AllocVla(n, count, element) => {
+                        let base = n.trim_start_matches('%');
+                        let wide = format!("%{}_count", base);
+                        let bytes = format!("%{}_bytes", base);
+                        o += &format!("{} =l extsw {}\n", wide, count);
+                        o += &format!("{} =l mul {}, {}\n", bytes, wide, element.max(&1));
+                        o += &format!("{} =l alloc8 {}\n", n, bytes);
+                    }
                     Instr::Const(n, v) => o += &format!("{} =w copy {}\n", n, v),
-                    Instr::Move(n, x) => o += &format!("{} ={} copy {}\n", n, Self::value(x), x),
+                    Instr::ConstLong(n, v) => o += &format!("{} =l copy {}\n", n, v),
+                    Instr::ConstFloat(n, v, ty) => {
+                        let qbe_ty = Self::ty(ty);
+                        let literal = Self::float_literal(*v, ty);
+                        o += &format!("{} ={} copy {}_{}\n", n, qbe_ty, qbe_ty, literal)
+                    }
+                    Instr::Move(n, x, ty) => o += &format!("{} ={} copy {}\n", n, Self::ty(ty), x),
                     Instr::Load(n, addr, ty) => {
-                        let op = if matches!(
-                            ty,
-                            Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool
-                        ) {
-                            "loadub"
-                        } else if Self::ty(ty) == "l" {
-                            "loadl"
-                        } else {
-                            "loadw"
+                        let op = match Self::ty(ty) {
+                            "l" => "loadl",
+                            "s" => "loads",
+                            "d" => "loadd",
+                            _ if matches!(
+                                ty,
+                                Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool
+                            ) =>
+                            {
+                                "loadub"
+                            }
+                            _ => "loadw",
                         };
                         o += &format!("{} ={} {} {}\n", n, Self::ty(ty), op, addr);
                     }
+                    Instr::LoadZero(n, addr, size) => {
+                        let op = match size {
+                            1 => "loadub",
+                            2 => "loaduh",
+                            4 => "loaduw",
+                            _ => "loadl",
+                        };
+                        let ty = if *size == 8 { "l" } else { "w" };
+                        o += &format!("{} ={} {} {}\n", n, ty, op, addr);
+                    }
                     Instr::Store(value, addr, ty) => {
-                        let op = if matches!(
-                            ty,
-                            Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool
-                        ) {
-                            "storeb"
-                        } else if Self::ty(ty) == "l" {
-                            "storel"
-                        } else {
-                            "storew"
+                        let op = match Self::ty(ty) {
+                            "l" => "storel",
+                            "s" => "stores",
+                            "d" => "stored",
+                            _ if matches!(
+                                ty,
+                                Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool
+                            ) =>
+                            {
+                                "storeb"
+                            }
+                            _ => "storew",
+                        };
+                        o += &format!("{} {}, {}\n", op, value, addr);
+                    }
+                    Instr::StoreSize(value, addr, size) => {
+                        let op = match size {
+                            1 => "storeb",
+                            2 => "storeh",
+                            4 => "storew",
+                            _ => "storel",
                         };
                         o += &format!("{} {}, {}\n", op, value, addr);
                     }
@@ -195,17 +267,96 @@ impl QbeCodegen {
                             b
                         );
                     }
-                    Instr::Call(dst, name, args) => {
-                        let args = args
+                    Instr::FloatBin(n, op, a, b, ty) => {
+                        let suffix = if matches!(ty, Type::Float) { "s" } else { "d" };
+                        let (result, op) = match op {
+                            crate::ast::BinOp::Add => (suffix, "add"),
+                            crate::ast::BinOp::Sub => (suffix, "sub"),
+                            crate::ast::BinOp::Mul => (suffix, "mul"),
+                            crate::ast::BinOp::Div => (suffix, "div"),
+                            crate::ast::BinOp::Eq => {
+                                ("w", if suffix == "s" { "ceqs" } else { "ceqd" })
+                            }
+                            crate::ast::BinOp::Ne => {
+                                ("w", if suffix == "s" { "cnes" } else { "cned" })
+                            }
+                            crate::ast::BinOp::Lt => {
+                                ("w", if suffix == "s" { "clts" } else { "cltd" })
+                            }
+                            crate::ast::BinOp::Le => {
+                                ("w", if suffix == "s" { "cles" } else { "cled" })
+                            }
+                            crate::ast::BinOp::Gt => {
+                                ("w", if suffix == "s" { "cgts" } else { "cgtd" })
+                            }
+                            crate::ast::BinOp::Ge => {
+                                ("w", if suffix == "s" { "cges" } else { "cged" })
+                            }
+                            _ => ("w", "copy"),
+                        };
+                        o += &format!("{} ={} {} {}, {}\n", n, result, op, a, b);
+                    }
+                    Instr::Convert(dst, src, from, to) => {
+                        let from_ty = Self::ty(from);
+                        let to_ty = Self::ty(to);
+                        if matches!(from_ty, "s" | "d") && matches!(to_ty, "s" | "d") {
+                            if from_ty == to_ty {
+                                o += &format!("{} ={} copy {}\n", dst, to_ty, src);
+                            } else if to_ty == "d" {
+                                o += &format!("{} =d exts {}\n", dst, src);
+                            } else {
+                                o += &format!("{} =s truncd {}\n", dst, src);
+                            }
+                        } else if matches!(from_ty, "s" | "d") {
+                            let op = if from_ty == "s" { "stosi" } else { "dtosi" };
+                            if to_ty == "l" {
+                                let tmp = format!("{}_w", dst);
+                                o += &format!("{} =w {} {}\n", tmp, op, src);
+                                o += &format!("{} =l extsw {}\n", dst, tmp);
+                            } else {
+                                o += &format!("{} =w {} {}\n", dst, op, src);
+                            }
+                        } else {
+                            let op = if from_ty == "l" { "sltof" } else { "swtof" };
+                            let tmp = format!("{}_d", dst);
+                            o += &format!("{} =d {} {}\n", tmp, op, src);
+                            if to_ty == "s" {
+                                o += &format!("{} =s truncd {}\n", dst, tmp);
+                            } else {
+                                o += &format!("{} =d copy {}\n", dst, tmp);
+                            }
+                        }
+                    }
+                    Instr::Call(dst, name, args, fixed, ret) => {
+                        let rendered = args
                             .iter()
-                            .map(|(x, t)| format!("{} {}", Self::ty(t), x))
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                            .map(|(x, t)| format!("{} {}", Self::abi_ty(t), x))
+                            .collect::<Vec<_>>();
+                        let args = if let Some(fixed) = fixed {
+                            let mut parts = rendered[..*fixed].to_vec();
+                            parts.push("...".to_string());
+                            parts.extend_from_slice(&rendered[*fixed..]);
+                            parts.join(", ")
+                        } else {
+                            rendered.join(", ")
+                        };
                         if let Some(dst) = dst {
-                            o += &format!("{} =w call ${}({})\n", dst, name, args);
+                            o += &format!(
+                                "{} ={} call ${}({})\n",
+                                dst,
+                                Self::abi_ty(ret),
+                                name,
+                                args
+                            );
                         } else {
                             o += &format!("call ${}({})\n", name, args);
                         }
+                    }
+                    Instr::VaStart(ap) => {
+                        o += &format!("vastart {}\n", ap);
+                    }
+                    Instr::VaArg(dst, ap, ty) => {
+                        o += &format!("{} ={} vaarg {}\n", dst, Self::abi_ty(ty), ap);
                     }
                     Instr::Ret(Some(x)) => {
                         o += &format!("ret {}\n", x);
@@ -233,37 +384,50 @@ impl QbeCodegen {
         Ok(o)
     }
 
-    fn data_directive(ty: &Type) -> &'static str {
-        match ty {
-            Type::Qualified(inner, _) => Self::data_directive(inner),
-            Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => "b",
-            Type::Short | Type::UnsignedShort => "h",
-            Type::Long
-            | Type::UnsignedLong
-            | Type::LongLong
-            | Type::UnsignedLongLong
-            | Type::Pointer(_) => "l",
-            _ => "w",
+    fn data_items(data: &DataObject) -> String {
+        let mut relocations = data.relocations.clone();
+        relocations.sort_by_key(|(offset, _)| *offset);
+        let mut items = Vec::new();
+        let mut offset = 0usize;
+        let mut next_relocation = 0usize;
+        while offset < data.bytes.len() {
+            if next_relocation < relocations.len() && relocations[next_relocation].0 == offset {
+                items.push(format!("l ${}", relocations[next_relocation].1));
+                offset += 8;
+                next_relocation += 1;
+                continue;
+            }
+            let end = relocations
+                .get(next_relocation)
+                .map(|(offset, _)| (*offset).min(data.bytes.len()))
+                .unwrap_or(data.bytes.len());
+            if end <= offset {
+                offset = end;
+                continue;
+            }
+            Self::push_bytes(&mut items, &data.bytes[offset..end]);
+            offset = end;
+        }
+        if items.is_empty() {
+            "z 0".to_string()
+        } else {
+            items.join(", ")
         }
     }
 
-    fn alignment(ty: &Type) -> usize {
-        match ty {
-            Type::Qualified(inner, _) => Self::alignment(inner),
-            Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => 1,
-            Type::Short | Type::UnsignedShort => 2,
-            Type::Long
-            | Type::UnsignedLong
-            | Type::LongLong
-            | Type::UnsignedLongLong
-            | Type::Pointer(_) => 8,
-            Type::Array(inner, _) => Self::alignment(inner),
-            Type::Struct(_, fields) | Type::Union(_, fields) => fields
-                .iter()
-                .map(|(_, ty)| Self::alignment(ty))
-                .max()
-                .unwrap_or(1),
-            _ => 4,
+    fn push_bytes(items: &mut Vec<String>, bytes: &[u8]) {
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if bytes[index] == 0 {
+                let start = index;
+                while index < bytes.len() && bytes[index] == 0 {
+                    index += 1;
+                }
+                items.push(format!("z {}", index - start));
+            } else {
+                items.push(format!("b {}", bytes[index]));
+                index += 1;
+            }
         }
     }
 
@@ -276,6 +440,9 @@ impl QbeCodegen {
                 "w" => (*value as i32 as i64).to_string(),
                 _ => value.to_string(),
             },
+            DataValue::Float(value, ty) => {
+                format!("{}_{}", directive, Self::float_literal(*value, ty))
+            }
         }
     }
 }

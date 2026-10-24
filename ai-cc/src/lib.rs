@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod codegen;
 pub mod diag;
+pub mod layout;
 pub mod lex;
 pub mod lower;
 pub mod parser;

@@ -314,20 +314,27 @@ impl Lexer {
                 }
             }
             let spelling: String = self.src[s..self.pos].iter().collect();
-            let is_hex = spelling.starts_with("0x") || spelling.starts_with("0X");
-            let is_float = spelling.contains('.')
+            let imaginary = matches!(spelling.chars().last(), Some('i' | 'j'));
+            let numeric = if imaginary {
+                &spelling[..spelling.len() - 1]
+            } else {
+                spelling.as_str()
+            };
+            let is_hex = numeric.starts_with("0x") || numeric.starts_with("0X");
+            let is_float = imaginary
+                || numeric.contains('.')
                 || if is_hex {
-                    spelling.contains('p') || spelling.contains('P')
+                    numeric.contains('p') || numeric.contains('P')
                 } else {
-                    spelling.contains('e') || spelling.contains('E')
+                    numeric.contains('e') || numeric.contains('E')
                 }
-                || matches!(spelling.chars().last(), Some('f' | 'F'));
+                || matches!(numeric.chars().last(), Some('f' | 'F'));
             if is_float {
-                let suffix = spelling
+                let suffix = numeric
                     .chars()
                     .last()
                     .filter(|c| matches!(c, 'f' | 'F' | 'l' | 'L'));
-                let body = suffix.map_or(spelling.as_str(), |_| &spelling[..spelling.len() - 1]);
+                let body = suffix.map_or(numeric, |_| &numeric[..numeric.len() - 1]);
                 let valid = if is_hex {
                     (body.starts_with("0x") || body.starts_with("0X"))
                         && (body.contains('p') || body.contains('P'))
@@ -336,8 +343,7 @@ impl Lexer {
                                 || matches!(c, 'x' | 'X' | 'p' | 'P' | '+' | '-' | '.')
                         })
                 } else {
-                    let no_suffix = body;
-                    no_suffix.parse::<f64>().is_ok()
+                    body.parse::<f64>().is_ok()
                 };
                 if !valid {
                     return Err(Diagnostic::error(
