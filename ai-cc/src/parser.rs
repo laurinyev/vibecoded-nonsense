@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
 enum DeclaratorOp {
-    Pointer,
+    Pointer(Qualifiers),
     Array(Option<usize>),
 }
 
@@ -524,20 +524,68 @@ impl Parser {
         }
     }
     fn declarator(&mut self, mut ty: Type) -> Result<(String, Type), Diagnostic> {
+        while let Some(qualifier) = self.take_qualifier() {
+            ty = Self::qualified(ty, qualifier);
+        }
         let (name, ops) = self.declarator_ops()?;
         for op in ops.into_iter().rev() {
             ty = match op {
-                DeclaratorOp::Pointer => Type::Pointer(Box::new(ty)),
+                DeclaratorOp::Pointer(q) => {
+                    let pointer = Type::Pointer(Box::new(ty));
+                    if q == Qualifiers::default() {
+                        pointer
+                    } else {
+                        Type::Qualified(Box::new(pointer), q)
+                    }
+                }
                 DeclaratorOp::Array(size) => Type::Array(Box::new(ty), size),
             };
         }
         Ok((name, ty))
     }
 
+    fn take_qualifier(&mut self) -> Option<Qualifiers> {
+        let qualifier = match self.cur() {
+            TokenKind::Const => Qualifiers {
+                is_const: true,
+                ..Default::default()
+            },
+            TokenKind::Volatile => Qualifiers {
+                is_volatile: true,
+                ..Default::default()
+            },
+            TokenKind::Restrict => Qualifiers {
+                is_restrict: true,
+                ..Default::default()
+            },
+            _ => return None,
+        };
+        self.p += 1;
+        Some(qualifier)
+    }
+
+    fn qualified(ty: Type, q: Qualifiers) -> Type {
+        match ty {
+            Type::Qualified(inner, mut existing) => {
+                existing.is_const |= q.is_const;
+                existing.is_volatile |= q.is_volatile;
+                existing.is_restrict |= q.is_restrict;
+                Type::Qualified(inner, existing)
+            }
+            ty => Type::Qualified(Box::new(ty), q),
+        }
+    }
+
     fn declarator_ops(&mut self) -> Result<(String, Vec<DeclaratorOp>), Diagnostic> {
-        let mut pointers = 0;
+        let mut pointers = Vec::new();
         while self.take(&TokenKind::Star) {
-            pointers += 1;
+            let mut qualifiers = Qualifiers::default();
+            while let Some(q) = self.take_qualifier() {
+                qualifiers.is_const |= q.is_const;
+                qualifiers.is_volatile |= q.is_volatile;
+                qualifiers.is_restrict |= q.is_restrict;
+            }
+            pointers.push(qualifiers);
         }
         let (name, mut ops) = if self.take(&TokenKind::LParen) {
             let inner = self.declarator_ops()?;
@@ -556,7 +604,7 @@ impl Parser {
             self.expect(&TokenKind::RBracket)?;
             ops.push(DeclaratorOp::Array(size));
         }
-        ops.extend((0..pointers).map(|_| DeclaratorOp::Pointer));
+        ops.extend(pointers.into_iter().map(DeclaratorOp::Pointer));
         Ok((name, ops))
     }
     fn expr(&mut self) -> Result<Expr, Diagnostic> {

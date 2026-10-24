@@ -154,7 +154,7 @@ fn integer_declaration_specifiers_allow_c99_ordering() {
 
 #[test]
 fn local_declaration_supports_multiple_declarators_and_initializers() {
-    let source = "int main(void) { int a = 2, b = a + 3, *p, (*row)[3]; p = &b; return *p; }";
+    let source = "int main(void) { int a = 2, b = a + 3, *p, (*row)[3]; const int c = 4; int const d = 5; int * const cp = &b; p = &b; return *p + c + d; }";
     let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
@@ -168,6 +168,34 @@ fn local_declaration_supports_multiple_declarators_and_initializers() {
             Box::new(ai_cc::ast::Type::Int),
             Some(3)
         )))
+    );
+    let ai_cc::ast::Stmt::Decl(_, trailing_const, _, _) = &ast.items[0].body.stmts[2] else {
+        panic!("expected trailing-qualified declaration");
+    };
+    assert_eq!(
+        trailing_const,
+        &ai_cc::ast::Type::Qualified(
+            Box::new(ai_cc::ast::Type::Int),
+            ai_cc::ast::Qualifiers {
+                is_const: true,
+                is_volatile: false,
+                is_restrict: false
+            }
+        )
+    );
+    let ai_cc::ast::Stmt::Decl(_, qualified_pointer, _, _) = &ast.items[0].body.stmts[3] else {
+        panic!("expected qualified pointer declaration");
+    };
+    assert_eq!(
+        qualified_pointer,
+        &ai_cc::ast::Type::Qualified(
+            Box::new(ai_cc::ast::Type::Pointer(Box::new(ai_cc::ast::Type::Int))),
+            ai_cc::ast::Qualifiers {
+                is_const: true,
+                is_volatile: false,
+                is_restrict: false
+            }
+        )
     );
     ai_cc::compile_preprocessed(source, "multiple-declarators.c").unwrap();
 }
