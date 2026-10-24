@@ -1,0 +1,1 @@
+struct Node { int x; struct Node *next; }; struct Pair { int x; const char y; }; union Value { int i; char c; }; enum Color { RED, GREEN=4, BLUE }; int main(){ struct Pair p; struct Node *head; int values[4]; union Value v; enum Color c; unsigned long n; return 0; }

@@ -1,0 +1,5 @@
+targets:
+  hello:
+    sources:
+      - fixtures/hello.c
+    output: build/hello
