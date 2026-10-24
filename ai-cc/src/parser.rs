@@ -8,15 +8,20 @@ use std::collections::HashMap;
 #[derive(Clone)]
 enum DeclaratorOp {
     Pointer(Qualifiers),
-    Array(Option<usize>),
-    Function(Vec<Type>),
+    Array(Option<usize>, Qualifiers, bool),
+    Function(Vec<(String, Type)>, bool, bool),
+}
+
+enum ExternalDecl {
+    Functions(Vec<Function>),
+    Object,
 }
 
 pub struct Parser {
     t: Vec<Token>,
     p: usize,
     errors: Vec<Diagnostic>,
-    aliases: HashMap<String, Type>,
+    aliases: Vec<HashMap<String, Option<Type>>>,
     eof: TokenKind,
 }
 impl Parser {
@@ -25,7 +30,7 @@ impl Parser {
             t: tokens,
             p: 0,
             errors: Vec::new(),
-            aliases: HashMap::new(),
+            aliases: vec![HashMap::new()],
             eof: TokenKind::End,
         }
     }
@@ -109,6 +114,12 @@ impl Parser {
                 while *self.cur() != TokenKind::RBrace && *self.cur() != TokenKind::End {
                     let ft = self.typ()?;
                     let (name, ft) = self.declarator(ft)?;
+                    if name.is_empty() {
+                        return Err(Diagnostic::error(
+                            "member declarator requires a name",
+                            Some(self.cur_span()),
+                        ));
+                    }
                     self.expect(&TokenKind::Semicolon)?;
                     if fields.iter().any(|(n, _)| n == &name) {
                         return Err(Diagnostic::error(
@@ -171,8 +182,12 @@ impl Parser {
                 let mut longs = 0;
                 let mut saw_int = false;
                 let mut saw_char = false;
+                let mut qualifiers = Qualifiers::default();
                 loop {
                     match self.cur() {
+                        TokenKind::Const => qualifiers.is_const = true,
+                        TokenKind::Volatile => qualifiers.is_volatile = true,
+                        TokenKind::Restrict => qualifiers.is_restrict = true,
                         TokenKind::Signed if !signed && !unsigned => signed = true,
                         TokenKind::Unsigned if !signed && !unsigned => unsigned = true,
                         TokenKind::Short if !short && longs == 0 => short = true,
@@ -193,17 +208,24 @@ impl Parser {
                     return Ok(Type::LongDouble);
                 }
                 if saw_char {
-                    return match (signed, unsigned, short, longs, saw_int) {
-                        (true, false, false, 0, false) => Ok(Type::SignedChar),
-                        (false, true, false, 0, false) => Ok(Type::UnsignedChar),
-                        (false, false, false, 0, false) => Ok(Type::Char),
-                        _ => Err(Diagnostic::error(
-                            "invalid character type specifiers",
-                            Some(self.cur_span()),
-                        )),
+                    let ty = match (signed, unsigned, short, longs, saw_int) {
+                        (true, false, false, 0, false) => Type::SignedChar,
+                        (false, true, false, 0, false) => Type::UnsignedChar,
+                        (false, false, false, 0, false) => Type::Char,
+                        _ => {
+                            return Err(Diagnostic::error(
+                                "invalid character type specifiers",
+                                Some(self.cur_span()),
+                            ))
+                        }
                     };
+                    return Ok(if qualifiers == Qualifiers::default() {
+                        ty
+                    } else {
+                        Self::qualified(ty, qualifiers)
+                    });
                 }
-                match (unsigned, short, longs) {
+                let ty = match (unsigned, short, longs) {
                     (true, true, 0) => Type::UnsignedShort,
                     (false, true, 0) => Type::Short,
                     (true, false, 1) => Type::UnsignedLong,
@@ -219,6 +241,11 @@ impl Parser {
                             Some(self.cur_span()),
                         ))
                     }
+                };
+                if qualifiers == Qualifiers::default() {
+                    ty
+                } else {
+                    Self::qualified(ty, qualifiers)
                 }
             }
             TokenKind::Float => {
@@ -233,8 +260,8 @@ impl Parser {
                 self.p += 1;
                 Type::Bool
             }
-            TokenKind::Ident(name) if self.aliases.contains_key(name) => {
-                let ty = self.aliases.get(name).cloned().unwrap();
+            TokenKind::Ident(name) if self.alias_type(name).is_some() => {
+                let ty = self.alias_type(name).unwrap();
                 self.p += 1;
                 return Ok(ty);
             }
@@ -246,19 +273,26 @@ impl Parser {
         };
         Ok(x)
     }
+    fn alias_type(&self, name: &str) -> Option<Type> {
+        self.aliases
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
+            .flatten()
+    }
+
+    fn bind_ordinary_name(&mut self, name: String) {
+        self.aliases.last_mut().unwrap().insert(name, None);
+    }
     pub fn parse_translation_unit(&mut self) -> Result<TranslationUnit, Vec<Diagnostic>> {
         let mut v = Vec::new();
         let mut types = Vec::new();
+        let mut declarations = Vec::new();
         let mut e = Vec::new();
         while *self.cur() != TokenKind::End {
             if self.take(&TokenKind::Typedef) {
-                match self.typ().and_then(|ty| {
-                    let (name, ty) = self.declarator(ty)?;
-                    self.expect(&TokenKind::Semicolon)?;
-                    Ok((name, ty))
-                }) {
-                    Ok((name, ty)) => {
-                        self.aliases.insert(name, ty);
+                match self.global_typedef() {
+                    Ok(()) => {
                         continue;
                     }
                     Err(x) => {
@@ -268,24 +302,26 @@ impl Parser {
                     }
                 }
             }
-            let parsed = if matches!(
-                self.cur(),
-                TokenKind::Struct | TokenKind::Union | TokenKind::Enum
-            ) {
-                let ty = self.typ();
-                match ty {
-                    Ok(ty) if self.take(&TokenKind::Semicolon) => {
-                        types.push(ty);
-                        continue;
-                    }
-                    Ok(ty) => self.function_after_type(ty),
-                    Err(x) => Err(x),
-                }
+            let parsed = if self.looks_like_function_declaration() {
+                self.function().map(ExternalDecl::Functions)
+            } else if self.looks_like_complex_function_definition() {
+                self.complex_function_definition()
+                    .map(|function| ExternalDecl::Functions(vec![function]))
+            } else if self.looks_like_nested_function_declaration() {
+                self.nested_function_declaration()
+                    .map(|function| ExternalDecl::Functions(vec![function]))
             } else {
-                self.function()
+                self.global_declaration(&mut types, &mut declarations)
+                    .map(|()| ExternalDecl::Object)
             };
             match parsed {
-                Ok(x) => v.push(x),
+                Ok(ExternalDecl::Functions(functions)) => {
+                    for function in functions {
+                        self.aliases[0].insert(function.name.clone(), None);
+                        v.push(function);
+                    }
+                }
+                Ok(ExternalDecl::Object) => {}
                 Err(x) => {
                     e.push(x);
                     self.synchronize(false);
@@ -294,31 +330,541 @@ impl Parser {
         }
         e.append(&mut self.errors);
         if e.is_empty() {
-            Ok(TranslationUnit { items: v, types })
+            Ok(TranslationUnit {
+                items: v,
+                types,
+                declarations,
+            })
         } else {
             Err(e)
         }
     }
-    fn function(&mut self) -> Result<Function, Diagnostic> {
-        self.take(&TokenKind::Static);
-        let ret = self.typ()?;
-        self.function_after_type(ret)
+
+    fn global_typedef(&mut self) -> Result<(), Diagnostic> {
+        let ty = self.typ()?;
+        loop {
+            let (name, declared_ty) = self.declarator_full(ty.clone())?;
+            if name.is_empty() {
+                return Err(Diagnostic::error(
+                    "typedef declarator requires a name",
+                    Some(self.cur_span()),
+                ));
+            }
+            self.aliases[0].insert(name, Some(declared_ty));
+            if !self.take(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::Semicolon)
     }
-    fn function_after_type(&mut self, ret: Type) -> Result<Function, Diagnostic> {
+
+    fn looks_like_function_declaration(&mut self) -> bool {
+        let start = self.p;
+        while matches!(
+            self.cur(),
+            TokenKind::Static | TokenKind::Extern | TokenKind::Inline
+        ) {
+            self.p += 1;
+        }
+        let type_ok = self.typ().is_ok();
+        let result = if type_ok {
+            let mut i = self.p;
+            while self.t.get(i).is_some_and(|t| t.kind == TokenKind::Star) {
+                i += 1;
+            }
+            matches!(self.t.get(i).map(|t| &t.kind), Some(TokenKind::Ident(_)))
+                && self
+                    .t
+                    .get(i + 1)
+                    .is_some_and(|t| t.kind == TokenKind::LParen)
+        } else {
+            false
+        };
+        self.p = start;
+        result
+    }
+
+    fn looks_like_nested_function_declaration(&mut self) -> bool {
+        let start = self.p;
+        while matches!(
+            self.cur(),
+            TokenKind::Static | TokenKind::Extern | TokenKind::Inline
+        ) {
+            self.p += 1;
+        }
+        let result = self
+            .typ()
+            .ok()
+            .and_then(|base| self.declarator_full(base).ok())
+            .is_some_and(|(_, ty)| {
+                matches!(ty, Type::Function(_, _, _, _)) && *self.cur() == TokenKind::Semicolon
+            });
+        self.p = start;
+        result
+    }
+
+    fn looks_like_complex_function_definition(&mut self) -> bool {
+        let start = self.p;
+        while matches!(
+            self.cur(),
+            TokenKind::Static | TokenKind::Extern | TokenKind::Inline
+        ) {
+            self.p += 1;
+        }
+        let result = self
+            .typ()
+            .ok()
+            .and_then(|base| self.declarator_full_details(base).ok())
+            .is_some_and(|(_, ty, _, _, _, is_function_declarator)| {
+                is_function_declarator
+                    && matches!(ty, Type::Function(_, _, _, _))
+                    && (*self.cur() == TokenKind::LBrace || self.is_type())
+            });
+        self.p = start;
+        result
+    }
+
+    fn complex_function_definition(&mut self) -> Result<Function, Diagnostic> {
+        let mut is_static = false;
+        let mut is_inline = false;
+        loop {
+            if self.take(&TokenKind::Static) {
+                is_static = true;
+            } else if self.take(&TokenKind::Extern) {
+                // External linkage is the default in the current function AST.
+            } else if self.take(&TokenKind::Inline) {
+                is_inline = true;
+            } else {
+                break;
+            }
+        }
+        let base = self.typ()?;
+        let (name, ty, mut params, is_variadic, has_prototype, is_function_declarator) =
+            self.declarator_full_details(base)?;
+        let Type::Function(ret, _, _, _) = ty else {
+            return Err(Diagnostic::error(
+                "function definition declarator must have function type",
+                Some(self.cur_span()),
+            ));
+        };
+        if !is_function_declarator {
+            return Err(Diagnostic::error(
+                "function definition requires a function declarator",
+                Some(self.cur_span()),
+            ));
+        }
+        if !has_prototype {
+            self.parse_old_style_parameter_declarations(&mut params)?;
+        }
+        if params.iter().any(|(param, _)| param.is_empty()) {
+            return Err(Diagnostic::error(
+                "function definition parameters must be named",
+                Some(self.cur_span()),
+            ));
+        }
+        self.finish_function(
+            name,
+            *ret,
+            params,
+            !has_prototype,
+            is_variadic,
+            is_static,
+            is_inline,
+        )
+    }
+
+    fn parse_old_style_parameter_declarations(
+        &mut self,
+        params: &mut [(String, Type)],
+    ) -> Result<(), Diagnostic> {
+        let mut declared = HashMap::new();
+        while self.is_type() {
+            if self.take(&TokenKind::Typedef) {
+                return Err(Diagnostic::error(
+                    "typedef is not allowed in an old-style parameter declaration",
+                    Some(self.cur_span()),
+                ));
+            }
+            if self.take(&TokenKind::Auto)
+                || self.take(&TokenKind::Static)
+                || self.take(&TokenKind::Extern)
+            {
+                return Err(Diagnostic::error(
+                    "invalid storage class in old-style parameter declaration",
+                    Some(self.cur_span()),
+                ));
+            }
+            self.take(&TokenKind::Register);
+            let base = self.typ()?;
+            loop {
+                let (name, ty) = self.declarator_full(base.clone())?;
+                if !params.iter().any(|(parameter, _)| parameter == &name) {
+                    return Err(Diagnostic::error(
+                        format!("{} is not a parameter", name),
+                        Some(self.cur_span()),
+                    ));
+                }
+                if declared.insert(name.clone(), ty).is_some() {
+                    return Err(Diagnostic::error(
+                        format!("duplicate declaration for parameter {}", name),
+                        Some(self.cur_span()),
+                    ));
+                }
+                if !self.take(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::Semicolon)?;
+        }
+        for (name, ty) in params {
+            let Some(declared_ty) = declared.remove(name) else {
+                return Err(Diagnostic::error(
+                    format!("parameter {} has no declaration", name),
+                    Some(self.cur_span()),
+                ));
+            };
+            *ty = Self::adjust_parameter_type(declared_ty);
+        }
+        Ok(())
+    }
+
+    fn nested_function_declaration(&mut self) -> Result<Function, Diagnostic> {
+        let start = self.cur_span().start;
+        let mut is_static = false;
+        let mut is_inline = false;
+        loop {
+            if self.take(&TokenKind::Static) {
+                is_static = true;
+            } else if self.take(&TokenKind::Extern) {
+                // External linkage is the default in the current function AST.
+            } else if self.take(&TokenKind::Inline) {
+                is_inline = true;
+            } else {
+                break;
+            }
+        }
+        let base = self.typ()?;
+        let (name, ty) = self.declarator_full(base)?;
+        let Type::Function(ret, params, is_variadic, has_prototype) = ty else {
+            return Err(Diagnostic::error(
+                "expected function declarator",
+                Some(self.cur_span()),
+            ));
+        };
+        self.expect(&TokenKind::Semicolon)?;
+        Ok(Function {
+            name,
+            ret: *ret,
+            params: params.into_iter().map(|ty| (String::new(), ty)).collect(),
+            params_unspecified: !has_prototype,
+            is_variadic,
+            body: Block { stmts: Vec::new() },
+            external: true,
+            is_static,
+            is_inline,
+            span: self.span_from(start),
+        })
+    }
+
+    fn global_declaration(
+        &mut self,
+        types: &mut Vec<Type>,
+        declarations: &mut Vec<GlobalDecl>,
+    ) -> Result<(), Diagnostic> {
+        let start = self.cur_span().start;
+        let mut storage = None;
+        let mut is_inline = false;
+        loop {
+            let class = match self.cur() {
+                TokenKind::Static => Some(StorageClass::Static),
+                TokenKind::Extern => Some(StorageClass::Extern),
+                TokenKind::Auto => {
+                    return Err(Diagnostic::error(
+                        "auto is not allowed at file scope",
+                        Some(self.cur_span()),
+                    ))
+                }
+                TokenKind::Register => {
+                    return Err(Diagnostic::error(
+                        "register is not allowed at file scope",
+                        Some(self.cur_span()),
+                    ))
+                }
+                _ => None,
+            };
+            if let Some(class) = class {
+                self.p += 1;
+                if storage.replace(class).is_some() {
+                    return Err(Diagnostic::error(
+                        "multiple storage-class specifiers",
+                        Some(self.cur_span()),
+                    ));
+                }
+            } else if self.take(&TokenKind::Inline) {
+                is_inline = true;
+            } else {
+                break;
+            }
+        }
+        let base = self.typ()?;
+        if self.take(&TokenKind::Semicolon) {
+            if matches!(
+                base,
+                Type::Struct(_, _) | Type::Union(_, _) | Type::Enum(_, _)
+            ) {
+                types.push(base);
+                return Ok(());
+            }
+            return Err(Diagnostic::error(
+                "declaration requires a declarator",
+                Some(self.cur_span()),
+            ));
+        }
+        let mut declarations_here = Vec::new();
+        loop {
+            let (name, ty) = self.declarator_full(base.clone())?;
+            if name.is_empty() {
+                return Err(Diagnostic::error(
+                    "file-scope declarator requires a name",
+                    Some(self.cur_span()),
+                ));
+            }
+            if matches!(ty, Type::Function(_, _, _, _)) {
+                return Err(Diagnostic::error(
+                    "use a function declaration for file-scope function prototypes",
+                    Some(self.cur_span()),
+                ));
+            }
+            let initializer = if self.take(&TokenKind::Assign) {
+                Some(self.assign()?)
+            } else {
+                None
+            };
+            if is_inline {
+                return Err(Diagnostic::error(
+                    "inline is only valid on a function declaration",
+                    Some(self.cur_span()),
+                ));
+            }
+            let tentative_definition =
+                storage != Some(StorageClass::Extern) || initializer.is_some();
+            self.aliases[0].insert(name.clone(), None);
+            declarations_here.push(GlobalDecl {
+                name,
+                ty,
+                storage,
+                initializer,
+                tentative_definition,
+                is_inline,
+                span: self.span_from(start),
+            });
+            if !self.take(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::Semicolon)?;
+        if declarations_here.is_empty() {
+            types.push(base);
+        } else {
+            declarations.extend(declarations_here);
+        }
+        Ok(())
+    }
+    fn function(&mut self) -> Result<Vec<Function>, Diagnostic> {
+        let mut storage = None;
+        let mut is_inline = false;
+        loop {
+            let class = match self.cur() {
+                TokenKind::Static => Some(StorageClass::Static),
+                TokenKind::Extern => Some(StorageClass::Extern),
+                TokenKind::Auto => Some(StorageClass::Auto),
+                TokenKind::Register => Some(StorageClass::Register),
+                _ => None,
+            };
+            if let Some(class) = class {
+                self.p += 1;
+                if storage.replace(class).is_some() {
+                    return Err(Diagnostic::error(
+                        "multiple storage-class specifiers",
+                        Some(self.cur_span()),
+                    ));
+                }
+            } else if self.take(&TokenKind::Inline) {
+                is_inline = true;
+            } else {
+                break;
+            }
+        }
+        if matches!(storage, Some(StorageClass::Auto | StorageClass::Register)) {
+            return Err(Diagnostic::error(
+                "function declaration cannot use auto or register",
+                Some(self.cur_span()),
+            ));
+        }
+        let ret = self.typ()?;
+        self.function_after_type(ret, storage == Some(StorageClass::Static), is_inline)
+    }
+    fn function_after_type(
+        &mut self,
+        ret: Type,
+        is_static: bool,
+        is_inline: bool,
+    ) -> Result<Vec<Function>, Diagnostic> {
+        let start = self.cur_span().start;
+        let declaration_base = ret.clone();
         let (name, ret) = self.declarator(ret)?;
+        if name.is_empty() {
+            return Err(Diagnostic::error(
+                "function declarator requires a name",
+                Some(self.cur_span()),
+            ));
+        }
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
         let mut params_unspecified = false;
+        let mut is_variadic = false;
+        if matches!(self.cur(), TokenKind::Ident(name) if self.alias_type(name).is_none()) {
+            let mut names = vec![self.ident()?];
+            while self.take(&TokenKind::Comma) {
+                names.push(self.ident()?);
+            }
+            self.expect(&TokenKind::RParen)?;
+            if *self.cur() == TokenKind::Semicolon || *self.cur() == TokenKind::Comma {
+                let function = Function {
+                    name,
+                    ret,
+                    params: Vec::new(),
+                    params_unspecified: true,
+                    is_variadic: false,
+                    body: Block { stmts: Vec::new() },
+                    external: true,
+                    is_static,
+                    is_inline,
+                    span: self.span_from(start),
+                };
+                if *self.cur() == TokenKind::Semicolon || *self.cur() == TokenKind::Comma {
+                    return self.finish_function_declaration_list(function, declaration_base);
+                }
+                return self
+                    .finish_function(
+                        function.name,
+                        function.ret,
+                        function.params,
+                        function.params_unspecified,
+                        function.is_variadic,
+                        function.is_static,
+                        function.is_inline,
+                    )
+                    .map(|function| vec![function]);
+            }
+            params = names.into_iter().map(|name| (name, Type::Int)).collect();
+            let mut declared = HashMap::new();
+            while self.is_type() {
+                if self.take(&TokenKind::Typedef) {
+                    return Err(Diagnostic::error(
+                        "typedef is not allowed in an old-style parameter declaration list",
+                        Some(self.cur_span()),
+                    ));
+                }
+                if self.take(&TokenKind::Auto)
+                    || self.take(&TokenKind::Static)
+                    || self.take(&TokenKind::Extern)
+                {
+                    return Err(Diagnostic::error(
+                        "invalid storage class in old-style parameter declaration",
+                        Some(self.cur_span()),
+                    ));
+                }
+                self.take(&TokenKind::Register);
+                let param_ty = self.typ()?;
+                loop {
+                    let (param_name, param_ty) = self.declarator_full(param_ty.clone())?;
+                    if !params.iter().any(|(name, _)| name == &param_name) {
+                        return Err(Diagnostic::error(
+                            format!("{} is not a parameter", param_name),
+                            Some(self.cur_span()),
+                        ));
+                    }
+                    if declared
+                        .insert(param_name.clone(), param_ty.clone())
+                        .is_some()
+                    {
+                        return Err(Diagnostic::error(
+                            format!("duplicate declaration for parameter {}", param_name),
+                            Some(self.cur_span()),
+                        ));
+                    }
+                    if !self.take(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::Semicolon)?;
+            }
+            for (name, ty) in &mut params {
+                let Some(declared_ty) = declared.remove(name) else {
+                    return Err(Diagnostic::error(
+                        format!("parameter {} has no declaration", name),
+                        Some(self.cur_span()),
+                    ));
+                };
+                *ty = Self::adjust_parameter_type(declared_ty);
+            }
+            if let Some(name) = declared.keys().next() {
+                return Err(Diagnostic::error(
+                    format!("parameter {} was declared more than once", name),
+                    Some(self.cur_span()),
+                ));
+            }
+            return self
+                .finish_function(name, ret, params, false, false, is_static, is_inline)
+                .map(|function| vec![function]);
+        }
         if *self.cur() != TokenKind::RParen {
-            if self.take(&TokenKind::Void) && *self.cur() == TokenKind::RParen {
+            if *self.cur() == TokenKind::Void
+                && self
+                    .t
+                    .get(self.p + 1)
+                    .is_some_and(|token| token.kind == TokenKind::RParen)
+            {
+                self.p += 1;
                 self.expect(&TokenKind::RParen)?;
-                return self.finish_function(name, ret, params, false);
+                let function = Function {
+                    name,
+                    ret,
+                    params,
+                    params_unspecified: false,
+                    is_variadic: false,
+                    body: Block { stmts: Vec::new() },
+                    external: true,
+                    is_static,
+                    is_inline,
+                    span: self.span_from(start),
+                };
+                if *self.cur() == TokenKind::Semicolon || *self.cur() == TokenKind::Comma {
+                    return self.finish_function_declaration_list(function, declaration_base);
+                }
+                return self
+                    .finish_function(
+                        function.name,
+                        function.ret,
+                        function.params,
+                        function.params_unspecified,
+                        function.is_variadic,
+                        function.is_static,
+                        function.is_inline,
+                    )
+                    .map(|function| vec![function]);
             }
             loop {
+                self.take(&TokenKind::Register);
                 let ty = self.typ()?;
-                let (n, ty) = self.declarator(ty)?;
-                params.push((n, ty));
+                let (n, ty) = self.declarator_full(ty)?;
+                params.push((n, Self::adjust_parameter_type(ty)));
                 if !self.take(&TokenKind::Comma) {
+                    break;
+                }
+                if self.take(&TokenKind::Ellipsis) {
+                    is_variadic = true;
                     break;
                 }
             }
@@ -326,7 +872,73 @@ impl Parser {
             params_unspecified = true;
         }
         self.expect(&TokenKind::RParen)?;
-        self.finish_function(name, ret, params, params_unspecified)
+        if *self.cur() == TokenKind::Semicolon || *self.cur() == TokenKind::Comma {
+            let function = Function {
+                name,
+                ret,
+                params,
+                params_unspecified,
+                is_variadic,
+                body: Block { stmts: Vec::new() },
+                external: true,
+                is_static,
+                is_inline,
+                span: self.span_from(start),
+            };
+            return self.finish_function_declaration_list(function, declaration_base);
+        }
+        self.finish_function(
+            name,
+            ret,
+            params,
+            params_unspecified,
+            is_variadic,
+            is_static,
+            is_inline,
+        )
+        .map(|function| vec![function])
+    }
+
+    fn finish_function_declaration_list(
+        &mut self,
+        first: Function,
+        declaration_base: Type,
+    ) -> Result<Vec<Function>, Diagnostic> {
+        let is_static = first.is_static;
+        let is_inline = first.is_inline;
+        let mut functions = vec![first];
+        loop {
+            if self.take(&TokenKind::Semicolon) {
+                return Ok(functions);
+            }
+            self.expect(&TokenKind::Comma)?;
+            let (name, ty, params, is_variadic, has_prototype, is_function_declarator) =
+                self.declarator_full_details(declaration_base.clone())?;
+            let Type::Function(ret, _, _, _) = ty else {
+                return Err(Diagnostic::error(
+                    "mixed function and object declarators in one declaration are not yet supported",
+                    Some(self.cur_span()),
+                ));
+            };
+            if !is_function_declarator {
+                return Err(Diagnostic::error(
+                    "expected function declarator after comma",
+                    Some(self.cur_span()),
+                ));
+            }
+            functions.push(Function {
+                name,
+                ret: *ret,
+                params: if has_prototype { params } else { Vec::new() },
+                params_unspecified: !has_prototype,
+                is_variadic,
+                body: Block { stmts: Vec::new() },
+                external: true,
+                is_static,
+                is_inline,
+                span: self.span_from(self.cur_span().start),
+            });
+        }
     }
     fn finish_function(
         &mut self,
@@ -334,21 +946,40 @@ impl Parser {
         ret: Type,
         params: Vec<(String, Type)>,
         params_unspecified: bool,
+        is_variadic: bool,
+        is_static: bool,
+        is_inline: bool,
     ) -> Result<Function, Diagnostic> {
         let start = self.cur_span().start;
         let external = self.take(&TokenKind::Semicolon);
+        if !external && params.iter().any(|(name, _)| name.is_empty()) {
+            return Err(Diagnostic::error(
+                "function definition parameters must be named",
+                Some(self.cur_span()),
+            ));
+        }
         let body = if external {
             Block { stmts: Vec::new() }
         } else {
+            self.aliases.push(HashMap::new());
+            for (param, _) in &params {
+                self.bind_ordinary_name(param.clone());
+            }
             self.block()?
         };
+        if !external {
+            self.aliases.pop();
+        }
         Ok(Function {
             name,
             ret,
             params,
             params_unspecified,
+            is_variadic,
             body,
             external,
+            is_static,
+            is_inline,
             span: Span {
                 start,
                 end: self.t[self.p - 1].span.end,
@@ -357,6 +988,7 @@ impl Parser {
     }
     fn block(&mut self) -> Result<Block, Diagnostic> {
         self.expect(&TokenKind::LBrace)?;
+        self.aliases.push(HashMap::new());
         let mut v = Vec::new();
         while *self.cur() != TokenKind::RBrace && *self.cur() != TokenKind::End {
             match self.stmt() {
@@ -368,6 +1000,7 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RBrace)?;
+        self.aliases.pop();
         Ok(Block { stmts: v })
     }
     fn synchronize(&mut self, in_block: bool) {
@@ -479,10 +1112,11 @@ impl Parser {
         Ok(Stmt::Expr(x, self.span_from(start)))
     }
     fn is_type(&self) -> bool {
-        matches!(self.cur(), TokenKind::Ident(name) if self.aliases.contains_key(name))
+        matches!(self.cur(), TokenKind::Ident(name) if self.alias_type(name).is_some())
             || matches!(
                 self.cur(),
                 TokenKind::Int
+                    | TokenKind::Typedef
                     | TokenKind::Bool
                     | TokenKind::CharKw
                     | TokenKind::Void
@@ -498,26 +1132,130 @@ impl Parser {
                     | TokenKind::Long
                     | TokenKind::Float
                     | TokenKind::Double
+                    | TokenKind::Auto
+                    | TokenKind::Extern
+                    | TokenKind::Register
+                    | TokenKind::Static
+                    | TokenKind::Inline
             )
     }
     fn declaration(&mut self) -> Result<Stmt, Diagnostic> {
         let start = self.cur_span().start;
+        let is_typedef = self.take(&TokenKind::Typedef);
+        let mut storage = None;
+        let mut inline = false;
+        loop {
+            let next = match self.cur() {
+                TokenKind::Auto => Some(StorageClass::Auto),
+                TokenKind::Extern => Some(StorageClass::Extern),
+                TokenKind::Register => Some(StorageClass::Register),
+                TokenKind::Static => Some(StorageClass::Static),
+                _ => None,
+            };
+            if let Some(class) = next {
+                self.p += 1;
+                if storage.replace(class).is_some() {
+                    return Err(Diagnostic::error(
+                        "multiple storage-class specifiers",
+                        Some(self.cur_span()),
+                    ));
+                }
+            } else if self.take(&TokenKind::Inline) {
+                inline = true;
+            } else {
+                break;
+            }
+        }
         let ty = self.typ()?;
+        loop {
+            let next = match self.cur() {
+                TokenKind::Auto => Some(StorageClass::Auto),
+                TokenKind::Extern => Some(StorageClass::Extern),
+                TokenKind::Register => Some(StorageClass::Register),
+                TokenKind::Static => Some(StorageClass::Static),
+                _ => None,
+            };
+            if let Some(class) = next {
+                self.p += 1;
+                if storage.replace(class).is_some() {
+                    return Err(Diagnostic::error(
+                        "multiple storage-class specifiers",
+                        Some(self.cur_span()),
+                    ));
+                }
+            } else if self.take(&TokenKind::Inline) {
+                inline = true;
+            } else {
+                break;
+            }
+        }
+        if inline {
+            return Err(Diagnostic::error(
+                "inline is only valid on a function declaration",
+                Some(self.cur_span()),
+            ));
+        }
+        if is_typedef && storage.is_some() {
+            return Err(Diagnostic::error(
+                "typedef cannot be combined with another storage-class specifier",
+                Some(self.cur_span()),
+            ));
+        }
+        if is_typedef {
+            let mut aliases = Vec::new();
+            loop {
+                let (name, declared_ty) = self.declarator_full(ty.clone())?;
+                if name.is_empty() {
+                    return Err(Diagnostic::error(
+                        "typedef declarator requires a name",
+                        Some(self.cur_span()),
+                    ));
+                }
+                self.aliases
+                    .last_mut()
+                    .unwrap()
+                    .insert(name.clone(), Some(declared_ty.clone()));
+                aliases.push((name, declared_ty));
+                if !self.take(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::Semicolon)?;
+            return if aliases.len() == 1 {
+                let (name, ty) = aliases.pop().unwrap();
+                Ok(Stmt::Typedef(name, ty, self.span_from(start)))
+            } else {
+                Ok(Stmt::Typedefs(aliases, self.span_from(start)))
+            };
+        }
         let mut declarations = Vec::new();
         loop {
             let (n, declared_ty) = self.declarator_full(ty.clone())?;
+            if n.is_empty() {
+                return Err(Diagnostic::error(
+                    "declaration requires a name",
+                    Some(self.cur_span()),
+                ));
+            }
             let init = if self.take(&TokenKind::Assign) {
                 Some(self.assign()?)
             } else {
                 None
             };
             declarations.push((n, declared_ty, init));
+            self.bind_ordinary_name(declarations.last().unwrap().0.clone());
             if !self.take(&TokenKind::Comma) {
                 break;
             }
         }
         self.expect(&TokenKind::Semicolon)?;
-        if declarations.len() == 1 {
+        if let Some(storage) = storage {
+            Ok(Stmt::StorageDecl(
+                storage,
+                declarations,
+                self.span_from(start),
+            ))
+        } else if declarations.len() == 1 {
             let (name, ty, init) = declarations.pop().unwrap();
             Ok(Stmt::Decl(name, ty, init, self.span_from(start)))
         } else {
@@ -532,6 +1270,31 @@ impl Parser {
         self.declarator_inner(&mut ty, true)
     }
 
+    fn declarator_full_details(
+        &mut self,
+        mut ty: Type,
+    ) -> Result<(String, Type, Vec<(String, Type)>, bool, bool, bool), Diagnostic> {
+        while let Some(qualifier) = self.take_qualifier() {
+            ty = Self::qualified(ty, qualifier);
+        }
+        let (name, ops) = self.declarator_ops(true)?;
+        let (params, variadic, has_prototype, is_function_declarator) = match ops.first() {
+            Some(DeclaratorOp::Function(params, variadic, has_prototype)) => {
+                (params.clone(), *variadic, *has_prototype, true)
+            }
+            _ => (Vec::new(), false, false, false),
+        };
+        ty = Self::apply_declarator_ops(ty, ops);
+        Ok((
+            name,
+            ty,
+            params,
+            variadic,
+            has_prototype,
+            is_function_declarator,
+        ))
+    }
+
     fn declarator_inner(
         &mut self,
         ty: &mut Type,
@@ -541,8 +1304,13 @@ impl Parser {
             *ty = Self::qualified(ty.clone(), qualifier);
         }
         let (name, ops) = self.declarator_ops(allow_function)?;
+        *ty = Self::apply_declarator_ops(ty.clone(), ops);
+        Ok((name, ty.clone()))
+    }
+
+    fn apply_declarator_ops(mut ty: Type, ops: Vec<DeclaratorOp>) -> Type {
         for op in ops.into_iter().rev() {
-            *ty = match op {
+            ty = match op {
                 DeclaratorOp::Pointer(q) => {
                     let pointer = Type::Pointer(Box::new(ty.clone()));
                     if q == Qualifiers::default() {
@@ -551,11 +1319,27 @@ impl Parser {
                         Type::Qualified(Box::new(pointer), q)
                     }
                 }
-                DeclaratorOp::Array(size) => Type::Array(Box::new(ty.clone()), size),
-                DeclaratorOp::Function(params) => Type::Function(Box::new(ty.clone()), params),
+                DeclaratorOp::Array(size, qualifiers, _is_static) => {
+                    let array = Type::Array(Box::new(ty.clone()), size);
+                    if qualifiers == Qualifiers::default() {
+                        array
+                    } else {
+                        Self::qualified(array, qualifiers)
+                    }
+                }
+                DeclaratorOp::Function(params, variadic, has_prototype) => Type::Function(
+                    Box::new(ty.clone()),
+                    if has_prototype {
+                        params.into_iter().map(|(_, ty)| ty).collect()
+                    } else {
+                        Vec::new()
+                    },
+                    variadic,
+                    has_prototype,
+                ),
             };
         }
-        Ok((name, ty.clone()))
+        ty
     }
 
     fn take_qualifier(&mut self) -> Option<Qualifiers> {
@@ -590,6 +1374,19 @@ impl Parser {
         }
     }
 
+    fn adjust_parameter_type(ty: Type) -> Type {
+        match ty {
+            Type::Array(element, _) => Type::Pointer(element),
+            Type::Function(_, _, _, _) => Type::Pointer(Box::new(ty)),
+            Type::Qualified(inner, q) => match *inner {
+                Type::Array(element, _) => Self::qualified(Type::Pointer(element), q),
+                Type::Function(_, _, _, _) => Self::qualified(Type::Pointer(inner), q),
+                other => Self::qualified(other, q),
+            },
+            other => other,
+        }
+    }
+
     fn declarator_ops(
         &mut self,
         allow_function: bool,
@@ -608,44 +1405,89 @@ impl Parser {
             let inner = self.declarator_ops(allow_function)?;
             self.expect(&TokenKind::RParen)?;
             inner
-        } else {
+        } else if matches!(self.cur(), TokenKind::Ident(_)) {
             (self.ident()?, Vec::new())
+        } else {
+            (String::new(), Vec::new())
         };
-        while self.take(&TokenKind::LBracket) {
-            let size = if let TokenKind::Number(n) = self.cur().clone() {
-                self.p += 1;
-                Some(n as usize)
-            } else {
-                None
-            };
-            self.expect(&TokenKind::RBracket)?;
-            ops.push(DeclaratorOp::Array(size));
-        }
-        if allow_function && self.take(&TokenKind::LParen) {
-            let mut params = Vec::new();
-            if !self.take(&TokenKind::RParen) {
-                if self.take(&TokenKind::Void) && self.take(&TokenKind::RParen) {
-                    // `void` denotes an empty parameter list.
-                } else {
-                    loop {
-                        let param_ty = self.typ()?;
-                        let param_ty = if matches!(
-                            self.cur(),
-                            TokenKind::Ident(_) | TokenKind::Star | TokenKind::LParen
-                        ) {
-                            self.declarator_full(param_ty)?.1
-                        } else {
-                            param_ty
-                        };
-                        params.push(param_ty);
-                        if !self.take(&TokenKind::Comma) {
-                            break;
-                        }
-                    }
-                    self.expect(&TokenKind::RParen)?;
+        loop {
+            if self.take(&TokenKind::LBracket) {
+                let mut is_static = self.take(&TokenKind::Static);
+                let mut qualifiers = Qualifiers::default();
+                while let Some(q) = self.take_qualifier() {
+                    qualifiers.is_const |= q.is_const;
+                    qualifiers.is_volatile |= q.is_volatile;
+                    qualifiers.is_restrict |= q.is_restrict;
                 }
+                is_static |= self.take(&TokenKind::Static);
+                let size = if matches!(self.cur(), TokenKind::Number(_)) {
+                    if let TokenKind::Number(n) = self.cur().clone() {
+                        self.p += 1;
+                        usize::try_from(n).ok()
+                    } else {
+                        unreachable!()
+                    }
+                } else if self.take(&TokenKind::Star) {
+                    None
+                } else if *self.cur() != TokenKind::RBracket {
+                    let _bound = self.assign()?;
+                    None
+                } else {
+                    None
+                };
+                self.expect(&TokenKind::RBracket)?;
+                ops.push(DeclaratorOp::Array(size, qualifiers, is_static));
+                continue;
             }
-            ops.push(DeclaratorOp::Function(params));
+            if allow_function && self.take(&TokenKind::LParen) {
+                let mut params = Vec::new();
+                let mut variadic = false;
+                let mut has_prototype = !self.take(&TokenKind::RParen);
+                if has_prototype {
+                    if matches!(self.cur(), TokenKind::Ident(name) if self.alias_type(name).is_none())
+                    {
+                        params.push((self.ident()?, Type::Int));
+                        while self.take(&TokenKind::Comma) {
+                            params.push((self.ident()?, Type::Int));
+                        }
+                        self.expect(&TokenKind::RParen)?;
+                        has_prototype = false;
+                    } else if *self.cur() == TokenKind::Void
+                        && self
+                            .t
+                            .get(self.p + 1)
+                            .is_some_and(|token| token.kind == TokenKind::RParen)
+                    {
+                        self.p += 2;
+                        // `void` denotes an empty parameter list.
+                    } else {
+                        loop {
+                            self.take(&TokenKind::Register);
+                            let param_ty = self.typ()?;
+                            let (param_name, param_ty) = if matches!(
+                                self.cur(),
+                                TokenKind::Ident(_) | TokenKind::Star | TokenKind::LParen
+                            ) {
+                                self.declarator_full(param_ty)?
+                            } else {
+                                (String::new(), param_ty)
+                            };
+                            params.push((param_name, Self::adjust_parameter_type(param_ty)));
+                            if !self.take(&TokenKind::Comma) {
+                                break;
+                            }
+                            if self.take(&TokenKind::Ellipsis) {
+                                variadic = true;
+                                break;
+                            }
+                        }
+                        self.expect(&TokenKind::RParen)?;
+                    }
+                }
+                ops.push(DeclaratorOp::Function(params, variadic, has_prototype));
+                continue;
+            }
+            break;
         }
         ops.extend(pointers.into_iter().map(DeclaratorOp::Pointer));
         Ok((name, ops))
@@ -746,6 +1588,32 @@ impl Parser {
         Ok(x)
     }
     fn unary(&mut self) -> Result<Expr, Diagnostic> {
+        if self.take(&TokenKind::Sizeof) {
+            if *self.cur() == TokenKind::LParen && self.lookahead_starts_type_name() {
+                self.p += 1;
+                let ty = self.type_name()?;
+                self.expect(&TokenKind::RParen)?;
+                return Ok(Expr::SizeofType(ty));
+            }
+            return Ok(Expr::Unary(UnOp::Sizeof, Box::new(self.unary()?)));
+        }
+        if *self.cur() == TokenKind::LParen
+            && self
+                .t
+                .get(self.p + 1)
+                .is_some_and(|_| self.lookahead_starts_type_name())
+        {
+            self.p += 1;
+            let ty = self.type_name()?;
+            self.expect(&TokenKind::RParen)?;
+            if self.take(&TokenKind::LBrace) {
+                return Ok(Expr::CompoundLiteral(
+                    ty,
+                    self.initializer_list_after_lbrace()?,
+                ));
+            }
+            return Ok(Expr::Cast(ty, Box::new(self.unary()?)));
+        }
         if self.take(&TokenKind::PlusPlus) || self.take(&TokenKind::MinusMinus) {
             let add = self.t[self.p - 1].kind == TokenKind::PlusPlus;
             let Expr::Var(n) = self.primary()? else {
@@ -783,11 +1651,92 @@ impl Parser {
         }
         self.primary()
     }
+
+    fn initializer(&mut self) -> Result<Initializer, Diagnostic> {
+        if self.take(&TokenKind::LBrace) {
+            self.initializer_list_after_lbrace()
+        } else {
+            Ok(Initializer::Expr(Box::new(self.assign()?)))
+        }
+    }
+
+    fn initializer_list_after_lbrace(&mut self) -> Result<Initializer, Diagnostic> {
+        let mut items = Vec::new();
+        if *self.cur() != TokenKind::RBrace {
+            loop {
+                let mut designators = Vec::new();
+                while self.take(&TokenKind::LBracket) || self.take(&TokenKind::Dot) {
+                    if matches!(self.t[self.p - 1].kind, TokenKind::LBracket) {
+                        let index = self.assign()?;
+                        self.expect(&TokenKind::RBracket)?;
+                        designators.push(Designator::Index(index));
+                    } else {
+                        designators.push(Designator::Member(self.ident()?));
+                    }
+                }
+                if !designators.is_empty() {
+                    self.expect(&TokenKind::Assign)?;
+                }
+                items.push(InitializerItem {
+                    designators,
+                    value: self.initializer()?,
+                });
+                if !self.take(&TokenKind::Comma) || *self.cur() == TokenKind::RBrace {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Initializer::List(items))
+    }
+
+    fn lookahead_starts_type_name(&self) -> bool {
+        match self.t.get(self.p + 1).map(|t| &t.kind) {
+            Some(TokenKind::Ident(name)) => self.alias_type(name).is_some(),
+            Some(k) => matches!(
+                k,
+                TokenKind::Void
+                    | TokenKind::Bool
+                    | TokenKind::CharKw
+                    | TokenKind::Int
+                    | TokenKind::Signed
+                    | TokenKind::Unsigned
+                    | TokenKind::Short
+                    | TokenKind::Long
+                    | TokenKind::Float
+                    | TokenKind::Double
+                    | TokenKind::Struct
+                    | TokenKind::Union
+                    | TokenKind::Enum
+                    | TokenKind::Const
+                    | TokenKind::Volatile
+                    | TokenKind::Restrict
+            ),
+            None => false,
+        }
+    }
+
+    fn type_name(&mut self) -> Result<Type, Diagnostic> {
+        let mut ty = self.typ()?;
+        if matches!(
+            self.cur(),
+            TokenKind::Star | TokenKind::LParen | TokenKind::LBracket
+        ) {
+            ty = self.declarator_full(ty)?.1;
+        }
+        Ok(ty)
+    }
     fn primary(&mut self) -> Result<Expr, Diagnostic> {
         let x = match self.cur().clone() {
             TokenKind::Number(n) => {
                 self.p += 1;
                 Expr::Int(n)
+            }
+            TokenKind::FloatConstant(_) => {
+                return Err(Diagnostic::error(
+                    "floating expressions are not implemented",
+                    Some(self.cur_span()),
+                ))
             }
             TokenKind::Char(c) => {
                 self.p += 1;

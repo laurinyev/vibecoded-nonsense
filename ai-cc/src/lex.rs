@@ -4,6 +4,7 @@ use std::fmt;
 pub enum TokenKind {
     Ident(String),
     Number(i64),
+    FloatConstant(String),
     String(String),
     Char(char),
     Int,
@@ -89,6 +90,8 @@ pub enum TokenKind {
     Dot,
     Arrow,
     Ellipsis,
+    Hash,
+    HashHash,
     End,
 }
 impl fmt::Display for TokenKind {
@@ -96,6 +99,7 @@ impl fmt::Display for TokenKind {
         let name = match self {
             TokenKind::Ident(_) => "identifier",
             TokenKind::Number(_) => "integer constant",
+            TokenKind::FloatConstant(_) => "floating constant",
             TokenKind::String(_) => "string literal",
             TokenKind::Char(_) => "character constant",
             TokenKind::Int => "'int'",
@@ -287,6 +291,63 @@ impl Lexer {
         }
         let c = self.src[self.pos];
         if c.is_ascii_digit() {
+            // Consume the pp-number-shaped spelling first, then validate it as
+            // either an integer or a C99 decimal/hexadecimal floating constant.
+            while self.pos < self.src.len()
+                && (self.src[self.pos].is_ascii_alphanumeric()
+                    || self.src[self.pos] == '_'
+                    || self.src[self.pos] == '.'
+                    || self.src[self.pos] == '+'
+                    || self.src[self.pos] == '-')
+            {
+                if matches!(self.src[self.pos], '+' | '-')
+                    && self.pos > s
+                    && matches!(self.src[self.pos - 1], 'e' | 'E' | 'p' | 'P')
+                {
+                    self.pos += 1;
+                    continue;
+                }
+                if !matches!(self.src[self.pos], '+' | '-') {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let spelling: String = self.src[s..self.pos].iter().collect();
+            let is_hex = spelling.starts_with("0x") || spelling.starts_with("0X");
+            let is_float = spelling.contains('.')
+                || if is_hex {
+                    spelling.contains('p') || spelling.contains('P')
+                } else {
+                    spelling.contains('e') || spelling.contains('E')
+                }
+                || matches!(spelling.chars().last(), Some('f' | 'F'));
+            if is_float {
+                let suffix = spelling
+                    .chars()
+                    .last()
+                    .filter(|c| matches!(c, 'f' | 'F' | 'l' | 'L'));
+                let body = suffix.map_or(spelling.as_str(), |_| &spelling[..spelling.len() - 1]);
+                let valid = if is_hex {
+                    (body.starts_with("0x") || body.starts_with("0X"))
+                        && (body.contains('p') || body.contains('P'))
+                        && body.chars().all(|c| {
+                            c.is_ascii_hexdigit()
+                                || matches!(c, 'x' | 'X' | 'p' | 'P' | '+' | '-' | '.')
+                        })
+                } else {
+                    let no_suffix = body;
+                    no_suffix.parse::<f64>().is_ok()
+                };
+                if !valid {
+                    return Err(Diagnostic::error(
+                        "invalid floating constant",
+                        Some(self.t(TokenKind::End, s).span),
+                    ));
+                }
+                return Ok(self.t(TokenKind::FloatConstant(spelling), s));
+            }
+            self.pos = s;
             let base = if c == '0' && matches!(self.src.get(self.pos + 1), Some('x' | 'X')) {
                 self.pos += 2;
                 16
@@ -540,6 +601,14 @@ impl Lexer {
                     TokenKind::Ellipsis
                 } else {
                     TokenKind::Dot
+                }
+            }
+            '#' => {
+                if self.src.get(self.pos) == Some(&'#') {
+                    self.pos += 1;
+                    TokenKind::HashHash
+                } else {
+                    TokenKind::Hash
                 }
             }
             '~' => TokenKind::Tilde,

@@ -20,7 +20,7 @@ pub enum Type {
     Void,
     Pointer(Box<Type>),
     Array(Box<Type>, Option<usize>),
-    Function(Box<Type>, Vec<Type>),
+    Function(Box<Type>, Vec<Type>, bool, bool),
     Struct(String, Vec<(String, Type)>),
     Union(String, Vec<(String, Type)>),
     Enum(String, Vec<(String, i64)>),
@@ -36,6 +36,18 @@ pub struct Qualifiers {
 pub struct TranslationUnit {
     pub items: Vec<Function>,
     pub types: Vec<Type>,
+    pub declarations: Vec<GlobalDecl>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GlobalDecl {
+    pub name: String,
+    pub ty: Type,
+    pub storage: Option<StorageClass>,
+    pub initializer: Option<Expr>,
+    pub tentative_definition: bool,
+    pub is_inline: bool,
+    pub span: Span,
 }
 #[derive(Clone, Debug)]
 pub struct Function {
@@ -43,8 +55,11 @@ pub struct Function {
     pub ret: Type,
     pub params: Vec<(String, Type)>,
     pub params_unspecified: bool,
+    pub is_variadic: bool,
     pub body: Block,
     pub external: bool,
+    pub is_static: bool,
+    pub is_inline: bool,
     pub span: Span,
 }
 #[derive(Clone, Debug)]
@@ -53,6 +68,9 @@ pub struct Block {
 }
 #[derive(Clone, Debug)]
 pub enum Stmt {
+    StorageDecl(StorageClass, Vec<(String, Type, Option<Expr>)>, Span),
+    Typedef(String, Type, Span),
+    Typedefs(Vec<(String, Type)>, Span),
     Decl(String, Type, Option<Expr>, Span),
     Decls(Vec<(String, Type, Option<Expr>)>, Span),
     Expr(Expr, Span),
@@ -72,10 +90,21 @@ pub enum Stmt {
     Continue(Span),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageClass {
+    Auto,
+    Register,
+    Static,
+    Extern,
+}
+
 impl Stmt {
     pub fn span(&self) -> Span {
         match self {
-            Self::Decl(_, _, _, span)
+            Self::StorageDecl(_, _, span)
+            | Self::Typedef(_, _, span)
+            | Self::Typedefs(_, span)
+            | Self::Decl(_, _, _, span)
             | Self::Decls(_, span)
             | Self::Expr(_, span)
             | Self::Return(_, span)
@@ -102,6 +131,27 @@ pub enum Expr {
     Conditional(Box<Expr>, Box<Expr>, Box<Expr>),
     Member(Box<Expr>, String, bool),
     Subscript(Box<Expr>, Box<Expr>),
+    Cast(Type, Box<Expr>),
+    SizeofType(Type),
+    CompoundLiteral(Type, Initializer),
+}
+
+#[derive(Clone, Debug)]
+pub enum Initializer {
+    Expr(Box<Expr>),
+    List(Vec<InitializerItem>),
+}
+
+#[derive(Clone, Debug)]
+pub struct InitializerItem {
+    pub designators: Vec<Designator>,
+    pub value: Initializer,
+}
+
+#[derive(Clone, Debug)]
+pub enum Designator {
+    Index(Expr),
+    Member(String),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOp {
@@ -133,4 +183,5 @@ pub enum UnOp {
     BitNot,
     Address,
     Deref,
+    Sizeof,
 }

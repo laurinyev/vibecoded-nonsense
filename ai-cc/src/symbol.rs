@@ -3,6 +3,7 @@ use crate::ast::Type;
 pub struct Symbol {
     pub name: String,
     pub ty: Type,
+    pub is_register: bool,
 }
 #[derive(Clone, Debug)]
 pub struct SymbolError(pub String);

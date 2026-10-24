@@ -278,6 +278,104 @@ fn runtime_fixture_has_expected_exit_status() {
 }
 
 #[test]
+fn compound_literals_support_aggregate_initializers_and_designators() {
+    let path = root().join("tests/conformance/runtime/compound-literals.c");
+    let work = temp_dir("compound-literals");
+    let executable = work.join("ai-program");
+    compile_ai(&path, &executable);
+    let output = run_sandboxed(&executable, &work);
+    assert_eq!(output.status.code(), Some(0));
+    let _ = fs::remove_dir_all(work);
+}
+
+#[test]
+fn compound_literal_initializer_constraints_are_diagnosed() {
+    for source in [
+        "int main(void) { return (int[2]){ [2] = 1 }[0]; }",
+        "struct S { int value; }; int main(void) { return (struct S){ .missing = 1 }.value; }",
+        "int main(void) { return (int){ 1, 2 }; }",
+        "union U { int value; char byte; }; int main(void) { return (union U){ 1, 2 }.value; }",
+    ] {
+        assert!(
+            ai_cc::compile(source, "compound-literal-invalid.c").is_err(),
+            "accepted: {source}"
+        );
+    }
+}
+
+#[test]
+fn file_scope_object_declarations_lower_to_initialized_and_tentative_storage() {
+    let path = root().join("tests/conformance/runtime/file-scope-objects.c");
+    let source = fs::read_to_string(&path).unwrap();
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    let ast = parser.parse_translation_unit().unwrap();
+    assert!(ast.declarations.iter().any(|declaration| {
+        declaration.name == "external_tentative"
+            && declaration.storage == Some(ai_cc::ast::StorageClass::Extern)
+            && !declaration.tentative_definition
+    }));
+    assert!(ast.declarations.iter().any(|declaration| {
+        declaration.name == "initialized" && declaration.initializer.is_some()
+    }));
+
+    let ir = ai_cc::compile(&source, path.to_str().unwrap()).unwrap();
+    assert!(ir.contains("export data $initialized"), "{ir}");
+    assert!(ir.contains("data $internal_tentative"), "{ir}");
+    assert!(ir.contains("export data $external_tentative"), "{ir}");
+    assert!(ir.contains("export data $callback"), "{ir}");
+
+    let work = temp_dir("file-scope-objects");
+    let executable = work.join("ai-program");
+    compile_ai(&path, &executable);
+    let output = run_sandboxed(&executable, &work);
+    assert_eq!(output.status.code(), Some(0));
+    let _ = fs::remove_dir_all(work);
+}
+
+#[test]
+fn file_scope_objects_reject_nonconstant_initializers_and_lower_aggregates() {
+    let errors = ai_cc::compile("int source; int copy = source;", "global-init.c").unwrap_err();
+    assert!(errors.iter().any(|error| error
+        .message
+        .contains("not a supported constant expression")));
+    assert!(errors.iter().all(|error| error.span.is_some()));
+
+    let ir = ai_cc::compile("int values[3];", "global-array.c").unwrap();
+    assert!(
+        ir.contains("export data $values = align 4 { w 0, w 0, w 0 }"),
+        "{ir}"
+    );
+
+    let errors = ai_cc::compile("auto int value;", "global-auto.c").unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|error| error.message.contains("auto is not allowed at file scope")));
+}
+
+#[test]
+fn old_style_function_definition_runs_with_declared_parameter_types() {
+    let path = root().join("tests/conformance/runtime/old-style-function-definition.c");
+    let work = temp_dir("old-style-function");
+    let executable = work.join("ai-program");
+    compile_ai(&path, &executable);
+    let output = run_sandboxed(&executable, &work);
+    assert_eq!(output.status.code(), Some(0));
+    let _ = fs::remove_dir_all(work);
+}
+
+#[test]
+fn parenthesized_and_nested_function_definitions_lower_and_run() {
+    let path = root().join("tests/conformance/runtime/nested-function-definitions.c");
+    let work = temp_dir("nested-function-definition");
+    let executable = work.join("ai-program");
+    compile_ai(&path, &executable);
+    let output = run_sandboxed(&executable, &work);
+    assert_eq!(output.status.code(), Some(0));
+    let _ = fs::remove_dir_all(work);
+}
+
+#[test]
 fn differential_integer_program_matches_host_compiler() {
     if env::var_os("AI_CC_RUN_DIFFERENTIAL").is_none() {
         eprintln!("skipping differential test; set AI_CC_RUN_DIFFERENTIAL=1 to enable");

@@ -81,7 +81,6 @@ fn run_glibc_case(file: &str, expected: &[u8]) {
     );
     assert_eq!(output.stdout, expected, "stdout mismatch for {}", file);
 }
-#[test]
 fn glibc_output_interop() {
     run_glibc_case("glibc_output.c", b"hello from glibc\nvalue=42\n");
 }
@@ -207,6 +206,179 @@ fn function_prototype_parameter_list_is_accepted() {
 }
 
 #[test]
+fn function_prototype_accepts_abstract_pointer_parameters() {
+    let source = "int consume(int *); int main(void) { return 0; }";
+    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    assert!(parser.parse_translation_unit().is_ok());
+}
+
+#[test]
+fn nested_function_declarators_parse_function_returning_function_pointer() {
+    let source = "int (*factory(void))(int); int (*factory2(int, int))(int); int (*array_factory(void))[4]; int apply(int (*callback)(int), int value); int invoke(int callback(int)); int consume(int matrix[static const 2][3], int *, int (*)(int)); int (*table[3])(int); int main(void) { return 0; }";
+    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    let ast = parser.parse_translation_unit().unwrap();
+    assert_eq!(ast.items[0].name, "factory");
+    assert!(ast.items[0].external);
+    assert!(matches!(
+        ast.items[0].ret,
+        ai_cc::ast::Type::Pointer(ref inner)
+            if matches!(**inner, ai_cc::ast::Type::Function(_, _, _, _))
+    ));
+    assert!(matches!(
+        ast.items[2].ret,
+        ai_cc::ast::Type::Pointer(ref inner)
+            if matches!(**inner, ai_cc::ast::Type::Array(_, Some(4)))
+    ));
+    assert_eq!(ast.items[1].params.len(), 2);
+    assert_eq!(ast.items[3].params.len(), 2);
+    assert_eq!(ast.items[4].params.len(), 1);
+    assert_eq!(ast.items[5].params.len(), 3);
+    assert!(matches!(
+        ast.declarations[0].ty,
+        ai_cc::ast::Type::Array(_, Some(3))
+    ));
+}
+
+#[test]
+fn variadic_and_unspecified_function_declarators_keep_their_prototype_form() {
+    let source = "int old(); int old_identifier(a, b); int fixed(void); int format(register int level, ...); int (*legacy_callback)(); int (*identifier_callback)(a, b); int (*var_callback)(int, ...); int main(void) { format(1, 2, 3); return 0; }";
+    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    let ast = parser.parse_translation_unit().unwrap();
+    assert!(ast.items[0].params_unspecified);
+    assert!(ast.items[1].params_unspecified);
+    assert!(!ast.items[2].params_unspecified);
+    assert!(ast.items[3].is_variadic);
+    assert!(matches!(
+        ast.declarations[0].ty,
+        ai_cc::ast::Type::Pointer(ref inner)
+            if matches!(**inner, ai_cc::ast::Type::Function(_, _, false, false))
+    ));
+    assert!(matches!(
+        ast.declarations[1].ty,
+        ai_cc::ast::Type::Pointer(ref inner)
+            if matches!(**inner, ai_cc::ast::Type::Function(_, _, false, false))
+    ));
+    assert!(matches!(
+        ast.declarations[2].ty,
+        ai_cc::ast::Type::Pointer(ref inner)
+            if matches!(**inner, ai_cc::ast::Type::Function(_, _, true, true))
+    ));
+    ai_cc::compile_preprocessed(source, "function-forms.c").unwrap();
+
+    let errors =
+        ai_cc::compile_preprocessed("int invalid(...);", "invalid-variadic.c").unwrap_err();
+    assert!(!errors.is_empty());
+
+    let errors = ai_cc::compile_preprocessed(
+        "int format(int level, ...); int main(void) { return format(); }",
+        "too-few-variadic-arguments.c",
+    )
+    .unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|error| error.message.contains("expects 1 argument(s), got 0")));
+
+    let errors = ai_cc::compile_preprocessed(
+        "int unsupported(int first, ...) { return first; }",
+        "variadic-definition.c",
+    )
+    .unwrap_err();
+    assert!(errors.iter().any(|error| error
+        .message
+        .contains("variadic function definitions are not yet supported")));
+}
+
+#[test]
+fn function_prototypes_support_multiple_declarators_in_one_declaration() {
+    let source = "int first(int value), second(int value); int old(first, second), fixed(void); int main(void) { return 0; }";
+    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    let ast = parser.parse_translation_unit().unwrap();
+    assert_eq!(ast.items[0].name, "first");
+    assert_eq!(ast.items[1].name, "second");
+    assert_eq!(ast.items[2].name, "old");
+    assert!(ast.items[2].params_unspecified);
+    assert_eq!(ast.items[3].name, "fixed");
+    assert!(!ast.items[3].params_unspecified);
+    ai_cc::compile_preprocessed(source, "multiple-function-declarators.c").unwrap();
+}
+
+#[test]
+fn old_style_function_definition_parameter_declarations_are_parsed() {
+    let source = "int subtract(left, right) int left; char right; { return left - right; } int main(void) { return subtract(9, 4) - 5; }";
+    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    let ast = parser.parse_translation_unit().unwrap();
+    assert_eq!(ast.items[0].params[0].0, "left");
+    assert_eq!(ast.items[0].params[0].1, ai_cc::ast::Type::Int);
+    assert_eq!(ast.items[0].params[1].0, "right");
+    assert_eq!(ast.items[0].params[1].1, ai_cc::ast::Type::Char);
+    ai_cc::compile_preprocessed(source, "old-style-definition.c").unwrap();
+}
+
+#[test]
+fn old_style_definition_requires_a_declaration_for_each_parameter() {
+    let errors = ai_cc::compile_preprocessed(
+        "int add(left, right) int left; { return left + right; }",
+        "old-style-missing-parameter.c",
+    )
+    .unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|error| error.message.contains("parameter right has no declaration")));
+}
+
+#[test]
+fn function_parameter_constraints_are_diagnosed() {
+    let errors = ai_cc::compile_preprocessed(
+        "int missing_name(int) { return 0; }",
+        "unnamed-definition-parameter.c",
+    )
+    .unwrap_err();
+    assert!(errors.iter().any(|error| error
+        .message
+        .contains("function definition parameters must be named")));
+
+    let errors =
+        ai_cc::compile_preprocessed("int invalid(void value);", "void-parameter.c").unwrap_err();
+    assert!(
+        errors.iter().any(|error| error
+            .message
+            .contains("function parameter cannot have void type")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn declarators_parse_array_parameter_qualifiers_static_and_vla_bounds() {
+    let source = "int consume(int values[const static 8]); int main(void) { int n = 3; int data[n]; return 0; }";
+    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    let ast = parser.parse_translation_unit().unwrap();
+    assert_eq!(
+        ast.items[0].params[0].1,
+        ai_cc::ast::Type::Qualified(
+            Box::new(ai_cc::ast::Type::Pointer(Box::new(ai_cc::ast::Type::Int))),
+            ai_cc::ast::Qualifiers {
+                is_const: true,
+                is_volatile: false,
+                is_restrict: false,
+            }
+        )
+    );
+    let ai_cc::ast::Stmt::Decl(_, ty, _, _) = &ast.items[1].body.stmts[1] else {
+        panic!("expected VLA declaration");
+    };
+    assert_eq!(
+        ty,
+        &ai_cc::ast::Type::Array(Box::new(ai_cc::ast::Type::Int), None)
+    );
+}
+
+#[test]
 fn local_function_pointer_declarator_is_parsed() {
     let source = "int main(void) { int (*callback)(int); return 0; }";
     let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
@@ -219,10 +391,56 @@ fn local_function_pointer_declarator_is_parsed() {
         ty,
         &ai_cc::ast::Type::Pointer(Box::new(ai_cc::ast::Type::Function(
             Box::new(ai_cc::ast::Type::Int),
-            vec![ai_cc::ast::Type::Int]
+            vec![ai_cc::ast::Type::Int],
+            false,
+            true
         )))
     );
     ai_cc::compile_preprocessed(source, "function-pointer.c").unwrap();
+}
+
+#[test]
+fn lexer_recognizes_decimal_and_hexadecimal_floating_constants() {
+    use ai_cc::lex::TokenKind as K;
+    let tokens = ai_cc::lex::Lexer::new("1.25 1e-3F 0x1.fp+2L")
+        .tokenize_all()
+        .unwrap();
+    assert!(matches!(tokens[0].kind, K::FloatConstant(_)));
+    assert!(matches!(tokens[1].kind, K::FloatConstant(_)));
+    assert!(matches!(tokens[2].kind, K::FloatConstant(_)));
+}
+
+#[test]
+fn block_scope_typedef_can_be_used_in_following_declaration() {
+    let source = "int main(void) { typedef unsigned long word; word value = 3; return value; }";
+    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    let ast = parser.parse_translation_unit().unwrap();
+    assert!(matches!(
+        ast.items[0].body.stmts[0],
+        ai_cc::ast::Stmt::Typedef(..)
+    ));
+    ai_cc::compile_preprocessed(source, "block-typedef.c").unwrap();
+}
+
+#[test]
+fn local_typedef_declaration_supports_multiple_declarators() {
+    let source =
+        "int main(void) { typedef int *intptr, row[4]; intptr p; row values; p = 0; return 0; }";
+    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    let ast = parser.parse_translation_unit().unwrap();
+    assert!(matches!(
+        ast.items[0].body.stmts[0],
+        ai_cc::ast::Stmt::Typedefs(..)
+    ));
+}
+
+#[test]
+fn typedef_names_are_hidden_by_ordinary_identifiers_in_nested_scopes() {
+    let source =
+        "typedef int T; int main(void) { { int T = 2; T = 3; } T value = 4; return value; }";
+    ai_cc::compile_preprocessed(source, "typedef-shadow.c").unwrap();
 }
 
 #[test]
@@ -453,10 +671,68 @@ fn aggregate_qualifier_keywords_lex() {
 }
 
 #[test]
-fn unsupported_pointer_sizeof_and_subscript_operators_are_diagnosed() {
-    let file = "unsupported-sizeof.c";
+fn sizeof_type_name_is_accepted() {
+    let (source, path) = case("unsupported-sizeof.c");
+    let ir = ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap();
+    assert!(ir.contains("copy 4"), "int must have target size 4: {ir}");
+}
+
+#[test]
+fn casts_and_sizeof_type_names_parse_and_lower() {
+    let source =
+        "int main(void) { long value = (long)3; return (int)(sizeof(long) + sizeof value); }";
+    ai_cc::compile_preprocessed(source, "cast-sizeof-type-name.c").unwrap();
+}
+
+#[test]
+fn static_local_has_persistent_initialized_storage() {
+    run_glibc_case("static-local.c", b"");
+}
+
+#[test]
+fn extern_local_uses_external_symbol_address() {
+    let ir = ai_cc::compile_preprocessed(
+        "int main(void) { extern int shared; return shared; }",
+        "extern-local.c",
+    )
+    .unwrap();
     assert!(
-        compile_errors(file).iter().any(|_| true),
-        "accepted unsupported operator: {file}"
+        ir.contains("loadw $shared"),
+        "expected external data reference: {ir}"
     );
+}
+
+#[test]
+fn register_object_cannot_have_its_address_taken() {
+    let errors = ai_cc::compile_preprocessed(
+        "int main(void) { register int value = 1; return (int)&value; }",
+        "register-address.c",
+    )
+    .unwrap_err();
+    assert!(errors.iter().any(|e| e.message.contains("register object")));
+}
+
+#[test]
+fn duplicate_storage_class_specifiers_are_rejected() {
+    let errors = ai_cc::compile_preprocessed(
+        "int main(void) { static extern int value; return value; }",
+        "duplicate-storage-class.c",
+    )
+    .unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|e| e.message.contains("multiple storage-class")));
+}
+
+#[test]
+fn static_inline_function_has_internal_qbe_linkage() {
+    let source =
+        "static inline int helper(void) { return 4; } int main(void) { return helper() - 4; }";
+    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let mut parser = ai_cc::parser::Parser::new(tokens);
+    let ast = parser.parse_translation_unit().unwrap();
+    assert!(ast.items[0].is_static && ast.items[0].is_inline);
+    let ir = ai_cc::compile_preprocessed(source, "static-inline-function.c").unwrap();
+    assert!(ir.contains("function w $helper"));
+    assert!(!ir.contains("export function w $helper"));
 }

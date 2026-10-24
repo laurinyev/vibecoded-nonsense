@@ -31,6 +31,77 @@ impl QbeCodegen {
 
     pub fn emit_program(&mut self, p: &LoweredProgram) -> Result<String, Vec<Diagnostic>> {
         let mut o = String::new();
+        for (name, ty, value, internal) in &p.globals {
+            let mut base_ty = ty;
+            while let Type::Qualified(inner, _) = base_ty {
+                base_ty = inner;
+            }
+            let (directive, alignment) = match base_ty {
+                Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => ("b", 1),
+                Type::Short | Type::UnsignedShort => ("h", 2),
+                Type::Long
+                | Type::UnsignedLong
+                | Type::LongLong
+                | Type::UnsignedLongLong
+                | Type::Pointer(_) => ("l", 8),
+                _ => ("w", 4),
+            };
+            let value = Self::data_value(value, directive);
+            let linkage = if *internal { "data" } else { "export data" };
+            o += &format!(
+                "{} ${} = align {} {{ {} {} }}\n",
+                linkage, name, alignment, directive, value
+            );
+        }
+        for data in &p.aggregate_data {
+            let alignment = Self::alignment(&data.ty);
+            let values = data
+                .values
+                .iter()
+                .map(|(ty, value)| {
+                    let directive = Self::data_directive(ty);
+                    format!("{} {}", directive, Self::data_value(value, directive))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let linkage = if data.internal { "data" } else { "export data" };
+            o += &format!(
+                "{} ${} = align {} {{ {} }}\n",
+                linkage, data.name, alignment, values
+            );
+        }
+        for (name, ty, value) in &p.statics {
+            let mut base_ty = ty;
+            while let Type::Qualified(inner, _) = base_ty {
+                base_ty = inner;
+            }
+            let alignment = match base_ty {
+                Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => 1,
+                Type::Short | Type::UnsignedShort => 2,
+                Type::Long
+                | Type::UnsignedLong
+                | Type::LongLong
+                | Type::UnsignedLongLong
+                | Type::Pointer(_) => 8,
+                _ => 4,
+            };
+            let (directive, value) = match base_ty {
+                Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => {
+                    ("b", *value as u8 as i64)
+                }
+                Type::Short | Type::UnsignedShort => ("h", *value as u16 as i64),
+                Type::Long
+                | Type::UnsignedLong
+                | Type::LongLong
+                | Type::UnsignedLongLong
+                | Type::Pointer(_) => ("l", *value),
+                _ => ("w", *value as i32 as i64),
+            };
+            o += &format!(
+                "data $static_{} = align {} {{ {} {} }}\n",
+                name, alignment, directive, value
+            );
+        }
         for (name, value) in &p.strings {
             o += &format!("data {} = {{ b \"{}\", b 0 }}\n", name, qbe_string(value));
         }
@@ -49,10 +120,12 @@ impl QbeCodegen {
             } else {
                 format!("{} ", Self::ty(&f.ret))
             };
-            o += &format!(
-                "export function {}${}({}) {{\n@start\n",
-                ret, f.name, params
-            );
+            let linkage = if f.is_static {
+                "function"
+            } else {
+                "export function"
+            };
+            o += &format!("{} {}${}({}) {{\n@start\n", linkage, ret, f.name, params);
             let mut terminated = false;
             for x in &f.body {
                 match x {
@@ -158,6 +231,52 @@ impl QbeCodegen {
             o.push_str("}\n\n");
         }
         Ok(o)
+    }
+
+    fn data_directive(ty: &Type) -> &'static str {
+        match ty {
+            Type::Qualified(inner, _) => Self::data_directive(inner),
+            Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => "b",
+            Type::Short | Type::UnsignedShort => "h",
+            Type::Long
+            | Type::UnsignedLong
+            | Type::LongLong
+            | Type::UnsignedLongLong
+            | Type::Pointer(_) => "l",
+            _ => "w",
+        }
+    }
+
+    fn alignment(ty: &Type) -> usize {
+        match ty {
+            Type::Qualified(inner, _) => Self::alignment(inner),
+            Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool => 1,
+            Type::Short | Type::UnsignedShort => 2,
+            Type::Long
+            | Type::UnsignedLong
+            | Type::LongLong
+            | Type::UnsignedLongLong
+            | Type::Pointer(_) => 8,
+            Type::Array(inner, _) => Self::alignment(inner),
+            Type::Struct(_, fields) | Type::Union(_, fields) => fields
+                .iter()
+                .map(|(_, ty)| Self::alignment(ty))
+                .max()
+                .unwrap_or(1),
+            _ => 4,
+        }
+    }
+
+    fn data_value(value: &DataValue, directive: &str) -> String {
+        match value {
+            DataValue::Address(name) => format!("${name}"),
+            DataValue::Integer(value) => match directive {
+                "b" => (*value as u8 as i64).to_string(),
+                "h" => (*value as u16 as i64).to_string(),
+                "w" => (*value as i32 as i64).to_string(),
+                _ => value.to_string(),
+            },
+        }
     }
 }
 
