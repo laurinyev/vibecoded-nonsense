@@ -161,6 +161,68 @@ fn preprocessor_matches_reference_for_basic_fixture() {
 }
 
 #[test]
+fn preprocessor_expands_c99_macro_forms() {
+    let source = r#"
+#define VALUE 4
+#define ADD(a, b) ((a) + (b))
+#define STR(x) #x
+#define CAT(a, b) a ## b
+#define JOIN(first, ...) first __VA_ARGS__
+#define LEFT RIGHT
+#define RIGHT LEFT
+ADD(VALUE, 3)
+STR(VALUE)
+CAT(ma, in)
+JOIN(1, 2, 3)
+LEFT
+#if defined(VALUE) && (2 + 3 * 4 == 14)
+selected
+#else
+not_selected
+#endif
+#undef VALUE
+#ifdef VALUE
+wrong
+#else
+undefined
+#endif
+"#;
+    let output = ai_cc::preprocess(source, "macros.c").unwrap();
+    let lines = nonempty_lines(&output);
+    assert!(lines.contains("((4) + (3))"), "{lines}");
+    assert!(lines.contains("\"VALUE\""), "{lines}");
+    assert!(lines.contains("main"), "{lines}");
+    assert!(lines.contains("1 2, 3"), "{lines}");
+    assert!(lines.contains("LEFT"), "{lines}");
+    assert!(lines.contains("selected"), "{lines}");
+    assert!(lines.contains("undefined"), "{lines}");
+    assert!(!lines.contains("not_selected"), "{lines}");
+}
+
+#[test]
+fn preprocessor_supports_include_expansion_and_line_builtins() {
+    let path = root().join("tests/conformance/preprocess/include_macro.c");
+    let source = fs::read_to_string(&path).unwrap();
+    let output = ai_cc::preprocess(&source, path.to_str().unwrap()).unwrap();
+    assert!(nonempty_lines(&output).contains("9"));
+
+    let output =
+        ai_cc::preprocess("#line 100 \"logical.c\"\n__LINE__ __FILE__\n", "physical.c").unwrap();
+    assert!(
+        nonempty_lines(&output).contains("100 \"logical.c\""),
+        "{output}"
+    );
+}
+
+#[test]
+fn preprocessor_rejects_incompatible_macro_redefinitions() {
+    let errors = ai_cc::preprocess("#define VALUE 1\n#define VALUE 2\n", "macros.c").unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|error| error.message.contains("incompatible redefinition")));
+}
+
+#[test]
 fn translation_phases_normalize_source_before_preprocessing() {
     let trigraph = "??=define ANSWER 7\nANSWER\n";
     let output = ai_cc::preprocess(trigraph, "trigraph.c").unwrap();
