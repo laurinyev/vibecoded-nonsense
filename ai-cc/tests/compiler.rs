@@ -147,6 +147,33 @@ fn lexical_c99_basics() {
 }
 
 #[test]
+fn lexer_recognizes_c99_keywords_punctuator_and_integer_radices() {
+    use ai_cc::lex::TokenKind as K;
+    let tokens = ai_cc::lex::Lexer::new(
+        "auto case default extern goto register switch inline _Complex _Imaginary ... 077 0xffU 42LL size_t int32_t",
+    )
+    .tokenize_all()
+    .unwrap();
+    let kinds: Vec<_> = tokens.iter().map(|token| &token.kind).collect();
+    assert!(matches!(kinds[0], K::Auto));
+    assert!(matches!(kinds[1], K::Case));
+    assert!(matches!(kinds[2], K::Default));
+    assert!(matches!(kinds[3], K::Extern));
+    assert!(matches!(kinds[4], K::Goto));
+    assert!(matches!(kinds[5], K::Register));
+    assert!(matches!(kinds[6], K::Switch));
+    assert!(matches!(kinds[7], K::Inline));
+    assert!(matches!(kinds[8], K::Complex));
+    assert!(matches!(kinds[9], K::Imaginary));
+    assert!(matches!(kinds[10], K::Ellipsis));
+    assert!(matches!(kinds[11], K::Number(63)));
+    assert!(matches!(kinds[12], K::Number(255)));
+    assert!(matches!(kinds[13], K::Number(42)));
+    assert!(matches!(kinds[14], K::Ident(name) if name == "size_t"));
+    assert!(matches!(kinds[15], K::Ident(name) if name == "int32_t"));
+}
+
+#[test]
 fn string_literal_concatenation() {
     let (source, path) = case("string-concat.c");
     let ir = ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap();

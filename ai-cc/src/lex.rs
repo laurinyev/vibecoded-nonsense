@@ -10,20 +10,16 @@ pub enum TokenKind {
     Bool,
     CharKw,
     Void,
-    SizeT,
-    PtrdiffT,
-    WcharT,
-    VaList,
-    Int8T,
-    Uint8T,
-    Int16T,
-    Uint16T,
-    Int32T,
-    Uint32T,
-    Int64T,
-    Uint64T,
-    IntmaxT,
-    UintmaxT,
+    Auto,
+    Case,
+    Default,
+    Extern,
+    Goto,
+    Register,
+    Switch,
+    Inline,
+    Complex,
+    Imaginary,
     Return,
     If,
     Else,
@@ -92,6 +88,7 @@ pub enum TokenKind {
     Question,
     Dot,
     Arrow,
+    Ellipsis,
     End,
 }
 impl fmt::Display for TokenKind {
@@ -163,6 +160,7 @@ impl fmt::Display for TokenKind {
             TokenKind::OrAssign => "'|='",
             TokenKind::Dot => "'.'",
             TokenKind::Arrow => "'->'",
+            TokenKind::Ellipsis => "'...'",
             _ => "type or keyword",
         };
         f.write_str(name)
@@ -276,44 +274,71 @@ impl Lexer {
         if s == self.src.len() {
             return Ok(self.t(TokenKind::End, s));
         }
+        for (spelling, kind) in [
+            ("<:", TokenKind::LBracket),
+            (":>", TokenKind::RBracket),
+            ("<%", TokenKind::LBrace),
+            ("%>", TokenKind::RBrace),
+        ] {
+            if self.src[s..].starts_with(&spelling.chars().collect::<Vec<_>>()) {
+                self.pos += 2;
+                return Ok(self.t(kind, s));
+            }
+        }
         let c = self.src[self.pos];
         if c.is_ascii_digit() {
             let base = if c == '0' && matches!(self.src.get(self.pos + 1), Some('x' | 'X')) {
                 self.pos += 2;
                 16
+            } else if c == '0' {
+                8
             } else {
                 10
             };
-            let mut n = 0i64;
-            let mut any = false;
-            let mut overflow = false;
-            while self.pos < self.src.len() {
-                let Some(d) = self.src[self.pos].to_digit(base) else {
-                    break;
-                };
-                any = true;
-                if let Some(next) = n
-                    .checked_mul(base as i64)
-                    .and_then(|x| x.checked_add(d as i64))
-                {
-                    n = next;
-                } else {
-                    overflow = true;
-                }
+            let digits_start = self.pos;
+            while self.pos < self.src.len() && self.src[self.pos].is_digit(base) {
                 self.pos += 1;
             }
-            if !any {
+            if self.pos == digits_start {
                 return Err(Diagnostic::error(
-                    "expected hexadecimal digit",
+                    if base == 16 {
+                        "expected hexadecimal digit"
+                    } else {
+                        "invalid integer constant"
+                    },
                     Some(self.t(TokenKind::End, s).span),
                 ));
             }
-            if overflow {
+            let digits: String = self.src[digits_start..self.pos].iter().collect();
+            let suffix_start = self.pos;
+            while self.pos < self.src.len() && matches!(self.src[self.pos], 'u' | 'U' | 'l' | 'L') {
+                self.pos += 1;
+            }
+            let suffix: String = self.src[suffix_start..self.pos].iter().collect();
+            let u_count = suffix.chars().filter(|c| matches!(c, 'u' | 'U')).count();
+            let l_count = suffix.chars().filter(|c| matches!(c, 'l' | 'L')).count();
+            let long_suffix: String = suffix.chars().filter(|c| matches!(c, 'l' | 'L')).collect();
+            if u_count > 1
+                || l_count > 2
+                || suffix.len() != u_count + l_count
+                || self
+                    .src
+                    .get(self.pos)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                || (l_count == 2 && long_suffix != "ll" && long_suffix != "LL")
+            {
+                return Err(Diagnostic::error(
+                    "invalid integer constant suffix",
+                    Some(self.t(TokenKind::End, s).span),
+                ));
+            }
+            let value = i64::from_str_radix(&digits, base).ok();
+            let Some(n) = value else {
                 return Err(Diagnostic::error(
                     "integer constant is out of range",
                     Some(self.t(TokenKind::End, s).span),
                 ));
-            }
+            };
             return Ok(self.t(TokenKind::Number(n), s));
         }
         if c.is_ascii_alphabetic()
@@ -353,20 +378,16 @@ impl Lexer {
                 "_Bool" => TokenKind::Bool,
                 "char" => TokenKind::CharKw,
                 "void" => TokenKind::Void,
-                "size_t" => TokenKind::SizeT,
-                "ptrdiff_t" => TokenKind::PtrdiffT,
-                "wchar_t" => TokenKind::WcharT,
-                "va_list" => TokenKind::VaList,
-                "int8_t" => TokenKind::Int8T,
-                "uint8_t" => TokenKind::Uint8T,
-                "int16_t" => TokenKind::Int16T,
-                "uint16_t" => TokenKind::Uint16T,
-                "int32_t" => TokenKind::Int32T,
-                "uint32_t" => TokenKind::Uint32T,
-                "int64_t" => TokenKind::Int64T,
-                "uint64_t" => TokenKind::Uint64T,
-                "intmax_t" => TokenKind::IntmaxT,
-                "uintmax_t" => TokenKind::UintmaxT,
+                "auto" => TokenKind::Auto,
+                "case" => TokenKind::Case,
+                "default" => TokenKind::Default,
+                "extern" => TokenKind::Extern,
+                "goto" => TokenKind::Goto,
+                "register" => TokenKind::Register,
+                "switch" => TokenKind::Switch,
+                "inline" => TokenKind::Inline,
+                "_Complex" => TokenKind::Complex,
+                "_Imaginary" => TokenKind::Imaginary,
                 "return" => TokenKind::Return,
                 "if" => TokenKind::If,
                 "else" => TokenKind::Else,
@@ -512,7 +533,15 @@ impl Lexer {
             ',' => TokenKind::Comma,
             ':' => TokenKind::Colon,
             '?' => TokenKind::Question,
-            '.' => TokenKind::Dot,
+            '.' => {
+                if self.src.get(self.pos) == Some(&'.') && self.src.get(self.pos + 1) == Some(&'.')
+                {
+                    self.pos += 2;
+                    TokenKind::Ellipsis
+                } else {
+                    TokenKind::Dot
+                }
+            }
             '~' => TokenKind::Tilde,
             '^' => {
                 if self.src.get(self.pos) == Some(&'=') {

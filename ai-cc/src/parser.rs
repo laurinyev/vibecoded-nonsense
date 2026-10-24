@@ -151,21 +151,7 @@ impl Parser {
             return Ok(Type::Enum(tag, values));
         }
         let x = match self.cur() {
-            TokenKind::Int
-            | TokenKind::SizeT
-            | TokenKind::PtrdiffT
-            | TokenKind::WcharT
-            | TokenKind::VaList
-            | TokenKind::Int8T
-            | TokenKind::Uint8T
-            | TokenKind::Int16T
-            | TokenKind::Uint16T
-            | TokenKind::Int32T
-            | TokenKind::Uint32T
-            | TokenKind::Int64T
-            | TokenKind::Uint64T
-            | TokenKind::IntmaxT
-            | TokenKind::UintmaxT => {
+            TokenKind::Int => {
                 self.p += 1;
                 Type::Int
             }
@@ -485,20 +471,6 @@ impl Parser {
                     | TokenKind::Bool
                     | TokenKind::CharKw
                     | TokenKind::Void
-                    | TokenKind::SizeT
-                    | TokenKind::PtrdiffT
-                    | TokenKind::WcharT
-                    | TokenKind::VaList
-                    | TokenKind::Int8T
-                    | TokenKind::Uint8T
-                    | TokenKind::Int16T
-                    | TokenKind::Uint16T
-                    | TokenKind::Int32T
-                    | TokenKind::Uint32T
-                    | TokenKind::Int64T
-                    | TokenKind::Uint64T
-                    | TokenKind::IntmaxT
-                    | TokenKind::UintmaxT
                     | TokenKind::Struct
                     | TokenKind::Union
                     | TokenKind::Enum
