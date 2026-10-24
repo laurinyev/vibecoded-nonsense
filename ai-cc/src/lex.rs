@@ -193,6 +193,51 @@ impl Lexer {
             },
         }
     }
+
+    fn ucn_at(&self, start: usize) -> Result<(char, usize), Diagnostic> {
+        let prefix = self.src.get(start + 1).copied();
+        let digits = match prefix {
+            Some('u') => 4,
+            Some('U') => 8,
+            _ => {
+                return Err(Diagnostic::error(
+                    "invalid universal character name",
+                    Some(Span {
+                        start,
+                        end: (start + 2).min(self.src.len()),
+                    }),
+                ))
+            }
+        };
+        let end = start.saturating_add(2).saturating_add(digits);
+        if end > self.src.len() {
+            return Err(Diagnostic::error(
+                "incomplete universal character name",
+                Some(Span {
+                    start,
+                    end: self.src.len(),
+                }),
+            ));
+        }
+        let mut value = 0u32;
+        for c in &self.src[start + 2..end] {
+            let Some(digit) = c.to_digit(16) else {
+                return Err(Diagnostic::error(
+                    "invalid universal character name",
+                    Some(Span { start, end }),
+                ));
+            };
+            value = value * 16 + digit;
+        }
+        let Some(c) = char::from_u32(value) else {
+            return Err(Diagnostic::error(
+                "universal character name is not a scalar value",
+                Some(Span { start, end }),
+            ));
+        };
+        Ok((c, end))
+    }
+
     pub fn next_token(&mut self) -> Result<Token, Diagnostic> {
         loop {
             while self.pos < self.src.len() && self.src[self.pos].is_whitespace() {
@@ -271,14 +316,38 @@ impl Lexer {
             }
             return Ok(self.t(TokenKind::Number(n), s));
         }
-        if c.is_ascii_alphabetic() || c == '_' {
-            self.pos += 1;
-            while self.pos < self.src.len()
-                && (self.src[self.pos].is_ascii_alphanumeric() || self.src[self.pos] == '_')
-            {
+        if c.is_ascii_alphabetic()
+            || c == '_'
+            || (c == '\\' && self.src.get(s + 1).is_some_and(|x| *x == 'u' || *x == 'U'))
+        {
+            let mut x = String::new();
+            if c == '\\' {
+                let (decoded, end) = self.ucn_at(self.pos)?;
+                x.push(decoded);
+                self.pos = end;
+            } else {
+                x.push(c);
                 self.pos += 1;
             }
-            let x: String = self.src[s..self.pos].iter().collect();
+            loop {
+                if self.pos < self.src.len()
+                    && (self.src[self.pos].is_ascii_alphanumeric() || self.src[self.pos] == '_')
+                {
+                    x.push(self.src[self.pos]);
+                    self.pos += 1;
+                } else if self.src.get(self.pos) == Some(&'\\')
+                    && self
+                        .src
+                        .get(self.pos + 1)
+                        .is_some_and(|x| *x == 'u' || *x == 'U')
+                {
+                    let (decoded, end) = self.ucn_at(self.pos)?;
+                    x.push(decoded);
+                    self.pos = end;
+                } else {
+                    break;
+                }
+            }
             let k = match x.as_str() {
                 "int" => TokenKind::Int,
                 "_Bool" => TokenKind::Bool,
@@ -331,6 +400,17 @@ impl Lexer {
             let mut x = String::new();
             while self.pos < self.src.len() && self.src[self.pos] != quote {
                 if self.src[self.pos] == '\\' {
+                    let escape_start = self.pos;
+                    if self
+                        .src
+                        .get(self.pos + 1)
+                        .is_some_and(|x| *x == 'u' || *x == 'U')
+                    {
+                        let (decoded, end) = self.ucn_at(escape_start)?;
+                        x.push(decoded);
+                        self.pos = end;
+                        continue;
+                    }
                     self.pos += 1;
                     let Some(e) = self.src.get(self.pos).copied() else {
                         break;
@@ -351,7 +431,13 @@ impl Lexer {
                 self.pos += 1;
             }
             if self.pos == self.src.len() || self.src[self.pos] != quote {
-                return Err(Diagnostic::error("unterminated string", None));
+                return Err(Diagnostic::error(
+                    "unterminated string",
+                    Some(Span {
+                        start: s,
+                        end: self.pos,
+                    }),
+                ));
             }
             self.pos += 1;
             return if quote == '"' {

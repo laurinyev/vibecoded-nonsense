@@ -161,6 +161,50 @@ fn preprocessor_matches_reference_for_basic_fixture() {
 }
 
 #[test]
+fn translation_phases_normalize_source_before_preprocessing() {
+    let trigraph = "??=define ANSWER 7\nANSWER\n";
+    let output = ai_cc::preprocess(trigraph, "trigraph.c").unwrap();
+    assert_eq!(nonempty_lines(&output), "7");
+
+    let spliced = "#define ANSWER 1\\\n2\nint main(void){return ANSWER;}\n";
+    ai_cc::compile(spliced, "spliced.c").unwrap();
+
+    let comments = "int/* comment\n */main(void){return 0;}\n";
+    ai_cc::compile(comments, "comments.c").unwrap();
+
+    let ucn = r"int main(void){ int \u0061 = 3; return \u0061; }";
+    ai_cc::compile(ucn, "ucn.c").unwrap();
+
+    let tokens = ai_cc::pp::tokenize_preprocessing("int \\u0061 -> 1\n").unwrap();
+    assert!(matches!(
+        tokens[0].kind,
+        ai_cc::pp::PreprocessingTokenKind::Identifier(ref value) if value == "int"
+    ));
+    assert!(matches!(
+        tokens[1].kind,
+        ai_cc::pp::PreprocessingTokenKind::Identifier(ref value) if value == "\\u0061"
+    ));
+    assert!(matches!(
+        tokens[2].kind,
+        ai_cc::pp::PreprocessingTokenKind::Punctuator(ref value) if value == "->"
+    ));
+
+    assert_eq!(
+        ai_cc::pp::normalize_source("a\r\nb\rc").unwrap(),
+        "a\nb\nc\n"
+    );
+}
+
+#[test]
+fn unterminated_comment_is_rejected_during_translation_phases() {
+    let errors = ai_cc::compile("int main(void){return 0;} /*", "comment.c").unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|error| error.message.contains("unterminated comment")));
+    assert!(errors.iter().all(|error| error.span.is_some()));
+}
+
+#[test]
 fn runtime_fixture_has_expected_exit_status() {
     let path = root().join("tests/conformance/runtime/exit-code.c");
     let work = temp_dir("runtime");

@@ -12,6 +12,10 @@ rejected; diagnostic fixtures carry an `EXPECT-DIAGNOSTIC` marker; the
 preprocessor fixture is compared with the host `cc`; and the runtime fixture is
 compiled, linked, sandboxed, and checked by exit status.
 
+The translation-phase tests also cover CRLF/CR normalization, trigraphs,
+backslash-newline splicing, comment whitespace/newline behavior, malformed
+comments, UCNs, and independent preprocessing-token classification.
+
 Fixtures derive from constructs illustrated by `../c99.pdf`, with the current
 coverage boundary recorded in `../C99_ROADMAP.md`.
 
