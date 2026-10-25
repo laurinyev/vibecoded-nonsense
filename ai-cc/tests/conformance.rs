@@ -286,6 +286,11 @@ fn function_pointers() {
 }
 
 #[test]
+fn pointer_conversions() {
+    run_valid_fixture("pointer-conversions.c");
+}
+
+#[test]
 fn string_arrays() {
     let path = root().join("tests/conformance/valid/string-array-initialization.c");
     let work = temp_dir("string-array-initialization");

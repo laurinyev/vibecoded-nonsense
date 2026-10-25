@@ -518,6 +518,26 @@ impl Lowerer {
         )
     }
 
+    fn integer_precision(rank: u8) -> u8 {
+        match rank {
+            0 | 1 => 8,
+            2 => 16,
+            4 | 5 => 64,
+            _ => 32,
+        }
+    }
+
+    fn integer_type_at_rank(rank: u8, unsigned: bool) -> Type {
+        match (rank, unsigned) {
+            (4, true) => Type::UnsignedLong,
+            (4, false) => Type::Long,
+            (5, true) => Type::UnsignedLongLong,
+            (5, false) => Type::LongLong,
+            (_, true) => Type::UnsignedInt,
+            (_, false) => Type::Int,
+        }
+    }
+
     fn usual_arithmetic_type(a: &Type, b: &Type) -> Type {
         let complex = Self::is_complex(a) || Self::is_complex(b);
         let a = Self::real_type(a);
@@ -529,21 +549,27 @@ impl Lowerer {
         } else if matches!(a, Type::Float) || matches!(b, Type::Float) {
             Type::Float
         } else {
-            let rank = Self::integer_rank(&a).max(Self::integer_rank(&b));
+            let a_rank = Self::integer_rank(&a);
+            let b_rank = Self::integer_rank(&b);
+            let rank = a_rank.max(b_rank);
+            let a_unsigned = Self::integer_unsigned(&a);
+            let b_unsigned = Self::integer_unsigned(&b);
+            let unsigned = if a_unsigned == b_unsigned {
+                a_unsigned
+            } else {
+                let (signed_rank, unsigned_rank) = if a_unsigned {
+                    (b_rank, a_rank)
+                } else {
+                    (a_rank, b_rank)
+                };
+                signed_rank <= unsigned_rank
+                    || Self::integer_precision(signed_rank)
+                        <= Self::integer_precision(unsigned_rank)
+            };
             if rank < 3 {
                 Type::Int
-            } else if Self::integer_unsigned(&a) || Self::integer_unsigned(&b) {
-                match rank {
-                    4 => Type::UnsignedLong,
-                    5 => Type::UnsignedLongLong,
-                    _ => Type::UnsignedInt,
-                }
             } else {
-                match rank {
-                    4 => Type::Long,
-                    5 => Type::LongLong,
-                    _ => Type::Int,
-                }
+                Self::integer_type_at_rank(rank, unsigned)
             }
         };
         if complex {
@@ -1489,6 +1515,25 @@ impl Lowerer {
             Expr::Binary(op, a, b) => {
                 let left_ty = self.type_of(a);
                 let right_ty = self.type_of(b);
+                if matches!(
+                    op,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                ) && (Self::is_pointer(&left_ty) || Self::is_pointer(&right_ty))
+                {
+                    let compare_ty = if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+                    {
+                        Type::UnsignedLong
+                    } else if Self::is_pointer(&left_ty) {
+                        left_ty.clone()
+                    } else {
+                        right_ty.clone()
+                    };
+                    let x = self.expr_as(a, &compare_ty, v);
+                    let y = self.expr_as(b, &compare_ty, v);
+                    let out = self.tmp();
+                    v.push(Instr::BinTyped(out.clone(), *op, x, y, compare_ty));
+                    return out;
+                }
                 if matches!(op, BinOp::Add | BinOp::Sub) {
                     if Self::is_pointer(&left_ty) && Self::is_integer(&right_ty) {
                         return self.pointer_offset(*op, a, b, &right_ty, v);
@@ -1566,14 +1611,24 @@ impl Lowerer {
                         | BinOp::Shr
                 ) && !Self::is_pointer(&left_ty)
                     && !Self::is_pointer(&right_ty);
-                let common = Self::usual_arithmetic_type(&left_ty, &right_ty);
+                let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+                let common = if shift {
+                    Self::integer_promote(&left_ty)
+                } else {
+                    Self::usual_arithmetic_type(&left_ty, &right_ty)
+                };
                 let x = if arithmetic {
                     self.expr_as(a, &common, v)
                 } else {
                     self.expr(a, v)
                 };
+                let right_common = if shift {
+                    Self::integer_promote(&right_ty)
+                } else {
+                    common.clone()
+                };
                 let y = if arithmetic {
-                    self.expr_as(b, &common, v)
+                    self.expr_as(b, &right_common, v)
                 } else {
                     self.expr(b, v)
                 };
@@ -1899,7 +1954,9 @@ impl Lowerer {
             ));
             return out;
         }
-        if Self::is_integer(&source) && Self::is_integer(&target) {
+        if (Self::is_integer(&source) || Self::is_pointer(&source))
+            && (Self::is_integer(&target) || Self::is_pointer(&target))
+        {
             let out = self.tmp();
             v.push(Instr::Convert(
                 out.clone(),

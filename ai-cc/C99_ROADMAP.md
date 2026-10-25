@@ -152,19 +152,20 @@ Assignments require modifiable lvalues; const-qualified objects, aggregates cont
 Remaining work:
 
 - Represent and validate increment/decrement without losing postfix value semantics.
-- Complete member/subscript constraints, including pointer-to-incomplete element types.
+- Complete member and subscript constraints, including reversed `i[p]` operands.
 - Expand source-spanned constraint coverage for every lvalue context.
 
-### 3.2 Implement C99 conversions
+### 3.2 Implement C99 conversions — in progress
 
-- Lvalue, array-to-pointer, and function-designator conversions.
-- Integer promotions.
-- Usual arithmetic conversions.
-- Integer, floating, pointer, and qualification conversions.
-- Null pointer constants.
-- Assignment, parameter, and return conversions.
-- Conditional-operator conversions.
-- Pointer arithmetic and pointer subtraction constraints.
+Arithmetic assignment conversions, integer promotions, and usual arithmetic conversions are implemented for the target integer model. Assignments, initializers, arguments, and returns accept compatible arithmetic types, null pointer constants, and qualifier-preserving object-pointer/`void *` conversions. Equality and relational pointer constraints are checked, and pointer arithmetic requires a complete object pointee.
+
+Remaining work:
+
+- Complete pointer conditional composite types and pointer casts/conversions.
+- Apply default argument promotions for unprototyped calls and variadic arguments.
+- Implement pointer subtraction and complete pointer arithmetic behavior.
+- Validate and lower every conversion consistently, including unsigned and floating edge cases.
+- Add coverage for remaining integer promotions and usual arithmetic conversion rank/representability cases.
 
 ### 3.3 Implement constant expressions — in progress
 

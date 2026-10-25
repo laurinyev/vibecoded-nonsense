@@ -490,7 +490,7 @@ impl Sema {
                             "void function cannot return a value",
                             Some(span),
                         ));
-                    } else if !Self::compatible(&ret, &got) {
+                    } else if !self.assignment_compatible(&ret, &got, e) {
                         self.errs.push(Diagnostic::error(
                             format!("return value is incompatible with {}", Self::describe(&ret)),
                             Some(span),
@@ -589,7 +589,7 @@ impl Sema {
                         Some(span),
                     ));
                 }
-                if !Self::compatible(&target_ty, &value_ty) {
+                if !self.assignment_compatible(&target_ty, &value_ty, value) {
                     self.errs.push(Diagnostic::error(
                         format!(
                             "cannot assign {} to {}",
@@ -613,9 +613,7 @@ impl Sema {
                     }
                     BinOp::Eq | BinOp::Ne => {
                         if !(Self::arithmetic(&left) && Self::arithmetic(&right))
-                            && !(Self::pointer_like(&left)
-                                && Self::pointer_like(&right)
-                                && Self::compatible(&left, &right))
+                            && !self.equality_comparable(&left, &right, a, b)
                         {
                             self.errs.push(Diagnostic::error(
                                 "equality operands must have compatible scalar types",
@@ -631,9 +629,7 @@ impl Sema {
                                 Some(span),
                             ));
                         } else if !(Self::arithmetic(&left) && Self::arithmetic(&right))
-                            && !(Self::pointer_like(&left)
-                                && Self::pointer_like(&right)
-                                && Self::compatible(&left, &right))
+                            && !self.relationally_comparable(&left, &right)
                         {
                             self.errs.push(Diagnostic::error(
                                 "relational operands must be arithmetic or compatible pointers",
@@ -658,11 +654,18 @@ impl Sema {
                                 && Self::integer(&left)
                                 && Self::pointer_like(&right));
                         if pointer_integer {
-                            if Self::pointer_like(&left) {
-                                Self::decay(&left)
+                            let pointer_ty = if Self::pointer_like(&left) {
+                                &left
                             } else {
-                                Self::decay(&right)
+                                &right
+                            };
+                            if !self.pointer_arithmetic_type(pointer_ty) {
+                                self.errs.push(Diagnostic::error(
+                                    "pointer arithmetic requires a pointer to a complete object type",
+                                    Some(span),
+                                ));
                             }
+                            Self::decay(pointer_ty)
                         } else if Self::arithmetic(&left) && Self::arithmetic(&right) {
                             Self::usual_arithmetic_type(&left, &right)
                         } else {
@@ -839,15 +842,35 @@ impl Sema {
                 self.require_scalar(&condition_ty, "conditional condition", span);
                 let yes_ty = Self::decay(&self.expr(yes, span));
                 let no_ty = Self::decay(&self.expr(no, span));
-                if !Self::compatible(&yes_ty, &no_ty) {
+                if Self::arithmetic(&yes_ty) && Self::arithmetic(&no_ty) {
+                    Self::usual_arithmetic_type(&yes_ty, &no_ty)
+                } else if Self::compatible(&yes_ty, &no_ty) {
+                    yes_ty
+                } else if Self::pointer_like(&yes_ty)
+                    && Self::integer(&no_ty)
+                    && self.is_null_pointer_constant(no, &no_ty)
+                {
+                    yes_ty
+                } else if Self::pointer_like(&no_ty)
+                    && Self::integer(&yes_ty)
+                    && self.is_null_pointer_constant(yes, &yes_ty)
+                {
+                    no_ty
+                } else if Self::pointer_like(&yes_ty) && Self::pointer_like(&no_ty) {
+                    if let Some(common) = Self::common_pointer_type(&yes_ty, &no_ty) {
+                        common
+                    } else {
+                        self.errs.push(Diagnostic::error(
+                            "conditional operands have incompatible types",
+                            Some(span),
+                        ));
+                        yes_ty
+                    }
+                } else {
                     self.errs.push(Diagnostic::error(
                         "conditional operands have incompatible types",
                         Some(span),
                     ));
-                }
-                if Self::arithmetic(&yes_ty) && Self::arithmetic(&no_ty) {
-                    Self::usual_arithmetic_type(&yes_ty, &no_ty)
-                } else {
                     yes_ty
                 }
             }
@@ -896,7 +919,15 @@ impl Sema {
                 let index_ty = self.expr(index, span);
                 self.require_integer(&index_ty, "subscript index", span);
                 match Self::unqualified(&base_ty) {
-                    Type::Pointer(inner) | Type::Array(inner, _, _) | Type::Vla(inner, _) => *inner,
+                    Type::Pointer(inner) | Type::Array(inner, _, _) | Type::Vla(inner, _) => {
+                        if !self.valid_object_type(&inner) {
+                            self.errs.push(Diagnostic::error(
+                                "subscript requires a pointer to a complete object type",
+                                Some(span),
+                            ));
+                        }
+                        *inner
+                    }
                     _ => {
                         self.errs.push(Diagnostic::error(
                             "subscript operand must be a pointer or array",
@@ -934,12 +965,7 @@ impl Sema {
     ) {
         Self::infer_array_bound(target, expr, &mut self.errs, span);
         let got = Self::decay(&self.expr(expr, span));
-        let null_pointer =
-            Self::pointer_like(target) && Self::integer(&got) && matches!(expr, Expr::Int(0));
-        if !Self::compatible(target, &got)
-            && !null_pointer
-            && !(Self::arithmetic(target) && Self::arithmetic(&got))
-        {
+        if !self.assignment_compatible(target, &got, expr) {
             self.errs.push(Diagnostic::error(
                 format!(
                     "initializer is incompatible with {}",
@@ -1485,6 +1511,131 @@ impl Sema {
             && !self.contains_const_member(&ty)
     }
 
+    fn is_null_pointer_constant(&self, expr: &Expr, ty: &Type) -> bool {
+        Self::integer(ty) && Self::integer_constant(expr) == Some(0)
+    }
+
+    fn assignment_compatible(&self, target: &Type, source: &Type, value: &Expr) -> bool {
+        if Self::arithmetic(target) && Self::arithmetic(source) {
+            return true;
+        }
+        if Self::compatible(target, source) {
+            return true;
+        }
+        match (Self::unqualified(target), Self::unqualified(source)) {
+            (Type::Pointer(to), Type::Pointer(from)) => {
+                Self::pointer_conversion_compatible(&to, &from)
+            }
+            (Type::Pointer(_), _) => self.is_null_pointer_constant(value, source),
+            _ => false,
+        }
+    }
+
+    fn pointer_conversion_compatible(target: &Type, source: &Type) -> bool {
+        let target_qualifiers = Self::top_qualifiers(target);
+        let source_qualifiers = Self::top_qualifiers(source);
+        if !Self::qualifiers_include(target_qualifiers, source_qualifiers) {
+            return false;
+        }
+        let target_base = Self::unqualified(target);
+        let source_base = Self::unqualified(source);
+        if Self::compatible_declaration(&target_base, &source_base) {
+            return true;
+        }
+        match (&target_base, &source_base) {
+            (Type::Void, source) => !matches!(
+                Self::unqualified(source),
+                Type::Void | Type::Function(_, _, _, _)
+            ),
+            (target, Type::Void) => !matches!(
+                Self::unqualified(target),
+                Type::Void | Type::Function(_, _, _, _)
+            ),
+            _ => false,
+        }
+    }
+
+    fn qualifiers_include(target: Qualifiers, source: Qualifiers) -> bool {
+        (!source.is_const || target.is_const)
+            && (!source.is_volatile || target.is_volatile)
+            && (!source.is_restrict || target.is_restrict)
+    }
+
+    fn equality_comparable(&self, left: &Type, right: &Type, a: &Expr, b: &Expr) -> bool {
+        match (Self::unqualified(left), Self::unqualified(right)) {
+            (Type::Pointer(a_type), Type::Pointer(b_type)) => {
+                Self::compatible_pointer_targets(&a_type, &b_type)
+                    || Self::void_object_pointer_pair(&a_type, &b_type)
+            }
+            (Type::Pointer(_), _) => self.is_null_pointer_constant(b, right),
+            (_, Type::Pointer(_)) => self.is_null_pointer_constant(a, left),
+            _ => false,
+        }
+    }
+
+    fn relationally_comparable(&self, left: &Type, right: &Type) -> bool {
+        let (Type::Pointer(left), Type::Pointer(right)) =
+            (Self::unqualified(left), Self::unqualified(right))
+        else {
+            return false;
+        };
+        !matches!(
+            Self::unqualified(&left),
+            Type::Void | Type::Function(_, _, _, _)
+        ) && !matches!(
+            Self::unqualified(&right),
+            Type::Void | Type::Function(_, _, _, _)
+        ) && Self::compatible_pointer_targets(&left, &right)
+    }
+
+    fn compatible_pointer_targets(left: &Type, right: &Type) -> bool {
+        Self::compatible_declaration(&Self::unqualified(left), &Self::unqualified(right))
+    }
+
+    fn common_pointer_type(left: &Type, right: &Type) -> Option<Type> {
+        let (Type::Pointer(left), Type::Pointer(right)) =
+            (Self::unqualified(left), Self::unqualified(right))
+        else {
+            return None;
+        };
+        let left_qualifiers = Self::top_qualifiers(&left);
+        let right_qualifiers = Self::top_qualifiers(&right);
+        let qualifiers = Qualifiers {
+            is_const: left_qualifiers.is_const || right_qualifiers.is_const,
+            is_volatile: left_qualifiers.is_volatile || right_qualifiers.is_volatile,
+            is_restrict: left_qualifiers.is_restrict || right_qualifiers.is_restrict,
+            is_static: false,
+        };
+        let left_base = Self::unqualified(&left);
+        let right_base = Self::unqualified(&right);
+        let base = if Self::compatible_declaration(&left_base, &right_base) {
+            Self::composite(&left_base, &right_base)
+        } else if Self::void_object_pointer_pair(&left, &right) {
+            Type::Void
+        } else {
+            return None;
+        };
+        Some(Type::Pointer(Box::new(Self::qualify_type(
+            base, qualifiers,
+        ))))
+    }
+
+    fn void_object_pointer_pair(left: &Type, right: &Type) -> bool {
+        let left = Self::unqualified(left);
+        let right = Self::unqualified(right);
+        (matches!(left, Type::Void) && !matches!(right, Type::Void | Type::Function(_, _, _, _)))
+            || (matches!(right, Type::Void)
+                && !matches!(left, Type::Void | Type::Function(_, _, _, _)))
+    }
+
+    fn pointer_arithmetic_type(&self, ty: &Type) -> bool {
+        let element = match Self::unqualified(ty) {
+            Type::Pointer(element) | Type::Array(element, _, _) | Type::Vla(element, _) => element,
+            _ => return false,
+        };
+        self.valid_object_type(&element)
+    }
+
     fn finish_call(
         &mut self,
         label: &str,
@@ -1534,8 +1685,13 @@ impl Sema {
             ));
         }
         if has_prototype {
-            for (index, (expected, got)) in params.iter().zip(arg_types.iter()).enumerate() {
-                if !Self::compatible(expected, got) {
+            for (index, ((expected, got), arg)) in params
+                .iter()
+                .zip(arg_types.iter())
+                .zip(args.iter())
+                .enumerate()
+            {
+                if !self.assignment_compatible(expected, got, arg) {
                     self.errs.push(Diagnostic::error(
                         format!("argument {} to {} has incompatible type", index + 1, label),
                         Some(span),
@@ -1921,7 +2077,6 @@ impl Sema {
     }
 
     fn compatible(a: &Type, b: &Type) -> bool {
-        // BUG: stripping qualifiers here makes const/volatile pointers falsely compatible.
         let a = Self::unqualified(a);
         let b = Self::unqualified(b);
         match (&a, &b) {
@@ -1932,14 +2087,11 @@ impl Sema {
             (Type::Enum(a, _), Type::Enum(b, _)) => a == b,
             (x, y) if Self::integer(x) && Self::integer(y) => true,
             (x, y) if Self::arithmetic(x) && Self::arithmetic(y) => true,
-            (Type::Pointer(x), Type::Pointer(y)) => Self::compatible(x, y),
+            (Type::Pointer(x), Type::Pointer(y)) => Self::compatible_declaration(x, y),
             (Type::Pointer(x), Type::Array(y, _, _))
             | (Type::Array(y, _, _), Type::Pointer(x))
             | (Type::Pointer(x), Type::Vla(y, _))
-            | (Type::Vla(y, _), Type::Pointer(x)) => Self::compatible(x, y),
-            (Type::Pointer(x), Type::Void) | (Type::Void, Type::Pointer(x)) => {
-                matches!(Self::unqualified(x), Type::Void)
-            }
+            | (Type::Vla(y, _), Type::Pointer(x)) => Self::compatible_declaration(x, y),
             (Type::Function(ar, ap, av, aproto), Type::Function(br, bp, bv, bproto)) => {
                 Self::compatible(ar, br)
                     && if !aproto || !bproto {
@@ -2072,6 +2224,26 @@ impl Sema {
         )
     }
 
+    fn integer_type_at_rank(rank: u8, unsigned: bool) -> Type {
+        match (rank, unsigned) {
+            (4, true) => Type::UnsignedLong,
+            (4, false) => Type::Long,
+            (5, true) => Type::UnsignedLongLong,
+            (5, false) => Type::LongLong,
+            (_, true) => Type::UnsignedInt,
+            (_, false) => Type::Int,
+        }
+    }
+
+    fn integer_precision(rank: u8) -> u8 {
+        match rank {
+            0 | 1 => 8,
+            2 => 16,
+            4 | 5 => 64,
+            _ => 32,
+        }
+    }
+
     fn usual_arithmetic_type(a: &Type, b: &Type) -> Type {
         let complex = Self::complex(a) || Self::complex(b);
         let a = Self::real_type(&Self::unqualified(a));
@@ -2083,21 +2255,27 @@ impl Sema {
         } else if matches!(a, Type::Float) || matches!(b, Type::Float) {
             Type::Float
         } else {
-            let rank = Self::integer_rank(&a).max(Self::integer_rank(&b));
+            let a_rank = Self::integer_rank(&a);
+            let b_rank = Self::integer_rank(&b);
+            let rank = a_rank.max(b_rank);
+            let a_unsigned = Self::integer_unsigned(&a);
+            let b_unsigned = Self::integer_unsigned(&b);
+            let unsigned = if a_unsigned == b_unsigned {
+                a_unsigned
+            } else {
+                let (signed_rank, unsigned_rank) = if a_unsigned {
+                    (b_rank, a_rank)
+                } else {
+                    (a_rank, b_rank)
+                };
+                signed_rank <= unsigned_rank
+                    || Self::integer_precision(signed_rank)
+                        <= Self::integer_precision(unsigned_rank)
+            };
             if rank < 3 {
                 Type::Int
-            } else if Self::integer_unsigned(&a) || Self::integer_unsigned(&b) {
-                match rank {
-                    4 => Type::UnsignedLong,
-                    5 => Type::UnsignedLongLong,
-                    _ => Type::UnsignedInt,
-                }
             } else {
-                match rank {
-                    4 => Type::Long,
-                    5 => Type::LongLong,
-                    _ => Type::Int,
-                }
+                Self::integer_type_at_rank(rank, unsigned)
             }
         };
         if complex {

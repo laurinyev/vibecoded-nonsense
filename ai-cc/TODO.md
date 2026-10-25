@@ -1,6 +1,6 @@
 # Code Markings
 
-18 active markings.
+17 active markings.
 
 ## TODO
 
@@ -22,7 +22,6 @@
 - `src/sema.rs:570` — string literals have array type in C99, not char pointer.
 - `src/sema.rs:1075` — undesignated union initializer blindly selects field 0 and ignores extras.
 - `src/sema.rs:1400` — any address-of variable is treated as constant, including automatic objects.
-- `src/sema.rs:1864` — stripping qualifiers here makes const/volatile pointers falsely compatible.
 
 ## HACK
 
