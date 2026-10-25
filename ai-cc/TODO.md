@@ -1,6 +1,6 @@
 # Code Markings
 
-14 active markings.
+13 active markings.
 
 ## TODO
 
@@ -18,7 +18,6 @@
 - `src/pp.rs:868` — malformed replacement tokenization is silently discarded.
 - `src/sema.rs:576` — integer literal suffixes are ignored; only the value range selects int versus long.
 - `src/sema.rs:581` — string literals have array type in C99, not char pointer.
-- `src/sema.rs:1218` — undesignated union initializer blindly selects field 0 and ignores extras.
 
 ## HACK
 

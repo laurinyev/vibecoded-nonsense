@@ -1215,7 +1215,6 @@ impl Sema {
             }
             Type::Union(_, fields) => {
                 let Some(item) = cursor.next() else { return };
-                // BUG: undesignated union initializer blindly selects field 0 and ignores extras.
                 let index = match item.designators.first() {
                     Some(Designator::Member(name)) => fields
                         .iter()
@@ -1243,6 +1242,12 @@ impl Sema {
                         let mut value = item.value.clone();
                         self.check_initializer_from_value(&mut field.ty, &mut value, cursor, span);
                     }
+                }
+                if !cursor.is_empty() {
+                    self.errs.push(Diagnostic::error(
+                        "too many union initializers",
+                        Some(span),
+                    ));
                 }
             }
             _ => {
