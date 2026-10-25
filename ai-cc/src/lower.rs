@@ -496,7 +496,7 @@ impl Lowerer {
     }
 
     fn integer_promote(t: &Type) -> Type {
-        if Self::integer_rank(t) < 3 {
+        if matches!(Self::scalar(t), Type::Enum(_, _)) || Self::integer_rank(t) < 3 {
             Type::Int
         } else {
             Self::scalar(t)
@@ -1337,6 +1337,12 @@ impl Lowerer {
                     ));
                     value = promoted;
                     ty = Type::Double;
+                } else {
+                    let promoted_ty = Self::integer_promote(&ty);
+                    if promoted_ty != ty {
+                        value = self.convert_value(value, &ty, &promoted_ty, v);
+                        ty = promoted_ty;
+                    }
                 }
                 values.push((value, ty));
             }

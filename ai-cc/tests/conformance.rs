@@ -311,6 +311,11 @@ fn increment_decrement() {
 }
 
 #[test]
+fn default_argument_promotions() {
+    run_valid_fixture("default-argument-promotions.c");
+}
+
+#[test]
 fn string_arrays() {
     let path = root().join("tests/conformance/valid/string-array-initialization.c");
     let work = temp_dir("string-array-initialization");

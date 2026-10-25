@@ -2270,7 +2270,7 @@ impl Sema {
     }
 
     fn integer_promote(t: &Type) -> Type {
-        if Self::integer_rank(t) < 3 {
+        if matches!(Self::unqualified(t), Type::Enum(_, _)) || Self::integer_rank(t) < 3 {
             Type::Int
         } else {
             Self::unqualified(t)
