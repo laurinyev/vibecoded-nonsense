@@ -296,6 +296,11 @@ fn integer_constant_expressions() {
 }
 
 #[test]
+fn reversed_subscript() {
+    run_valid_fixture("reversed-subscript.c");
+}
+
+#[test]
 fn string_arrays() {
     let path = root().join("tests/conformance/valid/string-array-initialization.c");
     let work = temp_dir("string-array-initialization");

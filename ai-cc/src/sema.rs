@@ -927,20 +927,26 @@ impl Sema {
             Expr::Subscript(base, index) => {
                 let base_ty = self.expr(base, span);
                 let index_ty = self.expr(index, span);
-                self.require_integer(&index_ty, "subscript index", span);
-                match Self::unqualified(&base_ty) {
-                    Type::Pointer(inner) | Type::Array(inner, _, _) | Type::Vla(inner, _) => {
-                        if !self.valid_object_type(&inner) {
+                let element = if Self::pointer_like(&base_ty) && Self::integer(&index_ty) {
+                    Self::pointee_type(&base_ty)
+                } else if Self::integer(&base_ty) && Self::pointer_like(&index_ty) {
+                    Self::pointee_type(&index_ty)
+                } else {
+                    None
+                };
+                match element {
+                    Some(element) => {
+                        if !self.valid_object_type(&element) {
                             self.errs.push(Diagnostic::error(
                                 "subscript requires a pointer to a complete object type",
                                 Some(span),
                             ));
                         }
-                        *inner
+                        element
                     }
-                    _ => {
+                    None => {
                         self.errs.push(Diagnostic::error(
-                            "subscript operand must be a pointer or array",
+                            "subscript requires one pointer or array and one integer operand",
                             Some(span),
                         ));
                         Type::Int
@@ -1501,12 +1507,11 @@ impl Sema {
                     self.is_lvalue(base)
                 }
             }
-            Expr::Subscript(base, _) => {
-                let ty = self.expr_type(base);
-                matches!(
-                    Self::unqualified(&ty),
-                    Type::Pointer(_) | Type::Array(_, _, _) | Type::Vla(_, _)
-                )
+            Expr::Subscript(base, index) => {
+                let base_ty = self.expr_type(base);
+                let index_ty = self.expr_type(index);
+                (Self::pointer_like(&base_ty) && Self::integer(&index_ty))
+                    || (Self::integer(&base_ty) && Self::pointer_like(&index_ty))
             }
             Expr::Unary(UnOp::Deref, _) => true,
             Expr::CompoundLiteral(_, _) => true,
@@ -1650,6 +1655,13 @@ impl Sema {
             _ => return false,
         };
         self.valid_object_type(&element)
+    }
+
+    fn pointee_type(ty: &Type) -> Option<Type> {
+        match Self::unqualified(ty) {
+            Type::Pointer(inner) | Type::Array(inner, _, _) | Type::Vla(inner, _) => Some(*inner),
+            _ => None,
+        }
     }
 
     fn finish_call(
@@ -1797,10 +1809,16 @@ impl Sema {
                     _ => Type::Int,
                 }
             }
-            Expr::Subscript(base, _) => match Self::unqualified(&self.expr_type(base)) {
-                Type::Pointer(inner) | Type::Array(inner, _, _) | Type::Vla(inner, _) => *inner,
-                _ => Type::Int,
-            },
+            Expr::Subscript(base, index) => {
+                let base_ty = self.expr_type(base);
+                let index_ty = self.expr_type(index);
+                let pointer_ty = if Self::pointer_like(&base_ty) {
+                    &base_ty
+                } else {
+                    &index_ty
+                };
+                Self::pointee_type(pointer_ty).unwrap_or(Type::Int)
+            }
         }
     }
 

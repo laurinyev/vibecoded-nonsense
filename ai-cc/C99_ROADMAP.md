@@ -152,7 +152,7 @@ Assignments require modifiable lvalues; const-qualified objects, aggregates cont
 Remaining work:
 
 - Represent and validate increment/decrement without losing postfix value semantics.
-- Complete member and subscript constraints, including reversed `i[p]` operands.
+- Complete remaining member and subscript constraints.
 - Expand source-spanned constraint coverage for every lvalue context.
 
 ### 3.2 Implement C99 conversions — in progress

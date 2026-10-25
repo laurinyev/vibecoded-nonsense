@@ -405,7 +405,15 @@ impl Lowerer {
                 };
                 Self::field(&base, name).map(|x| x.ty).unwrap_or(Type::Int)
             }
-            Expr::Subscript(x, _) => Self::pointee(&self.type_of(x)).unwrap_or(Type::Int),
+            Expr::Subscript(left, right) => {
+                let left = self.type_of(left);
+                let right = self.type_of(right);
+                if Self::is_pointer(&left) {
+                    Self::pointee(&left).unwrap_or(Type::Int)
+                } else {
+                    Self::pointee(&right).unwrap_or(Type::Int)
+                }
+            }
         }
     }
 
@@ -609,18 +617,24 @@ impl Lowerer {
                 self.add_addr(base, offset, v)
             }
             Expr::Subscript(x, index) => {
-                let element = Self::pointee(&self.type_of(x)).unwrap_or(Type::Int);
-                let base = if Self::is_pointer(&self.type_of(x)) {
+                let (pointer, index) = if Self::is_pointer(&self.type_of(x)) {
+                    (x.as_ref(), index.as_ref())
+                } else {
+                    (index.as_ref(), x.as_ref())
+                };
+                let pointer_ty = self.type_of(pointer);
+                let element = Self::pointee(&pointer_ty).unwrap_or(Type::Int);
+                let base = if Self::is_pointer(&pointer_ty) {
                     if matches!(
-                        Self::scalar(&self.type_of(x)),
+                        Self::scalar(&pointer_ty),
                         Type::Array(_, _, _) | Type::Vla(_, _)
                     ) {
-                        self.lvalue_addr(x, v)
+                        self.lvalue_addr(pointer, v)
                     } else {
-                        self.expr(x, v)
+                        self.expr(pointer, v)
                     }
                 } else {
-                    self.lvalue_addr(x, v)
+                    self.lvalue_addr(pointer, v)
                 };
                 let i = self.expr(index, v);
                 let scale = self.tmp();
