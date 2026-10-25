@@ -660,6 +660,18 @@ impl Sema {
                         Self::integer_promote(&left)
                     }
                     BinOp::Add | BinOp::Sub => {
+                        if *op == BinOp::Sub
+                            && Self::pointer_like(&left)
+                            && Self::pointer_like(&right)
+                        {
+                            if !self.pointer_difference_compatible(&left, &right) {
+                                self.errs.push(Diagnostic::error(
+                                    "pointer subtraction requires pointers to compatible complete object types",
+                                    Some(span),
+                                ));
+                            }
+                            return Type::Long;
+                        }
                         let pointer_integer = (Self::pointer_like(&left) && Self::integer(&right))
                             || (*op == BinOp::Add
                                 && Self::integer(&left)
@@ -1655,6 +1667,16 @@ impl Sema {
             _ => return false,
         };
         self.valid_object_type(&element)
+    }
+
+    fn pointer_difference_compatible(&self, left: &Type, right: &Type) -> bool {
+        let (Some(left), Some(right)) = (Self::pointee_type(left), Self::pointee_type(right))
+        else {
+            return false;
+        };
+        self.valid_object_type(&left)
+            && self.valid_object_type(&right)
+            && Self::compatible_pointer_targets(&left, &right)
     }
 
     fn pointee_type(ty: &Type) -> Option<Type> {

@@ -1548,6 +1548,34 @@ impl Lowerer {
                     v.push(Instr::BinTyped(out.clone(), *op, x, y, compare_ty));
                     return out;
                 }
+                if *op == BinOp::Sub && Self::is_pointer(&left_ty) && Self::is_pointer(&right_ty) {
+                    let element = Self::pointee(&left_ty).unwrap_or(Type::Char);
+                    let left = self.expr_as(a, &Type::Long, v);
+                    let right = self.expr_as(b, &Type::Long, v);
+                    let bytes = self.tmp();
+                    v.push(Instr::BinTyped(
+                        bytes.clone(),
+                        BinOp::Sub,
+                        left,
+                        right,
+                        Type::Long,
+                    ));
+                    let stride = Self::size(&element).max(1);
+                    if stride == 1 {
+                        return bytes;
+                    }
+                    let divisor = self.tmp();
+                    v.push(Instr::ConstLong(divisor.clone(), stride as i64));
+                    let elements = self.tmp();
+                    v.push(Instr::BinTyped(
+                        elements.clone(),
+                        BinOp::Div,
+                        bytes,
+                        divisor,
+                        Type::Long,
+                    ));
+                    return elements;
+                }
                 if matches!(op, BinOp::Add | BinOp::Sub) {
                     if Self::is_pointer(&left_ty) && Self::is_integer(&right_ty) {
                         return self.pointer_offset(*op, a, b, &right_ty, v);

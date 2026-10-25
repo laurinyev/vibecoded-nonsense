@@ -157,12 +157,12 @@ Remaining work:
 
 ### 3.2 Implement C99 conversions — in progress
 
-Arithmetic assignment conversions, integer promotions, and usual arithmetic conversions are implemented for the target integer model. Assignments, initializers, arguments, and returns accept compatible arithmetic types, null pointer constants, and qualifier-preserving object-pointer/`void *` conversions. Equality and relational pointer constraints are checked, and pointer arithmetic requires a complete object pointee.
+Arithmetic assignment conversions, integer promotions, and usual arithmetic conversions are implemented for the target integer model. Assignments, initializers, arguments, and returns accept compatible arithmetic types, null pointer constants, and qualifier-preserving object-pointer/`void *` conversions. Equality and relational pointer constraints are checked; pointer arithmetic requires complete object pointees, and subtraction of compatible object pointers yields element distance.
 
 Remaining work:
 
 - Apply default argument promotions for unprototyped calls and variadic arguments.
-- Implement pointer subtraction and complete pointer arithmetic behavior.
+- Complete pointer arithmetic constraints and address scaling edge cases.
 - Validate and lower every conversion consistently, including unsigned and floating edge cases.
 - Add coverage for remaining integer promotions and usual arithmetic conversion rank/representability cases.
 
