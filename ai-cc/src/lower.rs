@@ -1097,7 +1097,7 @@ impl Lowerer {
             let chunk = (size - offset).min(8);
             let target = self.add_addr(addr.clone(), offset as i64, v);
             let zero = self.tmp();
-            if chunk == 8 {
+            if chunk > 4 {
                 v.push(Instr::ConstLong(zero.clone(), 0));
             } else {
                 v.push(Instr::Const(zero.clone(), 0));

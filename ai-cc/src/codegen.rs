@@ -214,14 +214,74 @@ impl QbeCodegen {
                         o += &format!("{} ={} {} {}\n", n, Self::ty(ty), op, addr);
                     }
                     Instr::LoadZero(n, addr, size) => {
-                        let op = match size {
-                            1 => "loadub",
-                            2 => "loaduh",
-                            4 => "loaduw",
-                            _ => "loadl",
-                        };
-                        let ty = if *size == 8 { "l" } else { "w" };
-                        o += &format!("{} ={} {} {}\n", n, ty, op, addr);
+                        if !matches!(size, 3 | 5 | 6 | 7) {
+                            let op = match size {
+                                1 => "loadub",
+                                2 => "loaduh",
+                                4 => "loaduw",
+                                _ => "loadl",
+                            };
+                            let ty = if *size == 8 { "l" } else { "w" };
+                            o += &format!("{} ={} {} {}\n", n, ty, op, addr);
+                            continue;
+                        }
+                        let value_ty = if *size > 4 { "l" } else { "w" };
+                        let base = n.trim_start_matches('%');
+                        let mut accumulator = format!("%{}_zero", base);
+                        o += &format!("{} ={} copy 0\n", accumulator, value_ty);
+                        let mut offset = 0usize;
+                        while offset < *size {
+                            let remaining = size - offset;
+                            let chunk = if remaining >= 4 {
+                                4
+                            } else if remaining >= 2 {
+                                2
+                            } else {
+                                1
+                            };
+                            let load = format!("%{}_load_{}", base, offset);
+                            let load_op = match chunk {
+                                1 => "loadub",
+                                2 => "loaduh",
+                                _ => "loadw",
+                            };
+                            let address = if offset == 0 {
+                                addr.clone()
+                            } else {
+                                let address = format!("%{}_addr_{}", base, offset);
+                                o += &format!("{} =l add {}, {}\n", address, addr, offset);
+                                address
+                            };
+                            o += &format!("{} =w {} {}\n", load, load_op, address);
+                            let part = if value_ty == "l" {
+                                let extended = format!("%{}_extend_{}", base, offset);
+                                o += &format!("{} =l extuw {}\n", extended, load);
+                                extended
+                            } else {
+                                load
+                            };
+                            let part = if offset == 0 {
+                                part
+                            } else {
+                                let shifted = format!("%{}_shift_{}", base, offset);
+                                o += &format!(
+                                    "{} ={} shl {}, {}\n",
+                                    shifted,
+                                    value_ty,
+                                    part,
+                                    offset * 8
+                                );
+                                shifted
+                            };
+                            let combined = format!("%{}_combine_{}", base, offset);
+                            o += &format!(
+                                "{} ={} or {}, {}\n",
+                                combined, value_ty, accumulator, part
+                            );
+                            accumulator = combined;
+                            offset += chunk;
+                        }
+                        o += &format!("{} ={} copy {}\n", n, value_ty, accumulator);
                     }
                     Instr::Store(value, addr, ty) => {
                         let op = match Self::ty(ty) {
@@ -240,14 +300,56 @@ impl QbeCodegen {
                         o += &format!("{} {}, {}\n", op, value, addr);
                     }
                     Instr::StoreSize(value, addr, size) => {
-                        // BUG: non-power-of-two sizes fall back to 8-byte stores; LoadZero has the same issue.
-                        let op = match size {
-                            1 => "storeb",
-                            2 => "storeh",
-                            4 => "storew",
-                            _ => "storel",
-                        };
-                        o += &format!("{} {}, {}\n", op, value, addr);
+                        if matches!(size, 1 | 2 | 4 | 8) {
+                            let op = match size {
+                                1 => "storeb",
+                                2 => "storeh",
+                                4 => "storew",
+                                _ => "storel",
+                            };
+                            o += &format!("{} {}, {}\n", op, value, addr);
+                            continue;
+                        }
+                        let value_ty = if *size > 4 { "l" } else { "w" };
+                        let base = value.trim_start_matches('%');
+                        let mut offset = 0usize;
+                        while offset < *size {
+                            let remaining = size - offset;
+                            let chunk = if remaining >= 4 {
+                                4
+                            } else if remaining >= 2 {
+                                2
+                            } else {
+                                1
+                            };
+                            let part = if offset == 0 {
+                                value.clone()
+                            } else {
+                                let shifted = format!("%{}_shift_{}", base, offset);
+                                o += &format!(
+                                    "{} ={} shr {}, {}\n",
+                                    shifted,
+                                    value_ty,
+                                    value,
+                                    offset * 8
+                                );
+                                shifted
+                            };
+                            let address = if offset == 0 {
+                                addr.clone()
+                            } else {
+                                let address = format!("%{}_addr_{}", base, offset);
+                                o += &format!("{} =l add {}, {}\n", address, addr, offset);
+                                address
+                            };
+                            let op = match chunk {
+                                1 => "storeb",
+                                2 => "storeh",
+                                _ => "storew",
+                            };
+                            o += &format!("{} {}, {}\n", op, part, address);
+                            offset += chunk;
+                        }
                     }
                     Instr::Addr(n, base, offset) => {
                         o += &format!("{} =l add {}, {}\n", n, base, offset);

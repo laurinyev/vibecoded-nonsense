@@ -326,6 +326,11 @@ fn string_literal_arrays() {
 }
 
 #[test]
+fn nonpower_of_two_storage_copy() {
+    run_valid_fixture("nonpower-of-two-storage-copy.c");
+}
+
+#[test]
 fn string_arrays() {
     let path = root().join("tests/conformance/valid/string-array-initialization.c");
     let work = temp_dir("string-array-initialization");

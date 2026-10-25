@@ -1,6 +1,6 @@
 # Code Markings
 
-12 active markings.
+11 active markings.
 
 ## TODO
 
@@ -10,7 +10,6 @@
 
 ## BUG
 
-- `src/codegen.rs:243` — non-power-of-two sizes fall back to 8-byte stores; LoadZero has the same issue.
 - `src/layout.rs:44` — 16-byte long double is lowered and accessed as 8-byte QBE d.
 - `src/lower.rs:1987` — undeclared callee is assumed int(...) instead of being diagnosed.
 - `src/lower.rs:2336` — initializer errors are ignored, leaving the static object silently zeroed.
