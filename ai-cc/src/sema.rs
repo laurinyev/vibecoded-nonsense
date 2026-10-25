@@ -420,9 +420,11 @@ impl Sema {
 
     fn expr(&mut self, e: &mut Expr, span: crate::diag::Span) -> Type {
         match e {
+            // BUG: all integer literals are typed as int; value and suffix are ignored.
             Expr::Int(_) | Expr::Char(_) => Type::Int,
             Expr::Float(_, ty) => ty.clone(),
             Expr::Complex(_, _, ty) => Type::Complex(Box::new(ty.clone())),
+            // BUG: string literals have array type in C99, not char pointer.
             Expr::String(_) => Type::Pointer(Box::new(Type::Char)),
             Expr::Var(n) => self
                 .syms
@@ -683,6 +685,7 @@ impl Sema {
                     for arg in args.iter_mut() {
                         self.expr(arg, span);
                     }
+                    // HACK HACK: undeclared callees are silently accepted as an implicit-int extension.
                     // Keep the existing external-call extension for hosted libc symbols.
                     Type::Int
                 }
@@ -929,6 +932,7 @@ impl Sema {
             }
             Type::Union(_, fields) => {
                 let Some(item) = cursor.next() else { return };
+                // BUG: undesignated union initializer blindly selects field 0 and ignores extras.
                 let index = match item.designators.first() {
                     Some(Designator::Member(name)) => fields
                         .iter()
@@ -1119,6 +1123,7 @@ impl Sema {
     ) -> usize {
         let mut expr = expr.clone();
         let got = self.expr(&mut expr, span);
+        // BUG: a negative index is reported as non-constant and silently advances.
         let index = Self::integer_constant(&expr).and_then(|x| usize::try_from(x).ok());
         if !Self::integer(&got) || index.is_none() {
             self.errs.push(Diagnostic::error(
@@ -1211,6 +1216,7 @@ impl Sema {
                     BinOp::Mul => a.checked_mul(b),
                     BinOp::Div => a.checked_div(b),
                     BinOp::Rem => a.checked_rem(b),
+                    // BUG: shift counts are unchecked and can panic or wrap.
                     BinOp::Shl => Some(a << b),
                     BinOp::Shr => Some(a >> b),
                     BinOp::BitAnd => Some(a & b),
@@ -1247,6 +1253,7 @@ impl Sema {
                     && self.is_constant_initializer(no)
             }
             Expr::Unary(UnOp::Address, value) => {
+                // BUG: any address-of variable is treated as constant, including automatic objects.
                 matches!(&**value, Expr::Var(_))
                     || matches!(&**value, Expr::CompoundLiteral(_, initializer) if self.constant_initializer_list(initializer))
             }
@@ -1298,6 +1305,7 @@ impl Sema {
                 .lookup(n)
                 .map(|x| !matches!(Self::unqualified(&x.ty), Type::Function(_, _, _, _)))
                 .unwrap_or(false),
+            // BUG: arrow member lvalue-ness incorrectly follows the base expression.
             Expr::Member(base, _, _) => self.is_lvalue(base),
             Expr::Subscript(base, _) => {
                 let ty = self.expr_type(base);
@@ -1682,6 +1690,7 @@ impl Sema {
     }
 
     fn compatible(a: &Type, b: &Type) -> bool {
+        // BUG: stripping qualifiers here makes const/volatile pointers falsely compatible.
         let a = Self::unqualified(a);
         let b = Self::unqualified(b);
         match (&a, &b) {
@@ -1725,6 +1734,7 @@ impl Sema {
         } else if matches!(a, Type::Float) || matches!(b, Type::Float) {
             Type::Float
         } else {
+            // BUG: integer usual arithmetic conversions ignore rank, signedness, and promotions.
             Type::Int
         };
         if complex {

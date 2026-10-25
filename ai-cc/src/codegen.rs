@@ -20,6 +20,7 @@ impl QbeCodegen {
             Type::Double | Type::LongDouble => "d",
             Type::Complex(_) => "l",
             Type::Qualified(x, _) => Self::ty(x),
+            // BUG: Long/LongLong fall through to w and are truncated to 32 bits.
             _ => "w",
         }
     }
@@ -192,6 +193,7 @@ impl QbeCodegen {
                                 Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool
                             ) =>
                             {
+                                // BUG: signed char uses loadub; unsigned short falls through to signed loadw.
                                 "loadub"
                             }
                             _ => "loadw",
@@ -225,6 +227,7 @@ impl QbeCodegen {
                         o += &format!("{} {}, {}\n", op, value, addr);
                     }
                     Instr::StoreSize(value, addr, size) => {
+                        // BUG: non-power-of-two sizes fall back to 8-byte stores; LoadZero has the same issue.
                         let op = match size {
                             1 => "storeb",
                             2 => "storeh",
@@ -244,6 +247,7 @@ impl QbeCodegen {
                         );
                     }
                     Instr::Bin(n, op, a, b) => {
+                        // BUG: integer binary ops are hardcoded to w/signed; long, pointer, and unsigned math break.
                         o += &format!(
                             "{} =w {} {}, {}\n",
                             n,
@@ -442,6 +446,7 @@ impl QbeCodegen {
 
     fn data_value(value: &DataValue, directive: &str) -> String {
         match value {
+            // BUG: string symbols already include '$', so this emits "$$strN".
             DataValue::Address(name) => format!("${name}"),
             DataValue::Integer(value) => match directive {
                 "b" => (*value as u8 as i64).to_string(),

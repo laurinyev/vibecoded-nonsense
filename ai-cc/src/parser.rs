@@ -163,6 +163,7 @@ impl Parser {
         }
         if self.take(&TokenKind::Struct) || self.take(&TokenKind::Union) {
             let union = self.t[self.p - 1].kind == TokenKind::Union;
+            // BUG: a missing struct/union tag silently becomes an empty tag.
             let tag = self.ident().unwrap_or_default();
             let mut fields: Vec<Field> = Vec::new();
             if self.take(&TokenKind::LBrace) {
@@ -254,6 +255,7 @@ impl Parser {
                 while *self.cur() != TokenKind::RBrace && *self.cur() != TokenKind::End {
                     let n = self.ident()?;
                     if self.take(&TokenKind::Assign) {
+                        // TODO: enumerator values only accept a literal, not an integer constant expression.
                         if let TokenKind::Number(v) = self.cur().clone() {
                             next = v;
                             self.p += 1;
@@ -264,6 +266,7 @@ impl Parser {
                             ));
                         }
                     }
+                    // BUG: enumerator names are not bound in ordinary identifier scope.
                     values.push((n, next));
                     next += 1;
                     if !self.take(&TokenKind::Comma) {
@@ -1102,6 +1105,7 @@ impl Parser {
                 } else {
                     None
                 };
+                // BUG: this drops extern for comma-list objects; tentative_definition cannot see Extern.
                 let storage = is_static.then_some(StorageClass::Static);
                 self.aliases[0].insert(name.clone(), None);
                 self.pending_declarations.push(GlobalDecl {
@@ -1198,6 +1202,7 @@ impl Parser {
                 }
             }
         }
+        // BUG: scope is popped only after expect succeeds; a parse error leaks aliases.
         self.expect(&TokenKind::RBrace)?;
         self.aliases.pop();
         Ok(Block { stmts: v })
@@ -1264,6 +1269,7 @@ impl Parser {
                 None
             } else {
                 let s = if self.is_type() {
+                    // BUG: for-init declarations use the enclosing scope and remain visible after the loop.
                     self.declaration()?
                 } else {
                     let expr_start = self.cur_span().start;
@@ -1306,6 +1312,7 @@ impl Parser {
         if self.is_type() {
             return self.declaration();
         }
+        // BUG: a bare ';' is not accepted as an empty statement and reaches expr().
         let x = self.expr()?;
         self.expect(&TokenKind::Semicolon)?;
         Ok(Stmt::Expr(x, self.span_from(start)))
@@ -1657,6 +1664,7 @@ impl Parser {
                 let bound = if matches!(self.cur(), TokenKind::Number(_)) {
                     if let TokenKind::Number(n) = self.cur().clone() {
                         self.p += 1;
+                        // BUG: negative or overflowing bounds silently become unspecified arrays.
                         usize::try_from(n)
                             .map(ArrayBound::Fixed)
                             .unwrap_or(ArrayBound::Unspecified)
@@ -1769,6 +1777,7 @@ impl Parser {
                 Ok(Expr::Assign(
                     Box::new(x.clone()),
                     if let Some(op) = op {
+                        // BUG: cloning the LHS duplicates side effects in compound assignments.
                         Box::new(Expr::Binary(op, Box::new(x), Box::new(rhs)))
                     } else {
                         Box::new(rhs)
@@ -1914,6 +1923,7 @@ impl Parser {
         match expr {
             Expr::Int(n) => Some(*n),
             Expr::Char(c) => Some(*c as i64),
+            // BUG: cast type is ignored during integer constant evaluation.
             Expr::Cast(_, x) | Expr::Unary(UnOp::Pos, x) => Self::integer_constant(x),
             Expr::Unary(UnOp::Neg, x) => Self::integer_constant(x)?.checked_neg(),
             Expr::Unary(UnOp::Not, x) => Some((Self::integer_constant(x)? == 0) as i64),
@@ -2111,6 +2121,7 @@ impl Parser {
                         Expr::VaArg(Box::new(ap), ty)
                     } else if matches!(n.as_str(), "va_start" | "__builtin_va_start") {
                         let ap = self.assign()?;
+                        // HACK HACK: the required last-named-parameter argument is optional and discarded.
                         if self.take(&TokenKind::Comma) {
                             let _last = self.assign()?;
                         }
@@ -2141,6 +2152,7 @@ impl Parser {
                     }
                 } else {
                     let x = Expr::Var(n.clone());
+                    // BUG: postfix increment is lowered as prefix and only works on bare identifiers.
                     if self.take(&TokenKind::PlusPlus) {
                         Expr::Assign(
                             Box::new(x.clone()),

@@ -16,6 +16,7 @@ pub trait SymbolTable {
 }
 #[derive(Default)]
 pub struct Scopes {
+    // BUG: Default leaves the stack empty; insert/lookup_current_scope then panic.
     pub scopes: Vec<std::collections::HashMap<String, Symbol>>,
 }
 impl Scopes {

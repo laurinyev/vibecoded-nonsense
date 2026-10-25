@@ -43,6 +43,7 @@ impl FileResolver for FsResolver {
                     && dir
                         .file_name()
                         .and_then(|x| x.to_str())
+                        // HACK HACK: hyphen heuristic for multiarch includes can select the wrong architecture.
                         .is_some_and(|x| x.contains('-'))
                 {
                     includes.push(dir.join(path));

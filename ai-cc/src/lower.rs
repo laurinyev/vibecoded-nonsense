@@ -458,6 +458,7 @@ impl Lowerer {
         } else if matches!(a, Type::Float) || matches!(b, Type::Float) {
             Type::Float
         } else {
+            // BUG: integer usual arithmetic conversions ignore rank, signedness, and promotions.
             Type::Int
         };
         if complex {
@@ -1309,6 +1310,7 @@ impl Lowerer {
             }
             Expr::Unary(UnOp::Address, e) => self.lvalue_addr(e, v),
             Expr::Unary(UnOp::Deref, e) => {
+                // BUG: loads the pointer type instead of the pointee type.
                 let ty = self.type_of(e);
                 let addr = self.expr(e, v);
                 if matches!(Self::pointee(&ty), Some(Type::Function(_, _, _, _))) {
@@ -1433,6 +1435,7 @@ impl Lowerer {
                     }
                     v.push(Instr::Label(rhs));
                     let y = self.condition(b, v);
+                    // BUG: logical RHS result is copied raw instead of normalized to 0/1.
                     v.push(Instr::Move(z.clone(), y, Type::Int));
                     v.push(Instr::Jump(end.clone()));
                     v.push(Instr::Label(end));
@@ -1544,6 +1547,7 @@ impl Lowerer {
                     return dst.unwrap_or_else(|| "0".into());
                 }
                 let ret = Type::Int;
+                // BUG: undeclared callee is assumed int(...) instead of being diagnosed.
                 let values = self.call_arguments(args, &[], v);
                 let dst = self.tmp();
                 v.push(Instr::Call(Some(dst.clone()), n.clone(), values, None, ret));
@@ -1845,6 +1849,7 @@ impl Lowerer {
                                 let data_name = format!("static_{}", symbol);
                                 let mut data = Self::new_data_object(data_name.clone(), &ty, true);
                                 if let Some(initializer) = init {
+                                    // BUG: initializer errors are ignored, leaving the static object silently zeroed.
                                     let _ = self.data_initialize(&mut data, 0, &ty, initializer);
                                 }
                                 self.aggregate_data.push(data);
@@ -1902,6 +1907,7 @@ impl Lowerer {
                 v.push(Instr::Ret(value));
             }
             Stmt::Block(b, _) => {
+                // BUG: block scopes do not save/restore vars and slots; shadowed locals alias.
                 for x in &b.stmts {
                     self.stmt(x, v)
                 }

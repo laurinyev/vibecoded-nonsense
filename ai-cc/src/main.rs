@@ -222,6 +222,7 @@ fn dynamic_linker(verbose: bool) -> Result<PathBuf, String> {
     }
     for dir in ["/lib64", "/lib", "/usr/lib64", "/usr/lib"] {
         if let Ok(entries) = fs::read_dir(dir) {
+            // BUG: first ld-linux match is accepted without checking ELF class or architecture.
             if let Some(path) = entries.flatten().map(|x| x.path()).find(|x| {
                 x.file_name()
                     .and_then(|x| x.to_str())

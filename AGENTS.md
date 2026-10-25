@@ -2,7 +2,7 @@
 ## Token Use
 <token_optimization>
   <syntax>Telegraphic style, heavy abbreviations, short clauses Omit articles and filler words In thinking act like english has zero copula No full stops</syntax>
-  <prohibited>Phatic speech, greetings, conversational transitions, and repeat reasoning</prohibited>
+  <prohibited>Phatic speech, greetings, full prompt qoutes in reasoning, conversational transitions, and repeat reasoning</prohibited>
   <execution>Direct output only Zero explanations or background unless explicitly requested Treat effort setting as max, not min Ignore if unprovided</execution>
   <exceptions>ASCII art, but not text on it</exceptions>
 </token_optimization>
@@ -26,6 +26,11 @@
 * Pure functions preferred. Limit side effects
 * No silent fallback on errors. Fail explicitly
 * Keep edits targeted. No refactoring out-of-scope files
+
+### Commits
+* Commit after each major turn unless the developer says otherwise
+* Stage only intended files. Leave unrelated changes uncommitted
+* Use small, atomic commits with concise repo-style messages
 
 ### Verification
 * Execute test suite post-edit: unit -> integration

@@ -381,6 +381,7 @@ impl Preprocessor {
         preprocessor.add_builtin("__STDC__", "1");
         preprocessor.add_builtin("__STDC_VERSION__", "199901L");
         preprocessor.add_builtin("__STDC_HOSTED__", if hosted { "1" } else { "0" });
+        // BUG: __FILE__/__LINE__ expand specially but are absent here, so defined(__FILE__) is false.
         preprocessor.add_builtin("__DATE__", &preprocessor.date.clone());
         preprocessor.add_builtin("__TIME__", &preprocessor.time.clone());
         preprocessor
@@ -521,6 +522,7 @@ impl Preprocessor {
                         errors.push(Diagnostic::error("#undef requires an identifier", span));
                     }
                 }
+                // HACK HACK: includes recurse without depth/cycle tracking; self-include can overflow the stack.
                 Some("include") => match self.include_path(rest, &logical_file, logical_line) {
                     Ok(path) => match self.resolver.resolve(&path, file_name) {
                         Ok(included) => match self.run(&path, &included) {
@@ -774,6 +776,7 @@ impl Preprocessor {
                     i += 1;
                     continue;
                 };
+                // BUG: whitespace before '(' blocks invocation; C99 requires adjacency only in definitions.
                 if token_spelling(open) != "(" || open.leading_space {
                     output.push(tokens[i].clone());
                     i += 1;
@@ -784,6 +787,7 @@ impl Preprocessor {
                     i += 1;
                     continue;
                 };
+                // BUG: wrong macro argument count silently leaves the invocation unexpanded.
                 if (!definition.variadic && args.len() != params.len())
                     || (definition.variadic && args.len() < params.len())
                 {
@@ -841,6 +845,7 @@ fn current_date_time() -> (String, String) {
 }
 
 fn literal_tokens(text: &str) -> Vec<PreprocessingToken> {
+    // BUG: malformed replacement tokenization is silently discarded.
     preprocessing_tokenize_normalized(&format!("{}\n", text))
         .unwrap_or_default()
         .into_iter()
@@ -1029,6 +1034,7 @@ fn substitute_macro(
     let params = definition.params.as_deref().unwrap_or(&[]);
     let expanded: Vec<_> = args
         .iter()
+        // HACK HACK: the current macro is already disabled during argument prescan, breaking f(f(2)).
         .map(|arg| preprocessor.expand_tokens(arg, disabled, file, line))
         .collect();
     let mut output = Vec::new();
@@ -1059,6 +1065,7 @@ fn substitute_macro(
                     vec![next.clone()]
                 };
                 if let Some(lhs) = output.pop() {
+                    // BUG: rhs[0] panics when the right operand of ## is an empty argument.
                     let pasted = format!("{}{}", token_spelling(&lhs), token_spelling(&rhs[0]));
                     if let Some(token) = literal_tokens(&pasted).into_iter().next() {
                         output.push(token);
@@ -1127,6 +1134,7 @@ fn emit_tokens(output: &mut String, tokens: &[PreprocessingToken]) {
     let mut previous = None;
     for token in tokens {
         let spelling = token_spelling(token);
+        // HACK HACK: spacing only separates identifier-like tokens; punctuators can fuse into comments/operators.
         if token.leading_space
             || previous.is_some_and(|previous: &PreprocessingToken| {
                 let previous = token_spelling(previous);
@@ -1181,6 +1189,7 @@ impl IfExpr {
                 break;
             }
             self.position += 1;
+            // BUG: &&/|| do not short-circuit; an unevaluated RHS can raise division-by-zero.
             let right = self.expression(precedence + 1)?;
             left = apply_if_operator(&operator, left, right)?;
         }

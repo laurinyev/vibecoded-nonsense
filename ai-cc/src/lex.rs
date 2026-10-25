@@ -321,6 +321,7 @@ impl Lexer {
                 spelling.as_str()
             };
             let is_hex = numeric.starts_with("0x") || numeric.starts_with("0X");
+            // BUG: hex integers ending in f/F (e.g. 0xFF) are misclassified as floats.
             let is_float = imaginary
                 || numeric.contains('.')
                 || if is_hex {
@@ -399,6 +400,7 @@ impl Lexer {
                     Some(self.t(TokenKind::End, s).span),
                 ));
             }
+            // TODO: Number stores i64 only; unsigned constants above i64::MAX are rejected.
             let value = i64::from_str_radix(&digits, base).ok();
             let Some(n) = value else {
                 return Err(Diagnostic::error(
@@ -408,6 +410,7 @@ impl Lexer {
             };
             return Ok(self.t(TokenKind::Number(n), s));
         }
+        // TODO: wide and UTF-8 literal prefixes (L, u, U, u8) are lexed as identifiers.
         if c.is_ascii_alphabetic()
             || c == '_'
             || (c == '\\' && self.src.get(s + 1).is_some_and(|x| *x == 'u' || *x == 'U'))
@@ -503,6 +506,8 @@ impl Lexer {
                     let Some(e) = self.src.get(self.pos).copied() else {
                         break;
                     };
+                    // BUG: \x, multi-digit octal, and \a/\b/\f/\v are missing;
+                    // unknown escapes silently drop the backslash.
                     x.push(match e {
                         'n' => '\n',
                         't' => '\t',
@@ -533,6 +538,7 @@ impl Lexer {
             } else if x.chars().count() == 1 {
                 Ok(self.t(TokenKind::Char(x.chars().next().unwrap()), s))
             } else {
+                // TODO: C99 permits implementation-defined multi-character constants.
                 Err(Diagnostic::error(
                     "character constant must contain one character",
                     Some(self.t(TokenKind::End, s).span),

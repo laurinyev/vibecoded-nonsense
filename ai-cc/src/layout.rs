@@ -41,6 +41,7 @@ pub fn size(ty: &Type) -> usize {
         | Type::UnsignedLongLong
         | Type::Double
         | Type::Pointer(_) => 8,
+        // BUG: 16-byte long double is lowered and accessed as 8-byte QBE d.
         Type::LongDouble => 16,
         Type::Complex(inner) => size(inner) * 2,
         Type::Array(element, Some(count), _) => size(element) * count,

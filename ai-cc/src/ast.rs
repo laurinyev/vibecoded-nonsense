@@ -96,6 +96,7 @@ pub struct Block {
 }
 #[derive(Clone, Debug)]
 pub enum Stmt {
+    // TODO: switch/case/default, labels, and goto are lexed but cannot be represented.
     StorageDecl(StorageClass, Vec<(String, Type, Option<Initializer>)>, Span),
     Typedef(String, Type, Span),
     Typedefs(Vec<(String, Type)>, Span),
