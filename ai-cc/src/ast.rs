@@ -156,6 +156,7 @@ pub enum Expr {
     String(String),
     Var(String),
     Assign(Box<Expr>, Box<Expr>),
+    CompoundAssign(Box<Expr>, BinOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     Call(String, Vec<Expr>),

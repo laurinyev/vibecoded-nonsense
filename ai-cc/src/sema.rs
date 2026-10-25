@@ -612,6 +612,47 @@ impl Sema {
                 }
                 target_ty
             }
+            Expr::CompoundAssign(target, op, value) => {
+                let target_ty = self.expr(target, span);
+                let value_ty = Self::decay(&self.expr(value, span));
+                if !self.is_modifiable_lvalue(target) {
+                    self.errs.push(Diagnostic::error(
+                        "assignment requires a modifiable lvalue",
+                        Some(span),
+                    ));
+                }
+                let valid = match op {
+                    BinOp::Add | BinOp::Sub => {
+                        (Self::pointer_like(&target_ty)
+                            && Self::integer(&value_ty)
+                            && self.pointer_arithmetic_type(&target_ty))
+                            || (Self::arithmetic(&target_ty)
+                                && Self::arithmetic(&value_ty)
+                                && !Self::complex(&target_ty)
+                                && !Self::complex(&value_ty))
+                    }
+                    BinOp::Mul | BinOp::Div => {
+                        Self::arithmetic(&target_ty)
+                            && Self::arithmetic(&value_ty)
+                            && !Self::complex(&target_ty)
+                            && !Self::complex(&value_ty)
+                    }
+                    BinOp::Rem | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                        Self::integer(&target_ty) && Self::integer(&value_ty)
+                    }
+                    BinOp::Shl | BinOp::Shr => {
+                        Self::integer(&target_ty) && Self::integer(&value_ty)
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    self.errs.push(Diagnostic::error(
+                        "compound assignment has invalid operand types",
+                        Some(span),
+                    ));
+                }
+                target_ty
+            }
             Expr::Binary(op, a, b) => {
                 let left = Self::decay(&self.expr(a, span));
                 let right = Self::decay(&self.expr(b, span));
@@ -1791,6 +1832,7 @@ impl Sema {
                 .map(|x| x.ty.clone())
                 .unwrap_or(Type::Int),
             Expr::Assign(x, _) => self.expr_type(x),
+            Expr::CompoundAssign(x, _, _) => self.expr_type(x),
             Expr::Binary(op, a, b) => match op {
                 BinOp::Comma => self.expr_type(b),
                 BinOp::Add | BinOp::Sub => {

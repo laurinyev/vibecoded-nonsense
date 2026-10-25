@@ -345,6 +345,7 @@ impl Lowerer {
                 }
             }
             Expr::Assign(x, _) => self.type_of(x),
+            Expr::CompoundAssign(x, _, _) => self.type_of(x),
             Expr::Unary(UnOp::Address, x) => Type::Pointer(Box::new(self.type_of(x))),
             Expr::Unary(UnOp::Deref, x) => Self::pointee(&self.type_of(x)).unwrap_or(Type::Int),
             Expr::Unary(UnOp::Not | UnOp::BitNot, _) => Type::Int,
@@ -1434,6 +1435,96 @@ impl Lowerer {
         }
     }
 
+    fn compound_assign(
+        &mut self,
+        target: &Expr,
+        op: BinOp,
+        value: &Expr,
+        v: &mut Vec<Instr>,
+    ) -> String {
+        let target_ty = self.type_of(target);
+        let scalar_ty = Self::scalar(&target_ty);
+        let value_ty = self.type_of(value);
+        let addr = self.lvalue_addr(target, v);
+        let bitfield = self
+            .member_layout(target)
+            .filter(|layout| layout.width.is_some_and(|width| width > 0));
+        let old = if let Some(layout) = &bitfield {
+            self.load_bitfield_at(layout, addr.clone(), v)
+        } else {
+            let old = self.tmp();
+            v.push(Instr::Load(old.clone(), addr.clone(), target_ty.clone()));
+            old
+        };
+        let result = if Self::is_pointer(&target_ty) {
+            let element = Self::pointee(&target_ty).unwrap_or(Type::Char);
+            let offset = self.expr_as(value, &Type::Long, v);
+            let stride = Self::size(&element).max(1);
+            let offset = if stride == 1 {
+                offset
+            } else {
+                let scale = self.tmp();
+                v.push(Instr::ConstLong(scale.clone(), stride as i64));
+                let scaled = self.tmp();
+                v.push(Instr::BinTyped(
+                    scaled.clone(),
+                    BinOp::Mul,
+                    offset,
+                    scale,
+                    Type::Long,
+                ));
+                scaled
+            };
+            let old = self.convert_value(old, &target_ty, &Type::Long, v);
+            let result = self.tmp();
+            v.push(Instr::BinTyped(result.clone(), op, old, offset, Type::Long));
+            result
+        } else {
+            let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+            let common = if shift {
+                Self::integer_promote(&target_ty)
+            } else {
+                Self::usual_arithmetic_type(&target_ty, &value_ty)
+            };
+            let old = self.convert_value(old, &target_ty, &common, v);
+            let value_target = if shift {
+                Self::integer_promote(&value_ty)
+            } else {
+                common.clone()
+            };
+            let right = self.expr_as(value, &value_target, v);
+            let result = self.tmp();
+            if Self::is_float(&common) {
+                v.push(Instr::FloatBin(
+                    result.clone(),
+                    op,
+                    old,
+                    right,
+                    common.clone(),
+                ));
+            } else {
+                v.push(Instr::BinTyped(
+                    result.clone(),
+                    op,
+                    old,
+                    right,
+                    common.clone(),
+                ));
+            }
+            self.convert_value(result, &common, &target_ty, v)
+        };
+        self.store_increment_value(&target_ty, &addr, &bitfield, result.clone(), v);
+        if let Some(layout) = &bitfield {
+            self.load_bitfield_at(layout, addr, v)
+        } else if Self::is_integer(&scalar_ty) && Self::size(&scalar_ty) < 4 {
+            let converted = self.tmp();
+            v.push(Instr::Load(converted.clone(), addr, target_ty));
+            converted
+        } else {
+            result
+        }
+    }
+
     fn store_increment_value(
         &mut self,
         ty: &Type,
@@ -1479,6 +1570,7 @@ impl Lowerer {
                 self.make_complex(base, real, imaginary, v)
             }
             Expr::Cast(target, value) => self.expr_as(value, target, v),
+            Expr::CompoundAssign(target, op, value) => self.compound_assign(target, *op, value, v),
             Expr::IncDec(target, increment, prefix) => {
                 self.increment_decrement(target, *increment, *prefix, v)
             }

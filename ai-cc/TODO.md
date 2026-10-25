@@ -1,6 +1,6 @@
 # Code Markings
 
-15 active markings.
+14 active markings.
 
 ## TODO
 
@@ -12,14 +12,13 @@
 
 - `src/codegen.rs:243` — non-power-of-two sizes fall back to 8-byte stores; LoadZero has the same issue.
 - `src/layout.rs:44` — 16-byte long double is lowered and accessed as 8-byte QBE d.
-- `src/lower.rs:1857` — undeclared callee is assumed int(...) instead of being diagnosed.
-- `src/lower.rs:2206` — initializer errors are ignored, leaving the static object silently zeroed.
-- `src/parser.rs:2086` — cloning the LHS duplicates side effects in compound assignments.
+- `src/lower.rs:1963` — undeclared callee is assumed int(...) instead of being diagnosed.
+- `src/lower.rs:2312` — initializer errors are ignored, leaving the static object silently zeroed.
 - `src/pp.rs:811` — wrong macro argument count silently leaves the invocation unexpanded.
 - `src/pp.rs:868` — malformed replacement tokenization is silently discarded.
 - `src/sema.rs:576` — integer literal suffixes are ignored; only the value range selects int versus long.
 - `src/sema.rs:581` — string literals have array type in C99, not char pointer.
-- `src/sema.rs:1177` — undesignated union initializer blindly selects field 0 and ignores extras.
+- `src/sema.rs:1218` — undesignated union initializer blindly selects field 0 and ignores extras.
 
 ## HACK
 
@@ -28,7 +27,7 @@ None.
 ## HACK HACK
 
 - `src/lib.rs:47` — hyphen heuristic for multiarch includes can select the wrong architecture.
-- `src/sema.rs:874` — undeclared callees are silently accepted as an implicit-int extension.
+- `src/sema.rs:915` — undeclared callees are silently accepted as an implicit-int extension.
 
 ## HACK HACK HACK
 

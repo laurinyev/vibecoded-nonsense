@@ -316,6 +316,11 @@ fn default_argument_promotions() {
 }
 
 #[test]
+fn compound_assignment() {
+    run_valid_fixture("compound-assignment.c");
+}
+
+#[test]
 fn string_arrays() {
     let path = root().join("tests/conformance/valid/string-array-initialization.c");
     let work = temp_dir("string-array-initialization");

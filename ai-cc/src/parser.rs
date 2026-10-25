@@ -2080,15 +2080,10 @@ impl Parser {
             self.p += 1;
             if Self::is_lvalue(&x) {
                 let rhs = self.assign()?;
-                Ok(Expr::Assign(
-                    Box::new(x.clone()),
-                    if let Some(op) = op {
-                        // BUG: cloning the LHS duplicates side effects in compound assignments.
-                        Box::new(Expr::Binary(op, Box::new(x), Box::new(rhs)))
-                    } else {
-                        Box::new(rhs)
-                    },
-                ))
+                Ok(match op {
+                    Some(op) => Expr::CompoundAssign(Box::new(x), op, Box::new(rhs)),
+                    None => Expr::Assign(Box::new(x), Box::new(rhs)),
+                })
             } else {
                 Err(Diagnostic::error(
                     "assignment target required",
