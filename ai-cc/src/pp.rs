@@ -1,6 +1,9 @@
 use crate::diag::{Diagnostic, Span};
-use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 /// Apply translation phases 1–3 that are independent of macro expansion.
 ///
@@ -361,6 +364,7 @@ pub struct Preprocessor {
     macros: HashMap<String, MacroDef>,
     once: HashSet<String>,
     include_stack: Vec<String>,
+    expansion_errors: RefCell<Vec<Diagnostic>>,
     date: String,
     time: String,
 }
@@ -377,6 +381,7 @@ impl Preprocessor {
             macros: HashMap::new(),
             once: HashSet::new(),
             include_stack: Vec::new(),
+            expansion_errors: RefCell::new(Vec::new()),
             date,
             time,
         };
@@ -601,6 +606,7 @@ impl Preprocessor {
                 }),
             ));
         }
+        errors.extend(self.expansion_errors.borrow_mut().drain(..));
         if errors.is_empty() {
             Ok(out)
         } else {
@@ -803,15 +809,21 @@ impl Preprocessor {
                     i += 1;
                     continue;
                 }
-                let Some((args, end)) = parse_macro_arguments(tokens, i + 1) else {
+                let Some((mut args, end)) = parse_macro_arguments(tokens, i + 1) else {
                     output.push(tokens[i].clone());
                     i += 1;
                     continue;
                 };
-                // BUG: wrong macro argument count silently leaves the invocation unexpanded.
+                if args.is_empty() && !params.is_empty() {
+                    args.push(Vec::new());
+                }
                 if (!definition.variadic && args.len() != params.len())
                     || (definition.variadic && args.len() < params.len())
                 {
+                    self.expansion_errors.borrow_mut().push(Diagnostic::error(
+                        "macro invocation has incorrect number of arguments",
+                        Some(tokens[i].span),
+                    ));
                     output.push(tokens[i].clone());
                     i += 1;
                     continue;

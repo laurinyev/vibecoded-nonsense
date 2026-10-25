@@ -1,6 +1,6 @@
 # Code Markings
 
-11 active markings.
+10 active markings.
 
 ## TODO
 
@@ -13,8 +13,7 @@
 - `src/layout.rs:44` — 16-byte long double is lowered and accessed as 8-byte QBE d.
 - `src/lower.rs:1987` — undeclared callee is assumed int(...) instead of being diagnosed.
 - `src/lower.rs:2336` — initializer errors are ignored, leaving the static object silently zeroed.
-- `src/pp.rs:811` — wrong macro argument count silently leaves the invocation unexpanded.
-- `src/pp.rs:868` — malformed replacement tokenization is silently discarded.
+- `src/pp.rs:880` — malformed replacement tokenization is silently discarded.
 - `src/sema.rs:576` — integer literal suffixes are ignored; only the value range selects int versus long.
 
 ## HACK
