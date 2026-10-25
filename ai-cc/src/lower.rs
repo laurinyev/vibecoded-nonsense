@@ -1511,7 +1511,31 @@ impl Lowerer {
                     common.clone(),
                 ));
             }
-            self.convert_value(result, &common, &target_ty, v)
+            if matches!(scalar_ty, Type::Bool) {
+                let normalized = self.tmp();
+                if Self::is_float(&common) {
+                    let zero = self.tmp();
+                    v.push(Instr::ConstFloat(zero.clone(), 0.0, common.clone()));
+                    v.push(Instr::FloatBin(
+                        normalized.clone(),
+                        BinOp::Ne,
+                        result,
+                        zero,
+                        common,
+                    ));
+                } else {
+                    v.push(Instr::BinTyped(
+                        normalized.clone(),
+                        BinOp::Ne,
+                        result,
+                        "0".into(),
+                        common,
+                    ));
+                }
+                normalized
+            } else {
+                self.convert_value(result, &common, &target_ty, v)
+            }
         };
         self.store_increment_value(&target_ty, &addr, &bitfield, result.clone(), v);
         if let Some(layout) = &bitfield {

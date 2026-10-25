@@ -10,6 +10,7 @@ int main(void) {
     struct Bits bits = { 1 };
     float fraction = 1.5f;
     int shifted = 2;
+    _Bool enabled = 0;
 
     if ((values[index++] += 3) != 4 || index != 1 || values[0] != 4) return 1;
     pointer += 2;
@@ -19,5 +20,6 @@ int main(void) {
     if ((fraction *= 2.0f) != 3.0f) return 5;
     shifted <<= 2;
     if (shifted != 8) return 6;
+    if ((enabled += 2.0) != 1 || enabled != 1) return 7;
     return 0;
 }
