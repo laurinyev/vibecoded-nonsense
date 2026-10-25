@@ -830,3 +830,112 @@ fn function_constraints() {
     )
     .unwrap();
 }
+
+#[test]
+fn tag_scopes_and_shadowing() {
+    let source = "struct S { int a; }; int main(void) { struct S outer; { struct S { char b; }; struct S inner; inner.b = 1; } outer.a = 2; return outer.a - 2; }";
+    ai_cc::compile_preprocessed(source, "tag-shadow.c").unwrap();
+
+    let errors = ai_cc::compile_preprocessed(
+        "int main(void) { { struct Hidden { int a; }; } struct Hidden value; return 0; }",
+        "tag-scope.c",
+    )
+    .unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|error| error.message.contains("invalid object type for value")));
+}
+
+#[test]
+fn tags_in_declarations_and_duplicates() {
+    ai_cc::compile_preprocessed(
+        "struct S { int a; } value; int main(void) { value.a = 3; return value.a - 3; }",
+        "tag-declarator.c",
+    )
+    .unwrap();
+
+    let errors = ai_cc::compile_preprocessed(
+        "struct S { int a; }; struct S { int b; }; int main(void) { return 0; }",
+        "duplicate-tag.c",
+    )
+    .unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|error| error.message.contains("redefinition of struct S")));
+}
+
+#[test]
+fn tag_and_ordinary_namespaces() {
+    ai_cc::compile_preprocessed(
+        "struct S { int a; }; int S = 3; int main(void) { struct S value; value.a = S; return value.a - 3; }",
+        "tag-ordinary-namespace.c",
+    )
+    .unwrap();
+}
+
+#[test]
+fn function_prototype_tag_scope() {
+    let errors = ai_cc::compile_preprocessed(
+        "void consume(struct Payload { int a; } value); int main(void) { struct Payload item; return 0; }",
+        "prototype-tag-scope.c",
+    )
+    .unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|error| error.message.contains("invalid object type for item")));
+}
+
+#[test]
+fn enumerator_ordinary_namespace() {
+    ai_cc::compile_preprocessed(
+        "enum State { Idle = 2, Busy = Idle + 1 }; int main(void) { return Busy - 3; }",
+        "enumerator-constants.c",
+    )
+    .unwrap();
+    ai_cc::compile_preprocessed(
+        "enum State { Idle = 2 }; int main(void) { int Idle = 5; return Idle - 5; }",
+        "enumerator-shadow.c",
+    )
+    .unwrap();
+}
+
+#[test]
+fn inheritance_of_internal_linkage() {
+    let ir = ai_cc::compile_preprocessed(
+        "static int helper(void); int helper(void) { return 4; } int main(void) { return helper() - 4; }",
+        "internal-linkage.c",
+    )
+    .unwrap();
+    assert!(ir.contains("function w $helper"), "{ir}");
+    assert!(!ir.contains("export function w $helper"), "{ir}");
+
+    ai_cc::compile_preprocessed(
+        "static int value; extern int value; int main(void) { return value; }",
+        "internal-object-linkage.c",
+    )
+    .unwrap();
+}
+
+#[test]
+fn conflicting_linkage() {
+    for (source, expected) in [
+        (
+            "extern int value; static int value; int main(void) { return 0; }",
+            "static declaration of value follows non-static declaration",
+        ),
+        (
+            "static int value; int value; int main(void) { return 0; }",
+            "non-static declaration of value follows static declaration",
+        ),
+        (
+            "int helper(void); static int helper(void) { return 0; } int main(void) { return 0; }",
+            "static declaration of helper follows non-static declaration",
+        ),
+    ] {
+        let errors = ai_cc::compile_preprocessed(source, "conflicting-linkage.c").unwrap_err();
+        assert!(
+            errors.iter().any(|error| error.message.contains(expected)),
+            "{errors:?}"
+        );
+    }
+}

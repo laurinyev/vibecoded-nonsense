@@ -1,6 +1,6 @@
 # Code Markings
 
-19 active markings.
+18 active markings.
 
 ## TODO
 
@@ -14,16 +14,15 @@
 - `src/layout.rs:44` — 16-byte long double is lowered and accessed as 8-byte QBE d.
 - `src/lower.rs:1656` — undeclared callee is assumed int(...) instead of being diagnosed.
 - `src/lower.rs:2002` — initializer errors are ignored, leaving the static object silently zeroed.
-- `src/parser.rs:281` — enumerator names are not bound in ordinary identifier scope.
-- `src/parser.rs:1821` — cloning the LHS duplicates side effects in compound assignments.
-- `src/parser.rs:2212` — postfix increment is lowered as prefix and only works on bare identifiers.
+- `src/parser.rs:2061` — cloning the LHS duplicates side effects in compound assignments.
+- `src/parser.rs:2454` — postfix increment is lowered as prefix and only works on bare identifiers.
 - `src/pp.rs:811` — wrong macro argument count silently leaves the invocation unexpanded.
 - `src/pp.rs:868` — malformed replacement tokenization is silently discarded.
-- `src/sema.rs:423` — integer literal suffixes are ignored; only the value range selects int versus long.
-- `src/sema.rs:428` — string literals have array type in C99, not char pointer.
-- `src/sema.rs:936` — undesignated union initializer blindly selects field 0 and ignores extras.
-- `src/sema.rs:1261` — any address-of variable is treated as constant, including automatic objects.
-- `src/sema.rs:1705` — stripping qualifiers here makes const/volatile pointers falsely compatible.
+- `src/sema.rs:507` — integer literal suffixes are ignored; only the value range selects int versus long.
+- `src/sema.rs:512` — string literals have array type in C99, not char pointer.
+- `src/sema.rs:1020` — undesignated union initializer blindly selects field 0 and ignores extras.
+- `src/sema.rs:1345` — any address-of variable is treated as constant, including automatic objects.
+- `src/sema.rs:1789` — stripping qualifiers here makes const/volatile pointers falsely compatible.
 
 ## HACK
 
@@ -32,7 +31,7 @@ None.
 ## HACK HACK
 
 - `src/lib.rs:46` — hyphen heuristic for multiarch includes can select the wrong architecture.
-- `src/sema.rs:689` — undeclared callees are silently accepted as an implicit-int extension.
+- `src/sema.rs:773` — undeclared callees are silently accepted as an implicit-int extension.
 
 ## HACK HACK HACK
 

@@ -33,11 +33,49 @@ struct DeclaratorDetails {
     is_function_declarator: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum TagKind {
+    Struct,
+    Union,
+    Enum,
+}
+
+impl TagKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Struct => "struct",
+            Self::Union => "union",
+            Self::Enum => "enum",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TagEntry {
+    internal: String,
+    complete: bool,
+}
+
+#[derive(Clone)]
+struct ParseSnapshot {
+    aliases: Vec<HashMap<String, Option<Type>>>,
+    constants: Vec<HashMap<String, i64>>,
+    tags: Vec<HashMap<(TagKind, String), TagEntry>>,
+    definitions: usize,
+    tag_counter: usize,
+    anonymous_tags: usize,
+}
+
 pub struct Parser {
     t: Vec<Token>,
     p: usize,
     errors: Vec<Diagnostic>,
     aliases: Vec<HashMap<String, Option<Type>>>,
+    constants: Vec<HashMap<String, i64>>,
+    tags: Vec<HashMap<(TagKind, String), TagEntry>>,
+    type_definitions: Vec<Type>,
+    pending_parameter_tags: Option<HashMap<(TagKind, String), TagEntry>>,
+    tag_counter: usize,
     pending_functions: Vec<Function>,
     pending_declarations: Vec<GlobalDecl>,
     anonymous_tags: usize,
@@ -50,6 +88,11 @@ impl Parser {
             p: 0,
             errors: Vec::new(),
             aliases: vec![HashMap::new()],
+            constants: vec![HashMap::new()],
+            tags: vec![HashMap::new()],
+            type_definitions: Vec::new(),
+            pending_parameter_tags: None,
+            tag_counter: 0,
             pending_functions: Vec::new(),
             pending_declarations: Vec::new(),
             anonymous_tags: 0,
@@ -165,6 +208,11 @@ impl Parser {
         }
         if self.take(&TokenKind::Struct) || self.take(&TokenKind::Union) {
             let union = self.t[self.p - 1].kind == TokenKind::Union;
+            let kind = if union {
+                TagKind::Union
+            } else {
+                TagKind::Struct
+            };
             let tag = if matches!(self.cur(), TokenKind::Ident(_)) {
                 self.ident()?
             } else if *self.cur() == TokenKind::LBrace {
@@ -181,7 +229,8 @@ impl Parser {
                 ));
             };
             let mut fields: Vec<Field> = Vec::new();
-            if self.take(&TokenKind::LBrace) {
+            let has_body = self.take(&TokenKind::LBrace);
+            if has_body {
                 while *self.cur() != TokenKind::RBrace && *self.cur() != TokenKind::End {
                     let base = self.typ()?;
                     loop {
@@ -252,21 +301,37 @@ impl Parser {
                 }
                 self.expect(&TokenKind::RBrace)?;
             }
-            return Ok(if union {
+            let tag = if has_body {
+                self.define_tag(kind, &tag)?
+            } else {
+                self.reference_tag(kind, &tag)
+            };
+            let ty = if union {
                 Type::Union(tag, fields)
             } else {
                 Type::Struct(tag, fields)
-            });
+            };
+            if has_body {
+                self.type_definitions.push(ty.clone());
+            }
+            return Ok(ty);
         }
         if self.take(&TokenKind::Enum) {
             let tag = if matches!(self.cur(), TokenKind::Ident(_)) {
                 self.ident()?
+            } else if *self.cur() == TokenKind::LBrace {
+                self.anonymous_tags += 1;
+                format!("__anonymous_enum_{}", self.anonymous_tags)
             } else {
-                String::new()
+                return Err(Diagnostic::error(
+                    "expected enum tag or definition",
+                    Some(self.cur_span()),
+                ));
             };
             let mut values = Vec::new();
             let mut next = 0;
-            if self.take(&TokenKind::LBrace) {
+            let has_body = self.take(&TokenKind::LBrace);
+            if has_body {
                 while *self.cur() != TokenKind::RBrace && *self.cur() != TokenKind::End {
                     let n = self.ident()?;
                     if self.take(&TokenKind::Assign) {
@@ -278,7 +343,7 @@ impl Parser {
                             )
                         })?;
                     }
-                    // BUG: enumerator names are not bound in ordinary identifier scope.
+                    self.bind_constant(n.clone(), next);
                     values.push((n, next));
                     next += 1;
                     if !self.take(&TokenKind::Comma) {
@@ -287,7 +352,16 @@ impl Parser {
                 }
                 self.expect(&TokenKind::RBrace)?;
             }
-            return Ok(Type::Enum(tag, values));
+            let tag = if has_body {
+                self.define_tag(TagKind::Enum, &tag)?
+            } else {
+                self.reference_tag(TagKind::Enum, &tag)
+            };
+            let ty = Type::Enum(tag, values);
+            if has_body {
+                self.type_definitions.push(ty.clone());
+            }
+            return Ok(ty);
         }
         let x = match self.cur() {
             TokenKind::Signed
@@ -426,12 +500,133 @@ impl Parser {
     fn bind_ordinary_name(&mut self, name: String) {
         self.aliases.last_mut().unwrap().insert(name, None);
     }
+
+    fn enter_scope(&mut self) {
+        self.aliases.push(HashMap::new());
+        self.constants.push(HashMap::new());
+        self.tags.push(HashMap::new());
+    }
+
+    fn exit_scope(&mut self) {
+        if self.aliases.len() > 1 {
+            self.aliases.pop();
+        }
+        if self.constants.len() > 1 {
+            self.constants.pop();
+        }
+        if self.tags.len() > 1 {
+            self.tags.pop();
+        }
+    }
+
+    fn capture_parameter_tags(&mut self) {
+        self.pending_parameter_tags = self.tags.last().cloned();
+    }
+
+    fn bind_constant(&mut self, name: String, value: i64) {
+        self.aliases.last_mut().unwrap().insert(name.clone(), None);
+        self.constants.last_mut().unwrap().insert(name, value);
+    }
+
+    fn constant_value(&self, name: &str) -> Option<i64> {
+        for (aliases, constants) in self.aliases.iter().zip(self.constants.iter()).rev() {
+            if aliases.contains_key(name) {
+                return constants.get(name).copied();
+            }
+        }
+        None
+    }
+
+    fn snapshot(&self) -> ParseSnapshot {
+        ParseSnapshot {
+            aliases: self.aliases.clone(),
+            constants: self.constants.clone(),
+            tags: self.tags.clone(),
+            definitions: self.type_definitions.len(),
+            tag_counter: self.tag_counter,
+            anonymous_tags: self.anonymous_tags,
+        }
+    }
+
+    fn restore(&mut self, snapshot: ParseSnapshot, position: usize) {
+        self.p = position;
+        self.aliases = snapshot.aliases;
+        self.constants = snapshot.constants;
+        self.tags = snapshot.tags;
+        self.type_definitions.truncate(snapshot.definitions);
+        self.tag_counter = snapshot.tag_counter;
+        self.anonymous_tags = snapshot.anonymous_tags;
+    }
+
+    fn visible_tag(&self, kind: TagKind, name: &str) -> Option<TagEntry> {
+        self.tags
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&(kind, name.to_string())).cloned())
+    }
+
+    fn fresh_tag_name(&mut self, kind: TagKind, name: &str) -> String {
+        if self.tags.len() == 1 {
+            name.to_string()
+        } else {
+            self.tag_counter += 1;
+            format!("__local_{}_{}_{}", kind.name(), self.tag_counter, name)
+        }
+    }
+
+    fn reference_tag(&mut self, kind: TagKind, name: &str) -> String {
+        if let Some(entry) = self.visible_tag(kind, name) {
+            return entry.internal;
+        }
+        let internal = self.fresh_tag_name(kind, name);
+        self.tags.last_mut().unwrap().insert(
+            (kind, name.to_string()),
+            TagEntry {
+                internal: internal.clone(),
+                complete: false,
+            },
+        );
+        internal
+    }
+
+    fn define_tag(&mut self, kind: TagKind, name: &str) -> Result<String, Diagnostic> {
+        if let Some(entry) = self
+            .tags
+            .last()
+            .unwrap()
+            .get(&(kind, name.to_string()))
+            .cloned()
+        {
+            if entry.complete {
+                return Err(Diagnostic::error(
+                    format!("redefinition of {} {}", kind.name(), name),
+                    Some(self.cur_span()),
+                ));
+            }
+            self.tags
+                .last_mut()
+                .unwrap()
+                .get_mut(&(kind, name.to_string()))
+                .unwrap()
+                .complete = true;
+            return Ok(entry.internal);
+        }
+        let internal = self.fresh_tag_name(kind, name);
+        self.tags.last_mut().unwrap().insert(
+            (kind, name.to_string()),
+            TagEntry {
+                internal: internal.clone(),
+                complete: true,
+            },
+        );
+        Ok(internal)
+    }
     pub fn parse_translation_unit(&mut self) -> Result<TranslationUnit, Vec<Diagnostic>> {
         let mut v = Vec::new();
-        let mut types = Vec::new();
         let mut declarations = Vec::new();
         let mut e = Vec::new();
         while *self.cur() != TokenKind::End {
+            self.pending_parameter_tags = None;
             if self.take(&TokenKind::Typedef) {
                 match self.global_typedef() {
                     Ok(()) => {
@@ -453,7 +648,7 @@ impl Parser {
                 self.nested_function_declaration()
                     .map(|function| ExternalDecl::Functions(vec![function]))
             } else {
-                self.global_declaration(&mut types, &mut declarations)
+                self.global_declaration(&mut declarations)
                     .map(|()| ExternalDecl::Object)
             };
             match parsed {
@@ -482,7 +677,7 @@ impl Parser {
         if e.is_empty() {
             Ok(TranslationUnit {
                 items: v,
-                types,
+                types: std::mem::take(&mut self.type_definitions),
                 declarations,
             })
         } else {
@@ -510,6 +705,7 @@ impl Parser {
 
     fn looks_like_function_declaration(&mut self) -> bool {
         let start = self.p;
+        let snapshot = self.snapshot();
         while matches!(
             self.cur(),
             TokenKind::Static | TokenKind::Extern | TokenKind::Inline
@@ -530,12 +726,13 @@ impl Parser {
         } else {
             false
         };
-        self.p = start;
+        self.restore(snapshot, start);
         result
     }
 
     fn looks_like_nested_function_declaration(&mut self) -> bool {
         let start = self.p;
+        let snapshot = self.snapshot();
         while matches!(
             self.cur(),
             TokenKind::Static | TokenKind::Extern | TokenKind::Inline
@@ -549,12 +746,13 @@ impl Parser {
             .is_some_and(|(_, ty)| {
                 matches!(ty, Type::Function(_, _, _, _)) && *self.cur() == TokenKind::Semicolon
             });
-        self.p = start;
+        self.restore(snapshot, start);
         result
     }
 
     fn looks_like_complex_function_definition(&mut self) -> bool {
         let start = self.p;
+        let snapshot = self.snapshot();
         while matches!(
             self.cur(),
             TokenKind::Static | TokenKind::Extern | TokenKind::Inline
@@ -570,7 +768,7 @@ impl Parser {
                     && matches!(details.ty, Type::Function(_, _, _, _))
                     && (*self.cur() == TokenKind::LBrace || self.is_type())
             });
-        self.p = start;
+        self.restore(snapshot, start);
         result
     }
 
@@ -724,11 +922,7 @@ impl Parser {
         })
     }
 
-    fn global_declaration(
-        &mut self,
-        types: &mut Vec<Type>,
-        declarations: &mut Vec<GlobalDecl>,
-    ) -> Result<(), Diagnostic> {
+    fn global_declaration(&mut self, declarations: &mut Vec<GlobalDecl>) -> Result<(), Diagnostic> {
         let start = self.cur_span().start;
         let mut storage = None;
         let mut is_inline = false;
@@ -770,7 +964,6 @@ impl Parser {
                 base,
                 Type::Struct(_, _) | Type::Union(_, _) | Type::Enum(_, _)
             ) {
-                types.push(base);
                 return Ok(());
             }
             return Err(Diagnostic::error(
@@ -779,7 +972,6 @@ impl Parser {
             ));
         }
         let mut declarations_here = Vec::new();
-        let mut saw_function = false;
         loop {
             let (name, ty) = self.declarator_full(base.clone())?;
             if name.is_empty() {
@@ -809,7 +1001,6 @@ impl Parser {
                     is_inline,
                     span: self.span_from(start),
                 });
-                saw_function = true;
                 if !self.take(&TokenKind::Comma) {
                     break;
                 }
@@ -843,11 +1034,7 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::Semicolon)?;
-        if declarations_here.is_empty() && !saw_function {
-            types.push(base);
-        } else {
-            declarations.extend(declarations_here);
-        }
+        declarations.extend(declarations_here);
         Ok(())
     }
     fn function(&mut self) -> Result<Vec<Function>, Diagnostic> {
@@ -907,13 +1094,18 @@ impl Parser {
             ));
         }
         self.expect(&TokenKind::LParen)?;
+        self.enter_scope();
         let mut params = Vec::new();
         let mut params_unspecified = false;
         let mut is_variadic = false;
         if matches!(self.cur(), TokenKind::Ident(name) if self.alias_type(name).is_none()) {
-            let mut names = vec![self.ident()?];
+            let first = self.ident()?;
+            self.bind_ordinary_name(first.clone());
+            let mut names = vec![first];
             while self.take(&TokenKind::Comma) {
-                names.push(self.ident()?);
+                let name = self.ident()?;
+                self.bind_ordinary_name(name.clone());
+                names.push(name);
             }
             self.expect(&TokenKind::RParen)?;
             if *self.cur() == TokenKind::Semicolon || *self.cur() == TokenKind::Comma {
@@ -930,12 +1122,16 @@ impl Parser {
                     span: self.span_from(start),
                 };
                 if *self.cur() == TokenKind::Semicolon || *self.cur() == TokenKind::Comma {
+                    self.capture_parameter_tags();
+                    self.exit_scope();
                     return self.finish_function_declaration_list(
                         function,
                         declaration_base,
                         is_extern,
                     );
                 }
+                self.capture_parameter_tags();
+                self.exit_scope();
                 return self
                     .finish_function(
                         function.name,
@@ -1006,6 +1202,8 @@ impl Parser {
                     Some(self.cur_span()),
                 ));
             }
+            self.capture_parameter_tags();
+            self.exit_scope();
             return self
                 .finish_function(name, ret, params, false, false, is_static, is_inline)
                 .map(|function| vec![function]);
@@ -1032,12 +1230,16 @@ impl Parser {
                     span: self.span_from(start),
                 };
                 if *self.cur() == TokenKind::Semicolon || *self.cur() == TokenKind::Comma {
+                    self.capture_parameter_tags();
+                    self.exit_scope();
                     return self.finish_function_declaration_list(
                         function,
                         declaration_base,
                         is_extern,
                     );
                 }
+                self.capture_parameter_tags();
+                self.exit_scope();
                 return self
                     .finish_function(
                         function.name,
@@ -1054,6 +1256,9 @@ impl Parser {
                 self.take(&TokenKind::Register);
                 let ty = self.typ()?;
                 let (n, ty) = self.declarator_full(ty)?;
+                if !n.is_empty() {
+                    self.bind_ordinary_name(n.clone());
+                }
                 params.push((n, Self::adjust_parameter_type(ty)));
                 if !self.take(&TokenKind::Comma) {
                     break;
@@ -1080,8 +1285,12 @@ impl Parser {
                 is_inline,
                 span: self.span_from(start),
             };
+            self.capture_parameter_tags();
+            self.exit_scope();
             return self.finish_function_declaration_list(function, declaration_base, is_extern);
         }
+        self.capture_parameter_tags();
+        self.exit_scope();
         self.finish_function(
             name,
             ret,
@@ -1181,6 +1390,7 @@ impl Parser {
         is_static: bool,
         is_inline: bool,
     ) -> Result<Function, Diagnostic> {
+        let parameter_tags = self.pending_parameter_tags.take().unwrap_or_default();
         let start = self.cur_span().start;
         let external = self.take(&TokenKind::Semicolon);
         if !external && params.iter().any(|(name, _)| name.is_empty()) {
@@ -1192,14 +1402,15 @@ impl Parser {
         let body = if external {
             Block { stmts: Vec::new() }
         } else {
-            self.aliases.push(HashMap::new());
+            self.enter_scope();
+            self.tags.last_mut().unwrap().extend(parameter_tags);
             for (param, _) in &params {
                 self.bind_ordinary_name(param.clone());
             }
             self.block()?
         };
         if !external {
-            self.aliases.pop();
+            self.exit_scope();
         }
         Ok(Function {
             name,
@@ -1219,7 +1430,7 @@ impl Parser {
     }
     fn block(&mut self) -> Result<Block, Diagnostic> {
         self.expect(&TokenKind::LBrace)?;
-        self.aliases.push(HashMap::new());
+        self.enter_scope();
         let mut v = Vec::new();
         while *self.cur() != TokenKind::RBrace && *self.cur() != TokenKind::End {
             match self.stmt() {
@@ -1232,7 +1443,7 @@ impl Parser {
         }
         // Keep the alias scope balanced even when the closing brace is missing.
         let closing = self.expect(&TokenKind::RBrace);
-        self.aliases.pop();
+        self.exit_scope();
         closing?;
         Ok(Block { stmts: v })
     }
@@ -1294,7 +1505,7 @@ impl Parser {
         }
         if self.take(&TokenKind::For) {
             self.expect(&TokenKind::LParen)?;
-            self.aliases.push(HashMap::new());
+            self.enter_scope();
             let result = (|| {
                 let init = if self.take(&TokenKind::Semicolon) {
                     None
@@ -1331,7 +1542,7 @@ impl Parser {
                     self.span_from(start),
                 ))
             })();
-            self.aliases.pop();
+            self.exit_scope();
             return result;
         }
         if self.take(&TokenKind::Break) {
@@ -1438,6 +1649,21 @@ impl Parser {
         if inline {
             return Err(Diagnostic::error(
                 "inline is only valid on a function declaration",
+                Some(self.cur_span()),
+            ));
+        }
+        if self.take(&TokenKind::Semicolon) {
+            if matches!(
+                ty,
+                Type::Struct(_, _) | Type::Union(_, _) | Type::Enum(_, _)
+            ) {
+                return Ok(Stmt::Block(
+                    Block { stmts: Vec::new() },
+                    self.span_from(start),
+                ));
+            }
+            return Err(Diagnostic::error(
+                "declaration requires a declarator",
                 Some(self.cur_span()),
             ));
         }
@@ -1730,50 +1956,64 @@ impl Parser {
                 continue;
             }
             if allow_function && self.take(&TokenKind::LParen) {
-                let mut params = Vec::new();
-                let mut variadic = false;
-                let mut has_prototype = !self.take(&TokenKind::RParen);
-                if has_prototype {
-                    if matches!(self.cur(), TokenKind::Ident(name) if self.alias_type(name).is_none())
-                    {
-                        params.push((self.ident()?, Type::Int));
-                        while self.take(&TokenKind::Comma) {
-                            params.push((self.ident()?, Type::Int));
-                        }
-                        self.expect(&TokenKind::RParen)?;
-                        has_prototype = false;
-                    } else if *self.cur() == TokenKind::Void
-                        && self
-                            .t
-                            .get(self.p + 1)
-                            .is_some_and(|token| token.kind == TokenKind::RParen)
-                    {
-                        self.p += 2;
-                        // `void` denotes an empty parameter list.
-                    } else {
-                        loop {
-                            self.take(&TokenKind::Register);
-                            let param_ty = self.typ()?;
-                            let (param_name, param_ty) = if matches!(
-                                self.cur(),
-                                TokenKind::Ident(_) | TokenKind::Star | TokenKind::LParen
-                            ) {
-                                self.declarator_full(param_ty)?
-                            } else {
-                                (String::new(), param_ty)
-                            };
-                            params.push((param_name, Self::adjust_parameter_type(param_ty)));
-                            if !self.take(&TokenKind::Comma) {
-                                break;
+                self.enter_scope();
+                let parsed = (|| -> Result<(Vec<(String, Type)>, bool, bool), Diagnostic> {
+                    let mut params = Vec::new();
+                    let mut variadic = false;
+                    let mut has_prototype = !self.take(&TokenKind::RParen);
+                    if has_prototype {
+                        if matches!(self.cur(), TokenKind::Ident(name) if self.alias_type(name).is_none())
+                        {
+                            let name = self.ident()?;
+                            self.bind_ordinary_name(name.clone());
+                            params.push((name, Type::Int));
+                            while self.take(&TokenKind::Comma) {
+                                let name = self.ident()?;
+                                self.bind_ordinary_name(name.clone());
+                                params.push((name, Type::Int));
                             }
-                            if self.take(&TokenKind::Ellipsis) {
-                                variadic = true;
-                                break;
+                            self.expect(&TokenKind::RParen)?;
+                            has_prototype = false;
+                        } else if *self.cur() == TokenKind::Void
+                            && self
+                                .t
+                                .get(self.p + 1)
+                                .is_some_and(|token| token.kind == TokenKind::RParen)
+                        {
+                            self.p += 2;
+                            // `void` denotes an empty parameter list.
+                        } else {
+                            loop {
+                                self.take(&TokenKind::Register);
+                                let param_ty = self.typ()?;
+                                let (param_name, param_ty) = if matches!(
+                                    self.cur(),
+                                    TokenKind::Ident(_) | TokenKind::Star | TokenKind::LParen
+                                ) {
+                                    self.declarator_full(param_ty)?
+                                } else {
+                                    (String::new(), param_ty)
+                                };
+                                if !param_name.is_empty() {
+                                    self.bind_ordinary_name(param_name.clone());
+                                }
+                                params.push((param_name, Self::adjust_parameter_type(param_ty)));
+                                if !self.take(&TokenKind::Comma) {
+                                    break;
+                                }
+                                if self.take(&TokenKind::Ellipsis) {
+                                    variadic = true;
+                                    break;
+                                }
                             }
+                            self.expect(&TokenKind::RParen)?;
                         }
-                        self.expect(&TokenKind::RParen)?;
                     }
-                }
+                    Ok((params, variadic, has_prototype))
+                })();
+                self.capture_parameter_tags();
+                self.exit_scope();
+                let (params, variadic, has_prototype) = parsed?;
                 ops.push(DeclaratorOp::Function(params, variadic, has_prototype));
                 continue;
             }
@@ -2207,6 +2447,8 @@ impl Parser {
                         self.expect(&TokenKind::RParen)?;
                         Expr::Call(n, a)
                     }
+                } else if let Some(value) = self.constant_value(&n) {
+                    Expr::Int(value)
                 } else {
                     let x = Expr::Var(n.clone());
                     // BUG: postfix increment is lowered as prefix and only works on bare identifiers.

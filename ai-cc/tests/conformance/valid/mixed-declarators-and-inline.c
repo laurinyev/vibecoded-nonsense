@@ -8,7 +8,7 @@ extern inline int external_helper(void) {
 
 int second(void), object = 5, values[2] = { 6, 7 };
 
-static int second(void) {
+int second(void) {
     return values[0] + values[1];
 }
 

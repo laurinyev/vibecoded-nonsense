@@ -27,6 +27,20 @@ impl<'a> InitCursor<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Linkage {
+    External,
+    Internal,
+}
+
+#[derive(Clone)]
+struct FileEntity {
+    ty: Type,
+    linkage: Linkage,
+    is_function: bool,
+    defined: bool,
+}
+
 pub struct Sema {
     syms: Scopes,
     errs: Vec<Diagnostic>,
@@ -34,6 +48,7 @@ pub struct Sema {
     current_ret: Option<Type>,
     complete_tags: HashSet<String>,
     tag_defs: HashMap<String, Type>,
+    file_entities: HashMap<String, FileEntity>,
 }
 
 impl Default for Sema {
@@ -51,6 +66,7 @@ impl Sema {
             current_ret: None,
             complete_tags: Default::default(),
             tag_defs: Default::default(),
+            file_entities: Default::default(),
         }
     }
 
@@ -69,92 +85,26 @@ impl Sema {
             }
         }
 
-        for f in &ast.items {
-            if self.syms.lookup_current_scope(&f.name).is_none() {
-                let ty = Type::Function(
-                    Box::new(f.ret.clone()),
-                    f.params.iter().map(|(_, ty)| ty.clone()).collect(),
-                    f.is_variadic,
-                    !f.params_unspecified,
-                );
-                let _ = self.syms.insert(Symbol {
-                    name: f.name.clone(),
-                    ty,
-                    is_register: false,
-                });
-            }
+        enum FileEvent<'a> {
+            Object(&'a mut GlobalDecl),
+            Function(&'a mut Function),
         }
-
+        let mut events = Vec::new();
+        for f in &mut ast.items {
+            events.push((f.span.start, 0usize, FileEvent::Function(f)));
+        }
         for declaration in &mut ast.declarations {
-            if let Some(previous) = self.syms.lookup_current_scope(&declaration.name) {
-                if !Self::compatible(&previous.ty, &declaration.ty) {
-                    self.errs.push(Diagnostic::error(
-                        format!("conflicting types for {}", declaration.name),
-                        Some(declaration.span),
-                    ));
-                }
-            } else if let Err(error) = self.syms.insert(Symbol {
-                name: declaration.name.clone(),
-                ty: declaration.ty.clone(),
-                is_register: false,
-            }) {
-                self.errs
-                    .push(Diagnostic::error(error.0, Some(declaration.span)));
-            }
-            if let Some(initializer) = &mut declaration.initializer {
-                self.check_initializer(&mut declaration.ty, initializer, declaration.span);
-                if !self.constant_initializer_list(initializer) {
-                    self.errs.push(Diagnostic::error(
-                        "file-scope initializer is not a supported constant expression",
-                        Some(declaration.span),
-                    ));
-                }
-            }
-            self.update_symbol_type(&declaration.name, &declaration.ty);
-            if Self::contains_vla(&declaration.ty) {
-                self.errs.push(Diagnostic::error(
-                    "file-scope object cannot have variable-length array type",
-                    Some(declaration.span),
-                ));
-            }
-            if !self.valid_object_type(&declaration.ty) {
-                self.errs.push(Diagnostic::error(
-                    format!("invalid file-scope object type for {}", declaration.name),
-                    Some(declaration.span),
-                ));
-            }
+            events.push((
+                declaration.span.start,
+                1usize,
+                FileEvent::Object(declaration),
+            ));
         }
-
-        let mut defined_functions = HashSet::new();
-        for f in &ast.items {
-            let ty = Type::Function(
-                Box::new(f.ret.clone()),
-                f.params.iter().map(|(_, ty)| ty.clone()).collect(),
-                f.is_variadic,
-                !f.params_unspecified,
-            );
-            if let Some(previous) = self.syms.lookup_current_scope(&f.name) {
-                let existing = previous.ty.clone();
-                if !matches!(Self::unqualified(&existing), Type::Function(_, _, _, _))
-                    || !Self::compatible(&existing, &ty)
-                {
-                    self.errs.push(Diagnostic::error(
-                        format!("conflicting types for {}", f.name),
-                        Some(f.span),
-                    ));
-                }
-            } else if let Err(e) = self.syms.insert(Symbol {
-                name: f.name.clone(),
-                ty,
-                is_register: false,
-            }) {
-                self.errs.push(Diagnostic::error(e.0, Some(f.span)));
-            }
-            if !f.external && !defined_functions.insert(f.name.clone()) {
-                self.errs.push(Diagnostic::error(
-                    format!("redefinition of {}", f.name),
-                    Some(f.span),
-                ));
+        events.sort_by_key(|(start, order, _)| (*start, *order));
+        for (_, _, event) in events {
+            match event {
+                FileEvent::Object(declaration) => self.file_object(declaration),
+                FileEvent::Function(function) => self.file_function(function),
             }
         }
 
@@ -205,6 +155,140 @@ impl Sema {
         } else {
             Err(std::mem::take(&mut self.errs))
         }
+    }
+
+    fn file_object(&mut self, declaration: &mut GlobalDecl) {
+        let linkage = match declaration.storage {
+            Some(StorageClass::Static) => Linkage::Internal,
+            Some(StorageClass::Extern) => self
+                .file_entities
+                .get(&declaration.name)
+                .map(|entity| entity.linkage)
+                .unwrap_or(Linkage::External),
+            _ => Linkage::External,
+        };
+        self.merge_file_entity(
+            &declaration.name,
+            &declaration.ty,
+            false,
+            linkage,
+            declaration.initializer.is_some(),
+            declaration.span,
+        );
+        if linkage == Linkage::Internal {
+            declaration.storage = Some(StorageClass::Static);
+        }
+        if let Some(initializer) = &mut declaration.initializer {
+            self.check_initializer(&mut declaration.ty, initializer, declaration.span);
+            if !self.constant_initializer_list(initializer) {
+                self.errs.push(Diagnostic::error(
+                    "file-scope initializer is not a supported constant expression",
+                    Some(declaration.span),
+                ));
+            }
+        }
+        self.update_symbol_type(&declaration.name, &declaration.ty);
+        if Self::contains_vla(&declaration.ty) {
+            self.errs.push(Diagnostic::error(
+                "file-scope object cannot have variable-length array type",
+                Some(declaration.span),
+            ));
+        }
+        if !self.valid_object_type(&declaration.ty) {
+            self.errs.push(Diagnostic::error(
+                format!("invalid file-scope object type for {}", declaration.name),
+                Some(declaration.span),
+            ));
+        }
+    }
+
+    fn file_function(&mut self, function: &mut Function) {
+        let ty = Type::Function(
+            Box::new(function.ret.clone()),
+            function.params.iter().map(|(_, ty)| ty.clone()).collect(),
+            function.is_variadic,
+            !function.params_unspecified,
+        );
+        let linkage = if function.is_static {
+            Linkage::Internal
+        } else {
+            self.file_entities
+                .get(&function.name)
+                .map(|entity| entity.linkage)
+                .unwrap_or(Linkage::External)
+        };
+        self.merge_file_entity(
+            &function.name,
+            &ty,
+            true,
+            linkage,
+            !function.external,
+            function.span,
+        );
+        function.is_static = linkage == Linkage::Internal;
+    }
+
+    fn merge_file_entity(
+        &mut self,
+        name: &str,
+        ty: &Type,
+        is_function: bool,
+        linkage: Linkage,
+        is_definition: bool,
+        span: crate::diag::Span,
+    ) {
+        if let Some(previous) = self.file_entities.get(name).cloned() {
+            if previous.is_function != is_function || !Self::compatible(&previous.ty, ty) {
+                self.errs.push(Diagnostic::error(
+                    format!("conflicting types for {}", name),
+                    Some(span),
+                ));
+            }
+            if previous.linkage != linkage {
+                let message = match (previous.linkage, linkage) {
+                    (Linkage::External, Linkage::Internal) => format!(
+                        "static declaration of {} follows non-static declaration",
+                        name
+                    ),
+                    (Linkage::Internal, Linkage::External) => format!(
+                        "non-static declaration of {} follows static declaration",
+                        name
+                    ),
+                    _ => unreachable!(),
+                };
+                self.errs.push(Diagnostic::error(message, Some(span)));
+            }
+            if is_definition && previous.defined {
+                self.errs.push(Diagnostic::error(
+                    format!("redefinition of {}", name),
+                    Some(span),
+                ));
+            }
+            let entity = self.file_entities.get_mut(name).unwrap();
+            entity.ty = ty.clone();
+            entity.linkage = linkage;
+            entity.defined |= is_definition;
+        } else {
+            self.file_entities.insert(
+                name.to_string(),
+                FileEntity {
+                    ty: ty.clone(),
+                    linkage,
+                    is_function,
+                    defined: is_definition,
+                },
+            );
+        }
+        if self.syms.lookup_current_scope(name).is_none() {
+            if let Err(error) = self.syms.insert(Symbol {
+                name: name.to_string(),
+                ty: ty.clone(),
+                is_register: false,
+            }) {
+                self.errs.push(Diagnostic::error(error.0, Some(span)));
+            }
+        }
+        self.update_symbol_type(name, ty);
     }
 
     fn add(&mut self, n: &str, t: &Type, span: crate::diag::Span) {

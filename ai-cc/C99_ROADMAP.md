@@ -115,15 +115,15 @@ Complete for the current target and supported subset. The parser handles C99 dec
 
 Long-tail declaration coverage is tracked in Priority 9.
 
-### 2.2 Implement scopes, namespaces, linkage, and tags
+### 2.2 Implement scopes, namespaces, linkage, and tags — in progress
 
-- Maintain separate ordinary, tag, member, and label namespaces.
-- Give typedef names the correct ordinary-identifier behavior.
-- Implement file, block, function, and function-prototype scopes.
-- Resolve forward declarations and completed `struct`, `union`, and `enum` tags.
-- Implement external, internal, and no-linkage rules.
-- Merge compatible declarations and diagnose incompatible declarations.
-- Track function declarations separately from function definitions.
+Ordinary, tag, and member namespaces are separated. Typedef names and enumerators share ordinary-identifier behavior, including shadowing. File, block, function, and function-prototype scopes are tracked; tags declared in prototype parameter lists are hidden afterward and remain visible in definitions. Tag declarations resolve forward and completed types, with duplicate definitions diagnosed. File-scope linkage now distinguishes external and internal linkage, inherits internal linkage through compatible redeclarations, and diagnoses static/non-static conflicts. Compatible declarations merge, incompatible declarations are diagnosed, and function definitions are tracked separately from declarations.
+
+Remaining work:
+
+- Add label and `goto` namespaces when labels and `goto` are represented in the AST.
+- Complete composite-type computation for all compatible redeclarations.
+- Cover long-tail namespace diagnostics for conflicting ordinary identifiers.
 
 ### 2.3 Implement all C99 types — in progress
 
