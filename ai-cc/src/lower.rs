@@ -2206,7 +2206,20 @@ impl Lowerer {
                                 )]
                             })?;
                     }
-                    self.aggregate_data.push(data);
+                    if let Some(existing) = self
+                        .aggregate_data
+                        .iter_mut()
+                        .find(|object| object.name == declaration.name)
+                    {
+                        if declaration.initializer.is_some() {
+                            existing.ty = data.ty;
+                            existing.bytes = data.bytes;
+                            existing.relocations = data.relocations;
+                            existing.internal = data.internal;
+                        }
+                    } else {
+                        self.aggregate_data.push(data);
+                    }
                     continue;
                 }
                 let value = match &declaration.initializer {

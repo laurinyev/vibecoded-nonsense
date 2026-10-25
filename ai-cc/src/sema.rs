@@ -39,6 +39,7 @@ struct FileEntity {
     linkage: Linkage,
     is_function: bool,
     defined: bool,
+    tentative: bool,
 }
 
 pub struct Sema {
@@ -108,6 +109,28 @@ impl Sema {
             }
         }
 
+        for entity in self.file_entities.values_mut() {
+            if !entity.is_function
+                && entity.tentative
+                && matches!(entity.ty, Type::Array(_, None, _))
+            {
+                if let Type::Array(element, None, is_static) = entity.ty.clone() {
+                    entity.ty = Type::Array(element, Some(1), is_static);
+                }
+            }
+        }
+        for declaration in &mut ast.declarations {
+            if let Some(entity_ty) = self
+                .file_entities
+                .get(&declaration.name)
+                .filter(|entity| !entity.is_function)
+                .map(|entity| entity.ty.clone())
+            {
+                declaration.ty = entity_ty.clone();
+                self.update_symbol_type(&declaration.name, &entity_ty);
+            }
+        }
+
         for f in &mut ast.items {
             if matches!(
                 f.ret,
@@ -118,12 +141,9 @@ impl Sema {
                     Some(f.span),
                 ));
             }
-            if !f.external
-                && !matches!(Self::unqualified(&f.ret), Type::Void)
-                && !self.valid_object_type(&f.ret)
-            {
+            if !matches!(Self::unqualified(&f.ret), Type::Void) && !self.valid_object_type(&f.ret) {
                 self.errs.push(Diagnostic::error(
-                    "function definition return type is incomplete",
+                    "function return type is incomplete or invalid",
                     Some(f.span),
                 ));
             }
@@ -173,8 +193,17 @@ impl Sema {
             false,
             linkage,
             declaration.initializer.is_some(),
+            declaration.tentative_definition,
             declaration.span,
         );
+        if let Some(entity_ty) = self
+            .file_entities
+            .get(&declaration.name)
+            .filter(|entity| !entity.is_function)
+            .map(|entity| entity.ty.clone())
+        {
+            declaration.ty = entity_ty;
+        }
         if linkage == Linkage::Internal {
             declaration.storage = Some(StorageClass::Static);
         }
@@ -186,6 +215,12 @@ impl Sema {
                     Some(declaration.span),
                 ));
             }
+            if let Some(entity) = self.file_entities.get_mut(&declaration.name) {
+                if Self::compatible_declaration(&entity.ty, &declaration.ty) {
+                    entity.ty = Self::composite(&entity.ty, &declaration.ty);
+                }
+                declaration.ty = entity.ty.clone();
+            }
         }
         self.update_symbol_type(&declaration.name, &declaration.ty);
         if Self::contains_vla(&declaration.ty) {
@@ -194,7 +229,8 @@ impl Sema {
                 Some(declaration.span),
             ));
         }
-        if !self.valid_object_type(&declaration.ty) {
+        let is_definition = declaration.tentative_definition;
+        if !self.valid_file_object_type(&declaration.ty, is_definition) {
             self.errs.push(Diagnostic::error(
                 format!("invalid file-scope object type for {}", declaration.name),
                 Some(declaration.span),
@@ -223,6 +259,7 @@ impl Sema {
             true,
             linkage,
             !function.external,
+            false,
             function.span,
         );
         function.is_static = linkage == Linkage::Internal;
@@ -235,10 +272,13 @@ impl Sema {
         is_function: bool,
         linkage: Linkage,
         is_definition: bool,
+        is_tentative: bool,
         span: crate::diag::Span,
     ) {
         if let Some(previous) = self.file_entities.get(name).cloned() {
-            if previous.is_function != is_function || !Self::compatible(&previous.ty, ty) {
+            if previous.is_function != is_function
+                || !Self::compatible_declaration(&previous.ty, ty)
+            {
                 self.errs.push(Diagnostic::error(
                     format!("conflicting types for {}", name),
                     Some(span),
@@ -264,10 +304,17 @@ impl Sema {
                     Some(span),
                 ));
             }
+            let compatible = self
+                .file_entities
+                .get(name)
+                .is_some_and(|entity| Self::compatible_declaration(&entity.ty, ty));
             let entity = self.file_entities.get_mut(name).unwrap();
-            entity.ty = ty.clone();
+            if compatible {
+                entity.ty = Self::composite(&entity.ty, ty);
+            }
             entity.linkage = linkage;
             entity.defined |= is_definition;
+            entity.tentative |= is_tentative;
         } else {
             self.file_entities.insert(
                 name.to_string(),
@@ -276,6 +323,7 @@ impl Sema {
                     linkage,
                     is_function,
                     defined: is_definition,
+                    tentative: is_tentative,
                 },
             );
         }
@@ -288,7 +336,12 @@ impl Sema {
                 self.errs.push(Diagnostic::error(error.0, Some(span)));
             }
         }
-        self.update_symbol_type(name, ty);
+        let ty = self
+            .file_entities
+            .get(name)
+            .map(|entity| entity.ty.clone())
+            .unwrap_or_else(|| ty.clone());
+        self.update_symbol_type(name, &ty);
     }
 
     fn add(&mut self, n: &str, t: &Type, span: crate::diag::Span) {
@@ -332,7 +385,12 @@ impl Sema {
                         self.check_initializer(ty, initializer, span);
                         self.update_symbol_type(name, ty);
                     }
-                    if !self.valid_object_type(ty) {
+                    let valid = if *storage == StorageClass::Extern {
+                        self.valid_extern_object_type(ty)
+                    } else {
+                        self.valid_object_type(ty)
+                    };
+                    if !valid {
                         self.errs.push(Diagnostic::error(
                             format!("invalid object type for {}", name),
                             Some(span),
@@ -694,12 +752,9 @@ impl Sema {
                                 "sizeof cannot be applied to a bit-field",
                                 Some(span),
                             ));
-                        } else if matches!(
-                            Self::unqualified(&ty),
-                            Type::Void | Type::Function(_, _, _, _)
-                        ) {
+                        } else if !self.valid_object_type(&ty) {
                             self.errs.push(Diagnostic::error(
-                                "sizeof requires an object type",
+                                "sizeof requires a complete object type",
                                 Some(span),
                             ));
                         }
@@ -1580,6 +1635,26 @@ impl Sema {
         }
     }
 
+    fn valid_extern_object_type(&self, t: &Type) -> bool {
+        match Self::unqualified(t) {
+            Type::Void | Type::Function(_, _, _, _) => false,
+            Type::Array(element, None, _) => self.valid_object_type(&element),
+            Type::Struct(n, fields) | Type::Union(n, fields)
+                if fields.is_empty() && !self.complete_tags.contains(&n) =>
+            {
+                true
+            }
+            _ => self.valid_object_type(t),
+        }
+    }
+
+    fn valid_file_object_type(&self, t: &Type, is_definition: bool) -> bool {
+        if !is_definition || matches!(t, Type::Array(_, None, _)) {
+            return self.valid_extern_object_type(t);
+        }
+        self.valid_object_type(t)
+    }
+
     fn valid_object_type(&self, t: &Type) -> bool {
         match t {
             Type::Void | Type::Function(_, _, _, _) => false,
@@ -1816,6 +1891,84 @@ impl Sema {
                     }
             }
             _ => false,
+        }
+    }
+
+    fn same_qualifiers(a: &Qualifiers, b: &Qualifiers) -> bool {
+        a.is_const == b.is_const && a.is_volatile == b.is_volatile && a.is_restrict == b.is_restrict
+    }
+
+    fn compatible_declaration(a: &Type, b: &Type) -> bool {
+        match (a, b) {
+            (Type::Qualified(ai, aq), Type::Qualified(bi, bq)) => {
+                Self::same_qualifiers(aq, bq) && Self::compatible_declaration(ai, bi)
+            }
+            (Type::Qualified(_, _), _) | (_, Type::Qualified(_, _)) => false,
+            (Type::Int | Type::SignedInt, Type::Int | Type::SignedInt) => true,
+            (Type::Struct(a, _), Type::Struct(b, _)) | (Type::Union(a, _), Type::Union(b, _)) => {
+                a == b
+            }
+            (Type::Enum(a, _), Type::Enum(b, _)) => a == b,
+            (Type::Array(ae, ac, _), Type::Array(be, bc, _)) => {
+                (ac.is_none() || bc.is_none() || ac == bc) && Self::compatible_declaration(ae, be)
+            }
+            (Type::Vla(ae, _), Type::Vla(be, _)) => Self::compatible_declaration(ae, be),
+            (Type::Pointer(ai), Type::Pointer(bi)) => Self::compatible_declaration(ai, bi),
+            (Type::Function(ar, ap, av, aproto), Type::Function(br, bp, bv, bproto)) => {
+                Self::compatible_declaration(ar, br)
+                    && if !aproto || !bproto {
+                        !av && !bv
+                    } else {
+                        av == bv
+                            && ap.len() == bp.len()
+                            && ap.iter().zip(bp).all(|(a, b)| {
+                                Self::compatible_declaration(
+                                    &Self::unqualified(a),
+                                    &Self::unqualified(b),
+                                )
+                            })
+                    }
+            }
+            (a, b) => a == b,
+        }
+    }
+
+    fn composite(a: &Type, b: &Type) -> Type {
+        if a == b {
+            return a.clone();
+        }
+        match (a, b) {
+            (Type::Qualified(ai, aq), Type::Qualified(bi, _)) => {
+                Type::Qualified(Box::new(Self::composite(ai, bi)), *aq)
+            }
+            (Type::Array(ae, ac, astatic), Type::Array(be, bc, bstatic)) => Type::Array(
+                Box::new(Self::composite(ae, be)),
+                ac.or(*bc),
+                *astatic || *bstatic,
+            ),
+            (Type::Vla(ae, bound), Type::Vla(be, _)) => {
+                Type::Vla(Box::new(Self::composite(ae, be)), bound.clone())
+            }
+            (Type::Pointer(ai), Type::Pointer(bi)) => {
+                Type::Pointer(Box::new(Self::composite(ai, bi)))
+            }
+            (Type::Function(ar, ap, av, aproto), Type::Function(br, bp, bv, bproto)) => {
+                let ret = Self::composite(ar, br);
+                let params = if *aproto && *bproto {
+                    ap.iter()
+                        .zip(bp)
+                        .map(|(a, b)| Self::composite(a, b))
+                        .collect()
+                } else if *aproto {
+                    ap.clone()
+                } else if *bproto {
+                    bp.clone()
+                } else {
+                    Vec::new()
+                };
+                Type::Function(Box::new(ret), params, *av || *bv, *aproto || *bproto)
+            }
+            _ => a.clone(),
         }
     }
 

@@ -115,24 +115,22 @@ Complete for the current target and supported subset. The parser handles C99 dec
 
 Long-tail declaration coverage is tracked in Priority 9.
 
-### 2.2 Implement scopes, namespaces, linkage, and tags — in progress
+### 2.2 Implement scopes, namespaces, linkage, and tags — done for the supported subset
 
 Ordinary, tag, and member namespaces are separated. Typedef names and enumerators share ordinary-identifier behavior, including shadowing. File, block, function, and function-prototype scopes are tracked; tags declared in prototype parameter lists are hidden afterward and remain visible in definitions. Tag declarations resolve forward and completed types, with duplicate definitions diagnosed. File-scope linkage now distinguishes external and internal linkage, inherits internal linkage through compatible redeclarations, and diagnoses static/non-static conflicts. Compatible declarations merge, incompatible declarations are diagnosed, and function definitions are tracked separately from declarations.
 
 Remaining work:
 
-- Add label and `goto` namespaces when labels and `goto` are represented in the AST.
-- Complete composite-type computation for all compatible redeclarations.
+- Add label and `goto` namespaces when labels and `goto` are represented in the AST (tracked with the AST gaps in Priority 9).
 - Cover long-tail namespace diagnostics for conflicting ordinary identifiers.
 
-### 2.3 Implement all C99 types — in progress
+### 2.3 Implement all C99 types — done for the supported subset
 
-In progress for the current target and supported subset. `void`, `_Bool`, character and integer types, floating types, `_Complex`, arrays, functions, pointers, structures, unions, enumerations, qualified types, and bit-fields are modeled. `_Imaginary` is parsed and rejected with a diagnostic rather than silently accepted.
+Complete for the current target and supported subset. `void`, `_Bool`, character and integer types, floating types, `_Complex`, arrays, functions, pointers, structures, unions, enumerations, qualified types, and bit-fields are modeled. `_Imaginary` is parsed and rejected with a diagnostic rather than silently accepted.
 
-Remaining work:
+Incomplete object and function types are rejected except where declarations are explicitly allowed to refer to incomplete arrays or aggregate types. Compatible file-scope redeclarations merge using qualifier-aware composite types, including old-style/prototype function merges and tentative incomplete arrays completed to one element.
 
-- Complete incomplete-type handling and reject invalid object and function uses.
-- Complete compatibility and composite-type computation.
+`_Imaginary` remains intentionally rejected, and long-tail compatibility cases are tracked with the remaining type-system work in Priority 9.
 
 ### 2.4 Add target layout and representation — in progress
 

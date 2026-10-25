@@ -319,6 +319,35 @@ fn incompatible_redeclarations() {
 }
 
 #[test]
+fn object_declaration_compatibility() {
+    run_glibc_case("compatible-object-redeclarations.c", b"");
+    compile_ok("compatible-old-style-and-qualified.c");
+    compile_ok("extern-incomplete-objects.c");
+
+    for (file, expected) in [
+        ("conflicting-qualifiers.c", "conflicting types"),
+        ("conflicting-pointed-qualifiers.c", "conflicting types"),
+        ("conflicting-integer-types.c", "conflicting types"),
+        ("incomplete-file-object.c", "invalid file-scope object type"),
+        (
+            "sizeof-incomplete.c",
+            "sizeof requires a complete object type",
+        ),
+    ] {
+        let errors = compile_errors(file);
+        assert!(
+            errors.iter().any(|error| error.message.contains(expected)),
+            "missing {expected:?} in {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn tentative_incomplete_array_completion() {
+    run_glibc_case("tentative-incomplete-array.c", b"");
+}
+
+#[test]
 fn duplicate_definitions() {
     let errors = compile_errors("duplicate-function-definition.c");
     assert!(errors
