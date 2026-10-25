@@ -343,9 +343,17 @@ impl Parser {
                             )
                         })?;
                     }
+                    i32::try_from(next).map_err(|_| {
+                        Diagnostic::error(
+                            "enumerator value is not representable as int",
+                            Some(self.cur_span()),
+                        )
+                    })?;
                     self.bind_constant(n.clone(), next);
                     values.push((n, next));
-                    next += 1;
+                    next = next.checked_add(1).ok_or_else(|| {
+                        Diagnostic::error("enumerator value is out of range", Some(self.cur_span()))
+                    })?;
                     if !self.take(&TokenKind::Comma) {
                         break;
                     }
@@ -1941,7 +1949,24 @@ impl Parser {
                 } else if self.take(&TokenKind::Star) {
                     ArrayBound::Unspecified
                 } else if *self.cur() != TokenKind::RBracket {
-                    ArrayBound::Vla(Box::new(self.assign()?))
+                    let expression = self.assign()?;
+                    if let Some(value) = Self::integer_constant(&expression) {
+                        let size = usize::try_from(value).map_err(|_| {
+                            Diagnostic::error(
+                                "array bound must be a positive integer constant expression",
+                                Some(self.cur_span()),
+                            )
+                        })?;
+                        if size == 0 {
+                            return Err(Diagnostic::error(
+                                "array bound must be a positive integer constant expression",
+                                Some(self.cur_span()),
+                            ));
+                        }
+                        ArrayBound::Fixed(size)
+                    } else {
+                        ArrayBound::Vla(Box::new(expression))
+                    }
                 } else {
                     ArrayBound::Unspecified
                 };
@@ -2201,65 +2226,7 @@ impl Parser {
     }
 
     fn integer_constant(expr: &Expr) -> Option<i64> {
-        match expr {
-            Expr::Int(n) => Some(*n),
-            Expr::Char(c) => Some(*c as i64),
-            Expr::Cast(ty, x) => {
-                let value = Self::integer_constant(x)?;
-                let mut ty = ty;
-                while let Type::Qualified(inner, _) = ty {
-                    ty = inner;
-                }
-                Some(match ty {
-                    Type::Bool => i64::from(value != 0),
-                    Type::Char | Type::SignedChar => value as i8 as i64,
-                    Type::UnsignedChar => value as u8 as i64,
-                    Type::Short => value as i16 as i64,
-                    Type::UnsignedShort => value as u16 as i64,
-                    Type::Int | Type::SignedInt | Type::Enum(_, _) => value as i32 as i64,
-                    Type::UnsignedInt => value as u32 as i64,
-                    Type::Long | Type::LongLong | Type::Pointer(_) => value,
-                    Type::UnsignedLong | Type::UnsignedLongLong => value as u64 as i64,
-                    _ => value,
-                })
-            }
-            Expr::Unary(UnOp::Pos, x) => Self::integer_constant(x),
-            Expr::Unary(UnOp::Neg, x) => Self::integer_constant(x)?.checked_neg(),
-            Expr::Unary(UnOp::Not, x) => Some((Self::integer_constant(x)? == 0) as i64),
-            Expr::Unary(UnOp::BitNot, x) => Some(!Self::integer_constant(x)?),
-            Expr::Binary(op, a, b) => {
-                let (a, b) = (Self::integer_constant(a)?, Self::integer_constant(b)?);
-                match op {
-                    BinOp::Add => a.checked_add(b),
-                    BinOp::Sub => a.checked_sub(b),
-                    BinOp::Mul => a.checked_mul(b),
-                    BinOp::Div => a.checked_div(b),
-                    BinOp::Rem => a.checked_rem(b),
-                    BinOp::Shl => a.checked_shl(u32::try_from(b).ok()?),
-                    BinOp::Shr => a.checked_shr(u32::try_from(b).ok()?),
-                    BinOp::BitAnd => Some(a & b),
-                    BinOp::BitOr => Some(a | b),
-                    BinOp::BitXor => Some(a ^ b),
-                    BinOp::Eq => Some((a == b) as i64),
-                    BinOp::Ne => Some((a != b) as i64),
-                    BinOp::Lt => Some((a < b) as i64),
-                    BinOp::Le => Some((a <= b) as i64),
-                    BinOp::Gt => Some((a > b) as i64),
-                    BinOp::Ge => Some((a >= b) as i64),
-                    BinOp::And => Some((a != 0 && b != 0) as i64),
-                    BinOp::Or => Some((a != 0 || b != 0) as i64),
-                    BinOp::Comma => Some(b),
-                }
-            }
-            Expr::Conditional(condition, yes, no) => {
-                if Self::integer_constant(condition)? != 0 {
-                    Self::integer_constant(yes)
-                } else {
-                    Self::integer_constant(no)
-                }
-            }
-            _ => None,
-        }
+        crate::consteval::integer_constant(expr)
     }
 
     fn initializer(&mut self) -> Result<Initializer, Diagnostic> {

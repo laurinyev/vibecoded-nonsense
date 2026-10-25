@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod codegen;
+mod consteval;
 pub mod diag;
 pub mod layout;
 pub mod lex;

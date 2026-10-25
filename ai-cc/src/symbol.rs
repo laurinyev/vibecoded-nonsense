@@ -4,6 +4,7 @@ pub struct Symbol {
     pub name: String,
     pub ty: Type,
     pub is_register: bool,
+    pub has_static_storage_duration: bool,
 }
 #[derive(Clone, Debug)]
 pub struct SymbolError(pub String);

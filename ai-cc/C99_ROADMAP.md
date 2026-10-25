@@ -16,8 +16,8 @@ Section headings carry status labels: `— done` means complete for the current 
 - Roadmap item 1.3 is in progress: C99 keyword tokens, integer radix/suffix spelling recognition, decimal and hexadecimal floating-constant tokenization (including imaginary suffixes), ellipsis, all ordinary C punctuators (including `#`/`##`), and bracket/brace digraphs are covered. Integer type selection/ranges beyond the signed internal value, complete escape decoding, wide literals, multi-character constants, and precise malformed-number validation still need implementation.
 - Roadmap item 2.1 is complete for the current target and supported subset: C99 declaration specifiers, declarators, function pointers, adjusted-parameter metadata, and declaration diagnostics are implemented, with the declaration long-tail tracked in Priority 9.
 - Current compiler tests pass, but they cover only part of the language.
-- The compiler has partial global-object, floating-point, `_Complex`, and target ABI support, but no complete type checker or C99 preprocessor; `_Imaginary` is diagnosed as unsupported.
-- Existing behavior should be preserved only where it is covered by new conformance tests; several current tests encode stubs rather than C99 behavior.
+- The compiler implements a growing C99 frontend and preprocessing subset, plus partial global-object, floating-point, `_Complex`, and target ABI support; it does not claim full C99 conformance, and `_Imaginary` is diagnosed as unsupported.
+- Existing behavior should be preserved only where it is covered by conformance tests; several legacy compiler tests are syntax or smoke checks, not standards coverage.
 
 ## Priority 0 — Make the compiler safe and diagnostically trustworthy
 
@@ -161,7 +161,6 @@ Arithmetic assignment conversions, integer promotions, and usual arithmetic conv
 
 Remaining work:
 
-- Complete pointer conditional composite types and pointer casts/conversions.
 - Apply default argument promotions for unprototyped calls and variadic arguments.
 - Implement pointer subtraction and complete pointer arithmetic behavior.
 - Validate and lower every conversion consistently, including unsigned and floating edge cases.
@@ -169,12 +168,15 @@ Remaining work:
 
 ### 3.3 Implement constant expressions — in progress
 
-In progress for the current target and supported subset. Integer and floating constant expressions are evaluated for static initializers.
+One checked integer constant-expression evaluator is shared by parsing, semantic array designators, and static data lowering. It supports arithmetic, casts, comparisons, logical short-circuiting, conditional selection, and `sizeof` type names. It is used for enum values, positive fixed array bounds, bit-field widths, and array designators. Enum values outside `int` range and zero/negative constant bounds are rejected. Non-integer VLA bounds are diagnosed. Static initializer address checks distinguish static-duration objects from automatic objects, including remapping block-scope statics during lowering. The preprocessor retains its separate `#if` evaluator with short-circuiting.
 
 Remaining work:
 
-- Extend the evaluator to every required context, including enum values, array bounds, bit-field widths, case labels, and `#if`.
-- Diagnose invalid constant expressions and representability failures uniformly.
+- Make evaluation type-aware for unsigned constants, integer widths, and representability rather than using the current signed `i64` representation.
+- Implement `sizeof` constant evaluation for expression operands and tag references that require semantic type resolution.
+- Enforce positive runtime VLA bounds in generated code.
+- Add case labels and constant-expression checking after switch/case AST support exists (tracked in Priority 4.3).
+- Consider sharing evaluator logic with preprocessing `#if` while preserving its distinct integer model.
 
 ## Priority 4 — Complete expressions and statements
 

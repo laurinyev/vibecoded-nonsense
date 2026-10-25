@@ -149,7 +149,8 @@ impl Sema {
             }
             self.current_ret = Some(f.ret.clone());
             self.syms.enter_scope();
-            for (n, t) in &f.params {
+            for (n, t) in &mut f.params {
+                self.validate_array_bounds(t, f.span);
                 if matches!(Self::unqualified(t), Type::Void) {
                     self.errs.push(Diagnostic::error(
                         "function parameter cannot have void type",
@@ -178,6 +179,7 @@ impl Sema {
     }
 
     fn file_object(&mut self, declaration: &mut GlobalDecl) {
+        self.validate_array_bounds(&mut declaration.ty, declaration.span);
         let linkage = match declaration.storage {
             Some(StorageClass::Static) => Linkage::Internal,
             Some(StorageClass::Extern) => self
@@ -332,6 +334,7 @@ impl Sema {
                 name: name.to_string(),
                 ty: ty.clone(),
                 is_register: false,
+                has_static_storage_duration: true,
             }) {
                 self.errs.push(Diagnostic::error(error.0, Some(span)));
             }
@@ -349,6 +352,7 @@ impl Sema {
             name: n.to_string(),
             ty: t.clone(),
             is_register: false,
+            has_static_storage_duration: false,
         }) {
             self.errs.push(Diagnostic::error(e.0, Some(span)));
         }
@@ -373,10 +377,15 @@ impl Sema {
         match s {
             Stmt::StorageDecl(storage, declarations, _) => {
                 for (name, ty, init) in declarations {
+                    self.validate_array_bounds(ty, span);
                     let symbol = Symbol {
                         name: name.clone(),
                         ty: ty.clone(),
                         is_register: *storage == StorageClass::Register,
+                        has_static_storage_duration: matches!(
+                            storage,
+                            StorageClass::Static | StorageClass::Extern
+                        ),
                     };
                     if let Err(e) = self.syms.insert(symbol) {
                         self.errs.push(Diagnostic::error(e.0, Some(span)));
@@ -440,6 +449,7 @@ impl Sema {
             Stmt::Typedef(_, _, _) => {}
             Stmt::Typedefs(_, _) => {}
             Stmt::Decl(n, t, x, _) => {
+                self.validate_array_bounds(t, span);
                 self.add(n, t, span);
                 if let Some(initializer) = x {
                     self.check_initializer(t, initializer, span);
@@ -460,6 +470,7 @@ impl Sema {
             }
             Stmt::Decls(declarations, _) => {
                 for (n, t, x) in declarations {
+                    self.validate_array_bounds(t, span);
                     self.add(n, t, span);
                     if let Some(initializer) = x {
                         self.check_initializer(t, initializer, span);
@@ -844,11 +855,10 @@ impl Sema {
                 let no_ty = Self::decay(&self.expr(no, span));
                 if Self::arithmetic(&yes_ty) && Self::arithmetic(&no_ty) {
                     Self::usual_arithmetic_type(&yes_ty, &no_ty)
-                } else if Self::compatible(&yes_ty, &no_ty) {
-                    yes_ty
-                } else if Self::pointer_like(&yes_ty)
-                    && Self::integer(&no_ty)
-                    && self.is_null_pointer_constant(no, &no_ty)
+                } else if Self::compatible(&yes_ty, &no_ty)
+                    || (Self::pointer_like(&yes_ty)
+                        && Self::integer(&no_ty)
+                        && self.is_null_pointer_constant(no, &no_ty))
                 {
                     yes_ty
                 } else if Self::pointer_like(&no_ty)
@@ -954,6 +964,31 @@ impl Sema {
                 let mut cursor = InitCursor::new(items);
                 self.check_initializer_items(target, &mut cursor, span);
             }
+        }
+    }
+
+    fn validate_array_bounds(&mut self, ty: &mut Type, span: crate::diag::Span) {
+        match ty {
+            Type::Qualified(inner, _) | Type::Pointer(inner) | Type::Array(inner, _, _) => {
+                self.validate_array_bounds(inner, span)
+            }
+            Type::Vla(inner, bound) => {
+                let bound_ty = self.expr(bound, span);
+                self.require_integer(&bound_ty, "variable-length array bound", span);
+                self.validate_array_bounds(inner, span);
+            }
+            Type::Function(ret, params, _, _) => {
+                self.validate_array_bounds(ret, span);
+                for parameter in params {
+                    self.validate_array_bounds(parameter, span);
+                }
+            }
+            Type::Struct(_, fields) | Type::Union(_, fields) => {
+                for field in fields {
+                    self.validate_array_bounds(&mut field.ty, span);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1376,30 +1411,7 @@ impl Sema {
     }
 
     fn integer_constant(expr: &Expr) -> Option<i64> {
-        match expr {
-            Expr::Int(n) => Some(*n),
-            Expr::Char(c) => Some(*c as i64),
-            Expr::Cast(_, x) | Expr::Unary(UnOp::Pos, x) => Self::integer_constant(x),
-            Expr::Unary(UnOp::Neg, x) => Self::integer_constant(x)?.checked_neg(),
-            Expr::Unary(UnOp::BitNot, x) => Some(!Self::integer_constant(x)?),
-            Expr::Binary(op, a, b) => {
-                let (a, b) = (Self::integer_constant(a)?, Self::integer_constant(b)?);
-                match op {
-                    BinOp::Add => a.checked_add(b),
-                    BinOp::Sub => a.checked_sub(b),
-                    BinOp::Mul => a.checked_mul(b),
-                    BinOp::Div => a.checked_div(b),
-                    BinOp::Rem => a.checked_rem(b),
-                    BinOp::Shl => u32::try_from(b).ok().and_then(|b| a.checked_shl(b)),
-                    BinOp::Shr => u32::try_from(b).ok().and_then(|b| a.checked_shr(b)),
-                    BinOp::BitAnd => Some(a & b),
-                    BinOp::BitOr => Some(a | b),
-                    BinOp::BitXor => Some(a ^ b),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
+        crate::consteval::integer_constant(expr)
     }
 
     fn is_constant_initializer(&self, expr: &Expr) -> bool {
@@ -1426,11 +1438,15 @@ impl Sema {
                     && self.is_constant_initializer(no)
             }
             Expr::Unary(UnOp::Address, value) => {
-                // BUG: any address-of variable is treated as constant, including automatic objects.
-                matches!(&**value, Expr::Var(_))
-                    || matches!(&**value, Expr::CompoundLiteral(_, initializer) if self.constant_initializer_list(initializer))
+                matches!(&**value, Expr::Var(name) if self.syms.lookup(name).is_some_and(|symbol| {
+                    symbol.has_static_storage_duration
+                        || matches!(Self::unqualified(&symbol.ty), Type::Function(_, _, _, _))
+                })) || (self.current_ret.is_none()
+                    && matches!(&**value, Expr::CompoundLiteral(_, initializer) if self.constant_initializer_list(initializer)))
             }
-            Expr::CompoundLiteral(_, initializer) => self.constant_initializer_list(initializer),
+            Expr::CompoundLiteral(_, initializer) => {
+                self.current_ret.is_none() && self.constant_initializer_list(initializer)
+            }
             _ => false,
         }
     }

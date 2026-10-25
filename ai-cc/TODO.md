@@ -1,6 +1,6 @@
 # Code Markings
 
-17 active markings.
+16 active markings.
 
 ## TODO
 
@@ -12,16 +12,15 @@
 
 - `src/codegen.rs:243` — non-power-of-two sizes fall back to 8-byte stores; LoadZero has the same issue.
 - `src/layout.rs:44` — 16-byte long double is lowered and accessed as 8-byte QBE d.
-- `src/lower.rs:1656` — undeclared callee is assumed int(...) instead of being diagnosed.
-- `src/lower.rs:2002` — initializer errors are ignored, leaving the static object silently zeroed.
-- `src/parser.rs:2061` — cloning the LHS duplicates side effects in compound assignments.
-- `src/parser.rs:2454` — postfix increment is lowered as prefix and only works on bare identifiers.
+- `src/lower.rs:1711` — undeclared callee is assumed int(...) instead of being diagnosed.
+- `src/lower.rs:2060` — initializer errors are ignored, leaving the static object silently zeroed.
+- `src/parser.rs:2086` — cloning the LHS duplicates side effects in compound assignments.
+- `src/parser.rs:2421` — postfix increment is lowered as prefix and only works on bare identifiers.
 - `src/pp.rs:811` — wrong macro argument count silently leaves the invocation unexpanded.
 - `src/pp.rs:868` — malformed replacement tokenization is silently discarded.
-- `src/sema.rs:565` — integer literal suffixes are ignored; only the value range selects int versus long.
-- `src/sema.rs:570` — string literals have array type in C99, not char pointer.
-- `src/sema.rs:1075` — undesignated union initializer blindly selects field 0 and ignores extras.
-- `src/sema.rs:1400` — any address-of variable is treated as constant, including automatic objects.
+- `src/sema.rs:576` — integer literal suffixes are ignored; only the value range selects int versus long.
+- `src/sema.rs:581` — string literals have array type in C99, not char pointer.
+- `src/sema.rs:1140` — undesignated union initializer blindly selects field 0 and ignores extras.
 
 ## HACK
 
@@ -29,8 +28,8 @@ None.
 
 ## HACK HACK
 
-- `src/lib.rs:46` — hyphen heuristic for multiarch includes can select the wrong architecture.
-- `src/sema.rs:828` — undeclared callees are silently accepted as an implicit-int extension.
+- `src/lib.rs:47` — hyphen heuristic for multiarch includes can select the wrong architecture.
+- `src/sema.rs:842` — undeclared callees are silently accepted as an implicit-int extension.
 
 ## HACK HACK HACK
 

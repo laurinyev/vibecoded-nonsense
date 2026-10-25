@@ -2054,14 +2054,16 @@ impl Lowerer {
                                 format!("{}_{}_{}", self.function_name, name, self.statics.len());
                             if Self::is_complex(&ty) {
                                 let data_name = format!("static_{}", symbol);
+                                self.slots.insert(name.clone(), format!("${}", data_name));
                                 let mut data = Self::new_data_object(data_name.clone(), &ty, true);
                                 if let Some(initializer) = init {
                                     // BUG: initializer errors are ignored, leaving the static object silently zeroed.
                                     let _ = self.data_initialize(&mut data, 0, &ty, initializer);
                                 }
                                 self.aggregate_data.push(data);
-                                self.slots.insert(name.clone(), format!("${}", data_name));
                             } else {
+                                self.slots
+                                    .insert(name.clone(), format!("$static_{}", symbol));
                                 let value = init
                                     .as_ref()
                                     .and_then(|initializer| {
@@ -2069,8 +2071,6 @@ impl Lowerer {
                                     })
                                     .unwrap_or_else(|| Self::zero_data_value(&ty));
                                 self.statics.push((symbol.clone(), ty.clone(), value));
-                                self.slots
-                                    .insert(name.clone(), format!("$static_{}", symbol));
                             }
                         }
                         StorageClass::Extern => {
@@ -3065,7 +3065,13 @@ impl Lowerer {
                 Ok(DataValue::Address(name.clone()))
             }
             Expr::Unary(UnOp::Address, value) => match &**value {
-                Expr::Var(name) => Ok(DataValue::Address(name.clone())),
+                Expr::Var(name) => Ok(DataValue::Address(
+                    self.slots
+                        .get(name)
+                        .filter(|symbol| symbol.starts_with('$'))
+                        .cloned()
+                        .unwrap_or_else(|| name.clone()),
+                )),
                 Expr::CompoundLiteral(ty, initializer) => {
                     let name = format!("compound_literal_{}", self.aggregate_data.len());
                     let mut data = Self::new_data_object(name.clone(), ty, true);
@@ -3096,51 +3102,6 @@ impl Lowerer {
     }
 
     fn constant_value(expr: &Expr) -> Result<i64, ()> {
-        match expr {
-            Expr::Int(n) => Ok(*n),
-            Expr::Char(c) => Ok(*c as i64),
-            Expr::Cast(_, x) => match Self::constant_value(x) {
-                Ok(value) => Ok(value),
-                Err(()) => Self::constant_float_value(x)
-                    .map(|value| value as i64)
-                    .ok_or(()),
-            },
-            Expr::Unary(UnOp::Pos, x) => Self::constant_value(x),
-            Expr::Unary(UnOp::Not, x) => Ok((Self::constant_value(x)? == 0) as i64),
-            Expr::Unary(UnOp::Neg, x) => Self::constant_value(x)?.checked_neg().ok_or(()),
-            Expr::Unary(UnOp::BitNot, x) => Ok(!Self::constant_value(x)?),
-            Expr::Binary(op, a, b) => {
-                let (x, y) = (Self::constant_value(a)?, Self::constant_value(b)?);
-                match op {
-                    BinOp::Add => x.checked_add(y).ok_or(()),
-                    BinOp::Sub => x.checked_sub(y).ok_or(()),
-                    BinOp::Mul => x.checked_mul(y).ok_or(()),
-                    BinOp::Div => x.checked_div(y).ok_or(()),
-                    BinOp::Rem => x.checked_rem(y).ok_or(()),
-                    BinOp::BitOr => Ok(x | y),
-                    BinOp::BitXor => Ok(x ^ y),
-                    BinOp::BitAnd => Ok(x & y),
-                    BinOp::Shl => x.checked_shl(y as u32).ok_or(()),
-                    BinOp::Shr => x.checked_shr(y as u32).ok_or(()),
-                    BinOp::Eq => Ok((x == y) as i64),
-                    BinOp::Ne => Ok((x != y) as i64),
-                    BinOp::Lt => Ok((x < y) as i64),
-                    BinOp::Le => Ok((x <= y) as i64),
-                    BinOp::Gt => Ok((x > y) as i64),
-                    BinOp::Ge => Ok((x >= y) as i64),
-                    BinOp::And => Ok((x != 0 && y != 0) as i64),
-                    BinOp::Or => Ok((x != 0 || y != 0) as i64),
-                    _ => Err(()),
-                }
-            }
-            Expr::Conditional(condition, yes, no) => {
-                if Self::constant_value(condition)? != 0 {
-                    Self::constant_value(yes)
-                } else {
-                    Self::constant_value(no)
-                }
-            }
-            _ => Err(()),
-        }
+        crate::consteval::integer_constant(expr).ok_or(())
     }
 }
