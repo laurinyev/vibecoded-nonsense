@@ -145,14 +145,15 @@ Remaining work:
 
 ## Priority 3 — Implement semantic analysis and conversions
 
-### 3.1 Implement lvalue and modifiability rules
+### 3.1 Implement lvalue and modifiability rules — in progress
 
-- Validate assignment targets.
-- Reject assignments to const-qualified objects.
-- Validate address-of and dereference operands.
-- Validate increment/decrement operands.
-- Validate member and arrow operands and member names.
-- Validate array subscripting operands.
+Assignments require modifiable lvalues; const-qualified objects, aggregates containing const-qualified subobjects, and incomplete objects are rejected. Member access inherits qualifiers from its containing aggregate. Address-of rejects non-lvalues, register objects, and bit-fields; dereference, member access, and array subscripting have basic operand checks.
+
+Remaining work:
+
+- Represent and validate increment/decrement without losing postfix value semantics.
+- Complete member/subscript constraints, including pointer-to-incomplete element types.
+- Expand source-spanned constraint coverage for every lvalue context.
 
 ### 3.2 Implement C99 conversions
 

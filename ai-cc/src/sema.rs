@@ -853,9 +853,9 @@ impl Sema {
             }
             Expr::Member(base, name, arrow) => {
                 let base_ty = self.expr(base, span);
-                let aggregate = if *arrow {
+                let member_base = if *arrow {
                     match Self::unqualified(&base_ty) {
-                        Type::Pointer(inner) => self.resolve_tag(&Self::unqualified(&inner)),
+                        Type::Pointer(inner) => *inner,
                         _ => {
                             self.errs.push(Diagnostic::error(
                                 "arrow operand must be a pointer to a structure or union",
@@ -865,13 +865,16 @@ impl Sema {
                         }
                     }
                 } else {
-                    self.resolve_tag(&Self::unqualified(&base_ty))
+                    base_ty
                 };
+                let aggregate = self.resolve_tag(&Self::unqualified(&member_base));
                 match aggregate {
                     Type::Struct(_, fields) | Type::Union(_, fields) => fields
                         .iter()
                         .find(|field| field.name.as_deref() == Some(name))
-                        .map(|field| field.ty.clone())
+                        .map(|field| {
+                            Self::qualify_type(field.ty.clone(), Self::top_qualifiers(&member_base))
+                        })
                         .unwrap_or_else(|| {
                             self.errs.push(Diagnostic::error(
                                 format!("no member named {}", name),
@@ -1477,7 +1480,9 @@ impl Sema {
         !matches!(
             Self::unqualified(&ty),
             Type::Array(_, _, _) | Type::Vla(_, _) | Type::Function(_, _, _, _) | Type::Void
-        ) && !Self::top_const(&ty)
+        ) && self.valid_object_type(&ty)
+            && !Self::top_const(&ty)
+            && !self.contains_const_member(&ty)
     }
 
     fn finish_call(
@@ -1601,7 +1606,7 @@ impl Sema {
             }
             Expr::Member(base, name, arrow) => {
                 let ty = self.expr_type(base);
-                let ty = if *arrow {
+                let member_base = if *arrow {
                     match Self::unqualified(&ty) {
                         Type::Pointer(inner) => *inner,
                         _ => Type::Int,
@@ -1609,12 +1614,13 @@ impl Sema {
                 } else {
                     ty
                 };
-                let ty = self.resolve_tag(&Self::unqualified(&ty));
-                match ty {
+                let aggregate = self.resolve_tag(&Self::unqualified(&member_base));
+                let qualifiers = Self::top_qualifiers(&member_base);
+                match aggregate {
                     Type::Struct(_, fields) | Type::Union(_, fields) => fields
                         .into_iter()
                         .find(|field| field.name.as_deref() == Some(name))
-                        .map(|field| field.ty)
+                        .map(|field| Self::qualify_type(field.ty, qualifiers))
                         .unwrap_or(Type::Int),
                     _ => Type::Int,
                 }
@@ -1800,6 +1806,60 @@ impl Sema {
         match t {
             Type::Qualified(_, q) => q.is_const,
             _ => false,
+        }
+    }
+
+    fn top_qualifiers(t: &Type) -> Qualifiers {
+        let mut ty = t;
+        let mut qualifiers = Qualifiers::default();
+        while let Type::Qualified(inner, q) = ty {
+            qualifiers.is_const |= q.is_const;
+            qualifiers.is_volatile |= q.is_volatile;
+            qualifiers.is_restrict |= q.is_restrict;
+            qualifiers.is_static |= q.is_static;
+            ty = inner;
+        }
+        qualifiers
+    }
+
+    fn qualify_type(ty: Type, qualifiers: Qualifiers) -> Type {
+        if qualifiers == Qualifiers::default() {
+            return ty;
+        }
+        match ty {
+            Type::Array(element, count, is_static) => Type::Array(
+                Box::new(Self::qualify_type(*element, qualifiers)),
+                count,
+                is_static,
+            ),
+            Type::Vla(element, bound) => {
+                Type::Vla(Box::new(Self::qualify_type(*element, qualifiers)), bound)
+            }
+            Type::Qualified(inner, mut existing) => {
+                existing.is_const |= qualifiers.is_const;
+                existing.is_volatile |= qualifiers.is_volatile;
+                existing.is_restrict |= qualifiers.is_restrict;
+                existing.is_static |= qualifiers.is_static;
+                Type::Qualified(inner, existing)
+            }
+            other => Type::Qualified(Box::new(other), qualifiers),
+        }
+    }
+
+    fn contains_const_member(&self, ty: &Type) -> bool {
+        if Self::top_const(ty) {
+            return true;
+        }
+        match ty {
+            Type::Qualified(inner, _) | Type::Array(inner, _, _) | Type::Vla(inner, _) => {
+                self.contains_const_member(inner)
+            }
+            _ => match self.resolve_tag(&Self::unqualified(ty)) {
+                Type::Struct(_, fields) | Type::Union(_, fields) => fields
+                    .iter()
+                    .any(|field| self.contains_const_member(&field.ty)),
+                _ => false,
+            },
         }
     }
 
