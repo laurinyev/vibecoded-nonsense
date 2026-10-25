@@ -102,6 +102,11 @@ fn nonempty_lines(text: &str) -> String {
         .join("\n")
 }
 
+fn case(file: &str) -> (String, PathBuf) {
+    let path = root().join("tests/conformance/cases").join(file);
+    (fs::read_to_string(&path).unwrap(), path)
+}
+
 #[test]
 fn accepted_fixtures() {
     for path in fixtures("valid") {
@@ -162,32 +167,9 @@ fn preprocessor_reference() {
 
 #[test]
 fn macro_expansion() {
-    let source = r#"
-#define VALUE 4
-#define ADD(a, b) ((a) + (b))
-#define STR(x) #x
-#define CAT(a, b) a ## b
-#define JOIN(first, ...) first __VA_ARGS__
-#define LEFT RIGHT
-#define RIGHT LEFT
-ADD(VALUE, 3)
-STR(VALUE)
-CAT(ma, in)
-JOIN(1, 2, 3)
-LEFT
-#if defined(VALUE) && (2 + 3 * 4 == 14)
-selected
-#else
-not_selected
-#endif
-#undef VALUE
-#ifdef VALUE
-wrong
-#else
-undefined
-#endif
-"#;
-    let output = ai_cc::preprocess(source, "macros.c").unwrap();
+    let (source, path) = case("macro-expansion.c");
+    let output = ai_cc::preprocess(&source, path.to_str().unwrap()).unwrap();
+
     let lines = nonempty_lines(&output);
     assert!(lines.contains("((4) + (3))"), "{lines}");
     assert!(lines.contains("\"VALUE\""), "{lines}");
@@ -206,8 +188,8 @@ fn include_and_line() {
     let output = ai_cc::preprocess(&source, path.to_str().unwrap()).unwrap();
     assert!(nonempty_lines(&output).contains("9"));
 
-    let output =
-        ai_cc::preprocess("#line 100 \"logical.c\"\n__LINE__ __FILE__\n", "physical.c").unwrap();
+    let (line_source, line_path) = case("line-directive.c");
+    let output = ai_cc::preprocess(&line_source, line_path.to_str().unwrap()).unwrap();
     assert!(
         nonempty_lines(&output).contains("100 \"logical.c\""),
         "{output}"
@@ -216,7 +198,8 @@ fn include_and_line() {
 
 #[test]
 fn macro_redefinition() {
-    let errors = ai_cc::preprocess("#define VALUE 1\n#define VALUE 2\n", "macros.c").unwrap_err();
+    let (source, path) = case("macro-redefinition.c");
+    let errors = ai_cc::preprocess(&source, path.to_str().unwrap()).unwrap_err();
     assert!(errors
         .iter()
         .any(|error| error.message.contains("incompatible redefinition")));
@@ -224,20 +207,21 @@ fn macro_redefinition() {
 
 #[test]
 fn translation_phases() {
-    let trigraph = "??=define ANSWER 7\nANSWER\n";
-    let output = ai_cc::preprocess(trigraph, "trigraph.c").unwrap();
+    let (trigraph, trigraph_path) = case("trigraph.c");
+    let output = ai_cc::preprocess(&trigraph, trigraph_path.to_str().unwrap()).unwrap();
     assert_eq!(nonempty_lines(&output), "7");
 
-    let spliced = "#define ANSWER 1\\\n2\nint main(void){return ANSWER;}\n";
-    ai_cc::compile(spliced, "spliced.c").unwrap();
+    let (spliced, spliced_path) = case("spliced.c");
+    ai_cc::compile(&spliced, spliced_path.to_str().unwrap()).unwrap();
 
-    let comments = "int/* comment\n */main(void){return 0;}\n";
-    ai_cc::compile(comments, "comments.c").unwrap();
+    let (comments, comments_path) = case("comments.c");
+    ai_cc::compile(&comments, comments_path.to_str().unwrap()).unwrap();
 
-    let ucn = r"int main(void){ int \u0061 = 3; return \u0061; }";
-    ai_cc::compile(ucn, "ucn.c").unwrap();
+    let (ucn, ucn_path) = case("ucn.c");
+    ai_cc::compile(&ucn, ucn_path.to_str().unwrap()).unwrap();
 
-    let tokens = ai_cc::pp::tokenize_preprocessing("int \\u0061 -> 1\n").unwrap();
+    let (tokens_source, _) = case("preprocessing-tokens.txt");
+    let tokens = ai_cc::pp::tokenize_preprocessing(&tokens_source).unwrap();
     assert!(matches!(
         tokens[0].kind,
         ai_cc::pp::PreprocessingTokenKind::Identifier(ref value) if value == "int"
@@ -251,15 +235,17 @@ fn translation_phases() {
         ai_cc::pp::PreprocessingTokenKind::Punctuator(ref value) if value == "->"
     ));
 
+    let (normalize_source, _) = case("normalize-source.txt");
     assert_eq!(
-        ai_cc::pp::normalize_source("a\r\nb\rc").unwrap(),
+        ai_cc::pp::normalize_source(&normalize_source).unwrap(),
         "a\nb\nc\n"
     );
 }
 
 #[test]
 fn unterminated_comment() {
-    let errors = ai_cc::compile("int main(void){return 0;} /*", "comment.c").unwrap_err();
+    let (source, path) = case("unterminated-comment.c");
+    let errors = ai_cc::compile(&source, path.to_str().unwrap()).unwrap_err();
     assert!(errors
         .iter()
         .any(|error| error.message.contains("unterminated comment")));
@@ -312,15 +298,16 @@ fn string_arrays() {
 
 #[test]
 fn compound_literal_errors() {
-    for source in [
-        "int main(void) { return (int[2]){ [2] = 1 }[0]; }",
-        "struct S { int value; }; int main(void) { return (struct S){ .missing = 1 }.value; }",
-        "int main(void) { return (int){ 1, 2 }; }",
-        "union U { int value; char byte; }; int main(void) { return (union U){ 1, 2 }.value; }",
+    for file in [
+        "compound-literal-array-bound.c",
+        "compound-literal-missing-member.c",
+        "compound-literal-excess-list.c",
+        "compound-literal-union-list.c",
     ] {
+        let (source, path) = case(file);
         assert!(
-            ai_cc::compile(source, "compound-literal-invalid.c").is_err(),
-            "accepted: {source}"
+            ai_cc::compile(&source, path.to_str().unwrap()).is_err(),
+            "accepted: {file}"
         );
     }
 }
@@ -357,19 +344,22 @@ fn file_scope_objects() {
 
 #[test]
 fn file_scope_errors() {
-    let errors = ai_cc::compile("int source; int copy = source;", "global-init.c").unwrap_err();
+    let (source, path) = case("global-init.c");
+    let errors = ai_cc::compile(&source, path.to_str().unwrap()).unwrap_err();
     assert!(errors.iter().any(|error| error
         .message
         .contains("not a supported constant expression")));
     assert!(errors.iter().all(|error| error.span.is_some()));
 
-    let ir = ai_cc::compile("int values[3];", "global-array.c").unwrap();
+    let (source, path) = case("global-array.c");
+    let ir = ai_cc::compile(&source, path.to_str().unwrap()).unwrap();
     assert!(
         ir.contains("export data $values = align 4 { z 12 }"),
         "{ir}"
     );
 
-    let errors = ai_cc::compile("auto int value;", "global-auto.c").unwrap_err();
+    let (source, path) = case("global-auto.c");
+    let errors = ai_cc::compile(&source, path.to_str().unwrap()).unwrap_err();
     assert!(errors
         .iter()
         .any(|error| error.message.contains("auto is not allowed at file scope")));

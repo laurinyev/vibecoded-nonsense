@@ -1,0 +1,1 @@
+int old(); int old_identifier(a, b); int fixed(void); int format(register int level, ...); int (*legacy_callback)(); int (*identifier_callback)(a, b); int (*var_callback)(int, ...); int main(void) { format(1, 2, 3); return 0; }

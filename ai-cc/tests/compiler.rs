@@ -3,7 +3,7 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 fn case(file: &str) -> (String, PathBuf) {
-    let path = root().join("tests/cases").join(file);
+    let path = root().join("tests/compiler").join(file);
     (fs::read_to_string(&path).unwrap(), path)
 }
 fn compile_ok(file: &str) {
@@ -13,6 +13,10 @@ fn compile_ok(file: &str) {
 fn compile_errors(file: &str) -> Vec<ai_cc::diag::Diagnostic> {
     let (source, path) = case(file);
     ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap_err()
+}
+fn compile_ir(file: &str) -> String {
+    let (source, path) = case(file);
+    ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap()
 }
 fn qbe() -> PathBuf {
     env::var_os("QBE")
@@ -26,7 +30,7 @@ fn run_glibc_case(file: &str, expected: &[u8]) {
         file.replace('.', "-")
     ));
     fs::create_dir_all(&dir).unwrap();
-    let path = root().join("tests/cases").join(file);
+    let path = root().join("tests/compiler").join(file);
     let source = fs::read_to_string(&path).unwrap();
     let ir = ai_cc::compile(&source, path.to_str().unwrap()).unwrap();
     let ir_path = dir.join("program.ssa");
@@ -87,7 +91,7 @@ fn glibc_output_interop() {
 #[test]
 fn unknown_identifier() {
     let file = "unknown_identifier.c";
-    let path = root().join("tests/cases").join(file);
+    let path = root().join("tests/compiler").join(file);
     let source = fs::read_to_string(&path).unwrap();
     let errors = ai_cc::compile(&source, path.to_str().unwrap()).unwrap_err();
     assert!(!errors.is_empty());
@@ -96,7 +100,7 @@ fn unknown_identifier() {
 #[test]
 fn bad_syntax() {
     let file = "bad_syntax.c";
-    let path = root().join("tests/cases").join(file);
+    let path = root().join("tests/compiler").join(file);
     let source = fs::read_to_string(&path).unwrap();
     let errors = ai_cc::compile(&source, path.to_str().unwrap()).unwrap_err();
     assert!(!errors.is_empty());
@@ -147,14 +151,13 @@ fn c99_lexing() {
 
 #[test]
 fn integer_specifier_order() {
-    let source = "int main(void) { unsigned long a = 1; long unsigned b = 2; int long unsigned c = 3; signed short int d = 4; short signed e = 5; char unsigned f = 6; signed char g = 7; long double h; return a + b + c + d + e + f + g; }";
-    ai_cc::compile_preprocessed(source, "declaration-specifiers.c").unwrap();
+    compile_ok("declaration-specifiers.c");
 }
 
 #[test]
 fn local_declarators() {
-    let source = "int main(void) { int a = 2, b = a + 3, *p, (*row)[3]; const int c = 4; int const d = 5; int * const cp = &b; p = &b; return *p + c + d; }";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, path) = case("multiple-declarators.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
     let ai_cc::ast::Stmt::Decls(declarations, _) = &ast.items[0].body.stmts[0] else {
@@ -199,27 +202,26 @@ fn local_declarators() {
             }
         )
     );
-    ai_cc::compile_preprocessed(source, "multiple-declarators.c").unwrap();
+    ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap();
 }
 
 #[test]
 fn prototype_params() {
-    let source = "int add(int left, int right); int main(void) { return add(2, 3); }";
-    ai_cc::compile_preprocessed(source, "function-prototype.c").unwrap();
+    compile_ok("function-prototype.c");
 }
 
 #[test]
 fn abstract_params() {
-    let source = "int consume(int *); int main(void) { return 0; }";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, _) = case("function-prototype-abstract.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     assert!(parser.parse_translation_unit().is_ok());
 }
 
 #[test]
 fn nested_declarators() {
-    let source = "int (*factory(void))(int); int (*factory2(int, int))(int); int (*array_factory(void))[4]; int apply(int (*callback)(int), int value); int invoke(int callback(int)); int consume(int matrix[static const 2][3], int *, int (*)(int)); int (*table[3])(int); int main(void) { return 0; }";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, _) = case("nested-function-declarators.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
     assert_eq!(ast.items[0].name, "factory");
@@ -246,8 +248,8 @@ fn nested_declarators() {
 
 #[test]
 fn variadic_declarators() {
-    let source = "int old(); int old_identifier(a, b); int fixed(void); int format(register int level, ...); int (*legacy_callback)(); int (*identifier_callback)(a, b); int (*var_callback)(int, ...); int main(void) { format(1, 2, 3); return 0; }";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, path) = case("function-forms.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
     assert!(ast.items[0].params_unspecified);
@@ -269,33 +271,24 @@ fn variadic_declarators() {
         ai_cc::ast::Type::Pointer(ref inner)
             if matches!(**inner, ai_cc::ast::Type::Function(_, _, true, true))
     ));
-    ai_cc::compile_preprocessed(source, "function-forms.c").unwrap();
+    ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap();
 
-    let errors =
-        ai_cc::compile_preprocessed("int invalid(...);", "invalid-variadic.c").unwrap_err();
+    let errors = compile_errors("invalid-variadic.c");
     assert!(!errors.is_empty());
 
-    let errors = ai_cc::compile_preprocessed(
-        "int format(int level, ...); int main(void) { return format(); }",
-        "too-few-variadic-arguments.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("too-few-variadic-arguments.c");
     assert!(errors
         .iter()
         .any(|error| error.message.contains("expects 1 argument(s), got 0")));
 
-    let ir = ai_cc::compile_preprocessed(
-        "int supported(int first, ...) { return first; }",
-        "variadic-definition.c",
-    )
-    .unwrap();
+    let ir = compile_ir("variadic-definition.c");
     assert!(ir.contains("..."), "{ir}");
 }
 
 #[test]
 fn multi_declarators() {
-    let source = "int first(int value), second(int value); int old(first, second), fixed(void); int main(void) { return 0; }";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, path) = case("multiple-function-declarators.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
     assert_eq!(ast.items[0].name, "first");
@@ -304,28 +297,22 @@ fn multi_declarators() {
     assert!(ast.items[2].params_unspecified);
     assert_eq!(ast.items[3].name, "fixed");
     assert!(!ast.items[3].params_unspecified);
-    ai_cc::compile_preprocessed(source, "multiple-function-declarators.c").unwrap();
+    ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap();
 }
 
 #[test]
 fn declaration_merge() {
-    let source = "int add(int left, int right); int add(int left, int right) { return left + right; } int main(void) { return add(1, 2) - 3; }";
-    ai_cc::compile_preprocessed(source, "function-declaration-definition.c").unwrap();
+    compile_ok("function-declaration-definition.c");
 }
 
 #[test]
 fn compatible_redeclarations() {
-    let source = "int value(void); int value(void); int value(void) { return 0; } int main(void) { return value(); }";
-    ai_cc::compile_preprocessed(source, "repeated-function-declaration.c").unwrap();
+    compile_ok("repeated-function-declaration.c");
 }
 
 #[test]
 fn incompatible_redeclarations() {
-    let errors = ai_cc::compile_preprocessed(
-        "int value(void); long value(int); int main(void) { return 0; }",
-        "incompatible-function-redeclaration.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("incompatible-function-redeclaration.c");
     assert!(errors
         .iter()
         .any(|error| error.message.contains("conflicting types for value")));
@@ -333,11 +320,7 @@ fn incompatible_redeclarations() {
 
 #[test]
 fn duplicate_definitions() {
-    let errors = ai_cc::compile_preprocessed(
-        "int value(void) { return 1; } int value(void) { return 2; } int main(void) { return value(); }",
-        "duplicate-function-definition.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("duplicate-function-definition.c");
     assert!(errors
         .iter()
         .any(|error| error.message.contains("redefinition of value")));
@@ -345,24 +328,20 @@ fn duplicate_definitions() {
 
 #[test]
 fn old_style_params() {
-    let source = "int subtract(left, right) int left; char right; { return left - right; } int main(void) { return subtract(9, 4) - 5; }";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, path) = case("old-style-definition.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
     assert_eq!(ast.items[0].params[0].0, "left");
     assert_eq!(ast.items[0].params[0].1, ai_cc::ast::Type::Int);
     assert_eq!(ast.items[0].params[1].0, "right");
     assert_eq!(ast.items[0].params[1].1, ai_cc::ast::Type::Char);
-    ai_cc::compile_preprocessed(source, "old-style-definition.c").unwrap();
+    ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap();
 }
 
 #[test]
 fn old_style_missing_params() {
-    let errors = ai_cc::compile_preprocessed(
-        "int add(left, right) int left; { return left + right; }",
-        "old-style-missing-parameter.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("old-style-missing-parameter.c");
     assert!(errors
         .iter()
         .any(|error| error.message.contains("parameter right has no declaration")));
@@ -370,17 +349,12 @@ fn old_style_missing_params() {
 
 #[test]
 fn parameter_errors() {
-    let errors = ai_cc::compile_preprocessed(
-        "int missing_name(int) { return 0; }",
-        "unnamed-definition-parameter.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("unnamed-definition-parameter.c");
     assert!(errors.iter().any(|error| error
         .message
         .contains("function definition parameters must be named")));
 
-    let errors =
-        ai_cc::compile_preprocessed("int invalid(void value);", "void-parameter.c").unwrap_err();
+    let errors = compile_errors("void-parameter.c");
     assert!(
         errors.iter().any(|error| error
             .message
@@ -391,8 +365,8 @@ fn parameter_errors() {
 
 #[test]
 fn array_param_declarators() {
-    let source = "int consume(int values[const static 8]); int main(void) { int n = 3; int data[n]; return 0; }";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, _) = case("array-parameter-declarators.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
     assert_eq!(
@@ -418,8 +392,8 @@ fn array_param_declarators() {
 
 #[test]
 fn function_pointer_declarators() {
-    let source = "int main(void) { int (*callback)(int); return 0; }";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, path) = case("function-pointer.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
     let ai_cc::ast::Stmt::Decl(_, ty, _, _) = &ast.items[0].body.stmts[0] else {
@@ -434,15 +408,14 @@ fn function_pointer_declarators() {
             true
         )))
     );
-    ai_cc::compile_preprocessed(source, "function-pointer.c").unwrap();
+    ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap();
 }
 
 #[test]
 fn float_literals() {
     use ai_cc::lex::TokenKind as K;
-    let tokens = ai_cc::lex::Lexer::new("1.25 1e-3F 0x1.fp+2L")
-        .tokenize_all()
-        .unwrap();
+    let (source, _) = case("float-literals.txt");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     assert!(matches!(tokens[0].kind, K::FloatConstant(_)));
     assert!(matches!(tokens[1].kind, K::FloatConstant(_)));
     assert!(matches!(tokens[2].kind, K::FloatConstant(_)));
@@ -450,22 +423,21 @@ fn float_literals() {
 
 #[test]
 fn block_typedef_scope() {
-    let source = "int main(void) { typedef unsigned long word; word value = 3; return value; }";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, path) = case("block-typedef.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
     assert!(matches!(
         ast.items[0].body.stmts[0],
         ai_cc::ast::Stmt::Typedef(..)
     ));
-    ai_cc::compile_preprocessed(source, "block-typedef.c").unwrap();
+    ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap();
 }
 
 #[test]
 fn local_typedefs() {
-    let source =
-        "int main(void) { typedef int *intptr, row[4]; intptr p; row values; p = 0; return 0; }";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, _) = case("local-typedefs.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
     assert!(matches!(
@@ -476,19 +448,14 @@ fn local_typedefs() {
 
 #[test]
 fn typedef_shadowing() {
-    let source =
-        "typedef int T; int main(void) { { int T = 2; T = 3; } T value = 4; return value; }";
-    ai_cc::compile_preprocessed(source, "typedef-shadow.c").unwrap();
+    compile_ok("typedef-shadow.c");
 }
 
 #[test]
 fn c99_tokens() {
     use ai_cc::lex::TokenKind as K;
-    let tokens = ai_cc::lex::Lexer::new(
-        "auto case default extern goto register switch inline _Complex _Imaginary ... 077 0xffU 42LL size_t int32_t",
-    )
-    .tokenize_all()
-    .unwrap();
+    let (source, _) = case("c99-tokens.txt");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let kinds: Vec<_> = tokens.iter().map(|token| &token.kind).collect();
     assert!(matches!(kinds[0], K::Auto));
     assert!(matches!(kinds[1], K::Case));
@@ -537,12 +504,10 @@ fn conditional_inclusion() {
 
 #[test]
 fn hosted_macros() {
+    let (source, _) = case("hosted-macro.txt");
+    assert_eq!(ai_cc::preprocess(&source, "hosted.c").unwrap(), "1\n");
     assert_eq!(
-        ai_cc::preprocess("__STDC_HOSTED__", "hosted.c").unwrap(),
-        "1\n"
-    );
-    assert_eq!(
-        ai_cc::preprocess_with_hosted("__STDC_HOSTED__", "freestanding.c", false).unwrap(),
+        ai_cc::preprocess_with_hosted(&source, "freestanding.c", false).unwrap(),
         "0\n"
     );
 }
@@ -569,33 +534,17 @@ fn invalid_objects() {
     );
 }
 
-fn inline_errors(source: &str) -> Vec<ai_cc::diag::Diagnostic> {
-    ai_cc::compile_preprocessed(source, "inline.c").unwrap_err()
-}
-
 #[test]
 fn diagnostic_spans() {
     let cases = [
-        (
-            "int main(void){ const int x = 1; x = 2; return 0; }",
-            "modifiable lvalue",
-        ),
-        (
-            "int f(int x){ return x; } int main(void){ return f(); }",
-            "expects 1 argument",
-        ),
-        ("int main(void){ int x; return *x; }", "dereference operand"),
-        (
-            "int main(void){ int *x; return x; }",
-            "return value is incompatible",
-        ),
-        (
-            "struct Pair { int value; }; int main(void){ struct Pair p; return p.missing; }",
-            "no member named missing",
-        ),
+        ("diagnostic-modifiable-lvalue.c", "modifiable lvalue"),
+        ("diagnostic-argument-count.c", "expects 1 argument"),
+        ("diagnostic-dereference.c", "dereference operand"),
+        ("diagnostic-return-type.c", "return value is incompatible"),
+        ("diagnostic-missing-member.c", "no member named missing"),
     ];
-    for (source, expected) in cases {
-        let errors = inline_errors(source);
+    for (file, expected) in cases {
+        let errors = compile_errors(file);
         assert!(
             errors.iter().any(|e| e.message.contains(expected)),
             "missing {expected:?} in {errors:?}"
@@ -609,9 +558,8 @@ fn diagnostic_spans() {
 
 #[test]
 fn integer_overflow() {
-    let errors = ai_cc::lex::Lexer::new("999999999999999999999999")
-        .tokenize_all()
-        .unwrap_err();
+    let (source, _) = case("integer-overflow.txt");
+    let errors = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap_err();
     assert!(errors
         .iter()
         .any(|e| e.message.contains("integer constant is out of range")));
@@ -620,14 +568,15 @@ fn integer_overflow() {
 
 #[test]
 fn malformed_eof() {
-    let errors = inline_errors("int main(");
+    let errors = compile_errors("malformed-eof.c");
     assert!(!errors.is_empty());
     assert!(errors.iter().all(|e| e.span.is_some()));
 }
 
 #[test]
 fn malformed_conditionals() {
-    let errors = ai_cc::preprocess("#else\n#if 1\nint x;\n", "directives.c").unwrap_err();
+    let (source, path) = case("malformed-conditionals.c");
+    let errors = ai_cc::preprocess(&source, path.to_str().unwrap()).unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("#else without")));
     assert!(errors
         .iter()
@@ -637,7 +586,8 @@ fn malformed_conditionals() {
 
 #[test]
 fn error_directive() {
-    let errors = ai_cc::preprocess("#error stop here\n", "directives.c").unwrap_err();
+    let (source, path) = case("error-directive.c");
+    let errors = ai_cc::preprocess(&source, path.to_str().unwrap()).unwrap_err();
     assert!(errors.iter().any(|e| e.message.contains("#error")));
     assert!(errors.iter().all(|e| e.span.is_some()));
 }
@@ -717,9 +667,7 @@ fn sizeof_type() {
 
 #[test]
 fn casts_and_sizeof() {
-    let source =
-        "int main(void) { long value = (long)3; return (int)(sizeof(long) + sizeof value); }";
-    ai_cc::compile_preprocessed(source, "cast-sizeof-type-name.c").unwrap();
+    compile_ok("cast-sizeof-type-name.c");
 }
 
 #[test]
@@ -729,11 +677,7 @@ fn static_locals() {
 
 #[test]
 fn extern_local() {
-    let ir = ai_cc::compile_preprocessed(
-        "int main(void) { extern int shared; return shared; }",
-        "extern-local.c",
-    )
-    .unwrap();
+    let ir = compile_ir("extern-local.c");
     assert!(
         ir.contains("loadw $shared"),
         "expected external data reference: {ir}"
@@ -742,21 +686,13 @@ fn extern_local() {
 
 #[test]
 fn register_address() {
-    let errors = ai_cc::compile_preprocessed(
-        "int main(void) { register int value = 1; return (int)&value; }",
-        "register-address.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("register-address.c");
     assert!(errors.iter().any(|e| e.message.contains("register object")));
 }
 
 #[test]
 fn duplicate_storage() {
-    let errors = ai_cc::compile_preprocessed(
-        "int main(void) { static extern int value; return value; }",
-        "duplicate-storage-class.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("duplicate-storage-class.c");
     assert!(errors
         .iter()
         .any(|e| e.message.contains("multiple storage-class")));
@@ -764,33 +700,27 @@ fn duplicate_storage() {
 
 #[test]
 fn inline_linkage() {
-    let source =
-        "static inline int helper(void) { return 4; } int main(void) { return helper() - 4; }";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, path) = case("static-inline-function.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
     assert!(ast.items[0].is_static && ast.items[0].is_inline);
-    let ir = ai_cc::compile_preprocessed(source, "static-inline-function.c").unwrap();
+    let ir = ai_cc::compile_preprocessed(&source, path.to_str().unwrap()).unwrap();
     assert!(ir.contains("function w $helper"));
     assert!(!ir.contains("export function w $helper"));
 }
 
 #[test]
 fn function_constraints() {
-    let errors =
-        ai_cc::compile_preprocessed("int f(int values[static]);", "static-array.c").unwrap_err();
+    let errors = compile_errors("static-array.c");
     assert!(errors.iter().any(|error| error
         .message
         .contains("static array parameter requires a size")));
 
-    ai_cc::compile_preprocessed(
-        "int consume(int values[const static 4]); int main(void) { return 0; }",
-        "static-array-parameter.c",
-    )
-    .unwrap();
+    compile_ok("static-array-parameter.c");
 
-    let source = "int scan(int count, int values[static count]);";
-    let tokens = ai_cc::lex::Lexer::new(source).tokenize_all().unwrap();
+    let (source, _) = case("function-parameter-static-array.c");
+    let tokens = ai_cc::lex::Lexer::new(&source).tokenize_all().unwrap();
     let mut parser = ai_cc::parser::Parser::new(tokens);
     let ast = parser.parse_translation_unit().unwrap();
     assert!(matches!(
@@ -800,47 +730,29 @@ fn function_constraints() {
                 && matches!(**inner, ai_cc::ast::Type::Pointer(_))
     ));
 
-    let errors =
-        ai_cc::compile_preprocessed("int f(int restrict value);", "restrict-object.c").unwrap_err();
+    let errors = compile_errors("restrict-object.c");
     assert!(errors
         .iter()
         .any(|error| error.message.contains("incomplete or invalid type")));
 
-    let errors = ai_cc::compile_preprocessed(
-        "int main(void) { int values[const 3]; return 0; }",
-        "qualified-array-object.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("qualified-array-object.c");
     assert!(errors
         .iter()
         .any(|error| error.message.contains("invalid object type")));
 
-    let errors = ai_cc::compile_preprocessed(
-        "struct S; struct S f(void) { return; }",
-        "incomplete-return.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("incomplete-return.c");
     assert!(errors
         .iter()
         .any(|error| error.message.contains("return type is incomplete")));
 
-    ai_cc::compile_preprocessed(
-        "typedef int A[3]; const A values = { 1, 2, 3 }; int main(void) { return values[0] - 1; }",
-        "qualified-array-typedef.c",
-    )
-    .unwrap();
+    compile_ok("qualified-array-typedef.c");
 }
 
 #[test]
 fn tag_scopes_and_shadowing() {
-    let source = "struct S { int a; }; int main(void) { struct S outer; { struct S { char b; }; struct S inner; inner.b = 1; } outer.a = 2; return outer.a - 2; }";
-    ai_cc::compile_preprocessed(source, "tag-shadow.c").unwrap();
+    compile_ok("tag-shadow.c");
 
-    let errors = ai_cc::compile_preprocessed(
-        "int main(void) { { struct Hidden { int a; }; } struct Hidden value; return 0; }",
-        "tag-scope.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("tag-scope.c");
     assert!(errors
         .iter()
         .any(|error| error.message.contains("invalid object type for value")));
@@ -848,17 +760,9 @@ fn tag_scopes_and_shadowing() {
 
 #[test]
 fn tags_in_declarations_and_duplicates() {
-    ai_cc::compile_preprocessed(
-        "struct S { int a; } value; int main(void) { value.a = 3; return value.a - 3; }",
-        "tag-declarator.c",
-    )
-    .unwrap();
+    compile_ok("tag-declarator.c");
 
-    let errors = ai_cc::compile_preprocessed(
-        "struct S { int a; }; struct S { int b; }; int main(void) { return 0; }",
-        "duplicate-tag.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("duplicate-tag.c");
     assert!(errors
         .iter()
         .any(|error| error.message.contains("redefinition of struct S")));
@@ -866,20 +770,12 @@ fn tags_in_declarations_and_duplicates() {
 
 #[test]
 fn tag_and_ordinary_namespaces() {
-    ai_cc::compile_preprocessed(
-        "struct S { int a; }; int S = 3; int main(void) { struct S value; value.a = S; return value.a - 3; }",
-        "tag-ordinary-namespace.c",
-    )
-    .unwrap();
+    compile_ok("tag-ordinary-namespace.c");
 }
 
 #[test]
 fn function_prototype_tag_scope() {
-    let errors = ai_cc::compile_preprocessed(
-        "void consume(struct Payload { int a; } value); int main(void) { struct Payload item; return 0; }",
-        "prototype-tag-scope.c",
-    )
-    .unwrap_err();
+    let errors = compile_errors("prototype-tag-scope.c");
     assert!(errors
         .iter()
         .any(|error| error.message.contains("invalid object type for item")));
@@ -887,52 +783,36 @@ fn function_prototype_tag_scope() {
 
 #[test]
 fn enumerator_ordinary_namespace() {
-    ai_cc::compile_preprocessed(
-        "enum State { Idle = 2, Busy = Idle + 1 }; int main(void) { return Busy - 3; }",
-        "enumerator-constants.c",
-    )
-    .unwrap();
-    ai_cc::compile_preprocessed(
-        "enum State { Idle = 2 }; int main(void) { int Idle = 5; return Idle - 5; }",
-        "enumerator-shadow.c",
-    )
-    .unwrap();
+    compile_ok("enumerator-constants.c");
+    compile_ok("enumerator-shadow.c");
 }
 
 #[test]
 fn inheritance_of_internal_linkage() {
-    let ir = ai_cc::compile_preprocessed(
-        "static int helper(void); int helper(void) { return 4; } int main(void) { return helper() - 4; }",
-        "internal-linkage.c",
-    )
-    .unwrap();
+    let ir = compile_ir("internal-linkage.c");
     assert!(ir.contains("function w $helper"), "{ir}");
     assert!(!ir.contains("export function w $helper"), "{ir}");
 
-    ai_cc::compile_preprocessed(
-        "static int value; extern int value; int main(void) { return value; }",
-        "internal-object-linkage.c",
-    )
-    .unwrap();
+    compile_ok("internal-object-linkage.c");
 }
 
 #[test]
 fn conflicting_linkage() {
-    for (source, expected) in [
+    for (file, expected) in [
         (
-            "extern int value; static int value; int main(void) { return 0; }",
+            "conflicting-linkage-static-after-extern.c",
             "static declaration of value follows non-static declaration",
         ),
         (
-            "static int value; int value; int main(void) { return 0; }",
+            "conflicting-linkage-nonstatic-after-static.c",
             "non-static declaration of value follows static declaration",
         ),
         (
-            "int helper(void); static int helper(void) { return 0; } int main(void) { return 0; }",
+            "conflicting-linkage-function.c",
             "static declaration of helper follows non-static declaration",
         ),
     ] {
-        let errors = ai_cc::compile_preprocessed(source, "conflicting-linkage.c").unwrap_err();
+        let errors = compile_errors(file);
         assert!(
             errors.iter().any(|error| error.message.contains(expected)),
             "{errors:?}"

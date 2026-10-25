@@ -1,0 +1,1 @@
+int main(void) { unsigned long a = 1; long unsigned b = 2; int long unsigned c = 3; signed short int d = 4; short signed e = 5; char unsigned f = 6; signed char g = 7; long double h; return a + b + c + d + e + f + g; }

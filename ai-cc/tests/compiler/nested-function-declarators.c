@@ -1,0 +1,1 @@
+int (*factory(void))(int); int (*factory2(int, int))(int); int (*array_factory(void))[4]; int apply(int (*callback)(int), int value); int invoke(int callback(int)); int consume(int matrix[static const 2][3], int *, int (*)(int)); int (*table[3])(int); int main(void) { return 0; }
