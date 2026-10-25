@@ -164,6 +164,7 @@ pub enum Expr {
     Member(Box<Expr>, String, bool),
     Subscript(Box<Expr>, Box<Expr>),
     Cast(Type, Box<Expr>),
+    IncDec(Box<Expr>, bool, bool),
     SizeofType(Type),
     CompoundLiteral(Type, Initializer),
     VaStart(Box<Expr>),

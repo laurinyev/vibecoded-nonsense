@@ -147,11 +147,10 @@ Remaining work:
 
 ### 3.1 Implement lvalue and modifiability rules — in progress
 
-Assignments require modifiable lvalues; const-qualified objects, aggregates containing const-qualified subobjects, and incomplete objects are rejected. Member access inherits qualifiers from its containing aggregate. Address-of rejects non-lvalues, register objects, and bit-fields; dereference, member access, and array subscripting have basic operand checks.
+Assignments and increment/decrement require modifiable lvalues; const-qualified objects, aggregates containing const-qualified subobjects, and incomplete objects are rejected. Member access inherits qualifiers from its containing aggregate. Prefix/postfix increment and decrement preserve value and evaluate their lvalue once. Address-of rejects non-lvalues, register objects, and bit-fields; dereference, member access, and array subscripting have basic operand checks, including `i[p]`.
 
 Remaining work:
 
-- Represent and validate increment/decrement without losing postfix value semantics.
 - Complete remaining member and subscript constraints.
 - Expand source-spanned constraint coverage for every lvalue context.
 

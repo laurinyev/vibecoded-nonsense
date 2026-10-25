@@ -800,6 +800,26 @@ impl Sema {
                 }
                 target.clone()
             }
+            Expr::IncDec(target, _, _) => {
+                let ty = self.expr(target, span);
+                if !self.is_modifiable_lvalue(target) {
+                    self.errs.push(Diagnostic::error(
+                        "increment/decrement requires a modifiable lvalue",
+                        Some(span),
+                    ));
+                }
+                if (Self::arithmetic(&ty) && !Self::complex(&ty))
+                    || (Self::pointer_like(&ty) && self.pointer_arithmetic_type(&ty))
+                {
+                    ty
+                } else {
+                    self.errs.push(Diagnostic::error(
+                        "increment/decrement requires a real or pointer operand",
+                        Some(span),
+                    ));
+                    ty
+                }
+            }
             Expr::SizeofType(ty) => {
                 if matches!(
                     Self::unqualified(ty),
@@ -1759,6 +1779,7 @@ impl Sema {
             Expr::Float(_, ty) => ty.clone(),
             Expr::Complex(_, _, ty) => Type::Complex(Box::new(ty.clone())),
             Expr::Cast(ty, _) => ty.clone(),
+            Expr::IncDec(target, _, _) => self.expr_type(target),
             Expr::SizeofType(_) | Expr::Unary(UnOp::Sizeof, _) => Type::UnsignedLong,
             Expr::CompoundLiteral(ty, _) => ty.clone(),
             Expr::VaStart(_) | Expr::VaEnd(_) | Expr::VaCopy(_, _) => Type::Void,

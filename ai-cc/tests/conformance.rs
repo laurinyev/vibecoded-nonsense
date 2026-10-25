@@ -306,6 +306,11 @@ fn pointer_difference() {
 }
 
 #[test]
+fn increment_decrement() {
+    run_valid_fixture("increment-decrement.c");
+}
+
+#[test]
 fn string_arrays() {
     let path = root().join("tests/conformance/valid/string-array-initialization.c");
     let work = temp_dir("string-array-initialization");

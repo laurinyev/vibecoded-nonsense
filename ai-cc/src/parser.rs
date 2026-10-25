@@ -2171,21 +2171,8 @@ impl Parser {
             return Ok(Expr::Cast(ty, Box::new(self.unary()?)));
         }
         if self.take(&TokenKind::PlusPlus) || self.take(&TokenKind::MinusMinus) {
-            let add = self.t[self.p - 1].kind == TokenKind::PlusPlus;
-            let Expr::Var(n) = self.primary()? else {
-                return Err(Diagnostic::error(
-                    "increment target required",
-                    Some(self.cur_span()),
-                ));
-            };
-            return Ok(Expr::Assign(
-                Box::new(Expr::Var(n.clone())),
-                Box::new(Expr::Binary(
-                    if add { BinOp::Add } else { BinOp::Sub },
-                    Box::new(Expr::Var(n)),
-                    Box::new(Expr::Int(1)),
-                )),
-            ));
+            let increment = self.t[self.p - 1].kind == TokenKind::PlusPlus;
+            return Ok(Expr::IncDec(Box::new(self.unary()?), increment, true));
         }
         if self.take(&TokenKind::Minus) {
             return Ok(Expr::Unary(UnOp::Neg, Box::new(self.unary()?)));
@@ -2417,29 +2404,7 @@ impl Parser {
                 } else if let Some(value) = self.constant_value(&n) {
                     Expr::Int(value)
                 } else {
-                    let x = Expr::Var(n.clone());
-                    // BUG: postfix increment is lowered as prefix and only works on bare identifiers.
-                    if self.take(&TokenKind::PlusPlus) {
-                        Expr::Assign(
-                            Box::new(x.clone()),
-                            Box::new(Expr::Binary(
-                                BinOp::Add,
-                                Box::new(x),
-                                Box::new(Expr::Int(1)),
-                            )),
-                        )
-                    } else if self.take(&TokenKind::MinusMinus) {
-                        Expr::Assign(
-                            Box::new(x.clone()),
-                            Box::new(Expr::Binary(
-                                BinOp::Sub,
-                                Box::new(x),
-                                Box::new(Expr::Int(1)),
-                            )),
-                        )
-                    } else {
-                        x
-                    }
+                    Expr::Var(n)
                 }
             }
             TokenKind::LParen => {
@@ -2475,6 +2440,14 @@ impl Parser {
                 }
                 self.expect(&TokenKind::RParen)?;
                 x = Expr::IndirectCall(Box::new(x), arguments);
+                continue;
+            }
+            if self.take(&TokenKind::PlusPlus) {
+                x = Expr::IncDec(Box::new(x), true, false);
+                continue;
+            }
+            if self.take(&TokenKind::MinusMinus) {
+                x = Expr::IncDec(Box::new(x), false, false);
                 continue;
             }
             let arrow = self.take(&TokenKind::Arrow);

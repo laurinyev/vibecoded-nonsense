@@ -329,6 +329,7 @@ impl Lowerer {
             Expr::Float(_, ty) => ty.clone(),
             Expr::Complex(_, _, ty) => Type::Complex(Box::new(ty.clone())),
             Expr::Cast(ty, _) => ty.clone(),
+            Expr::IncDec(target, _, _) => self.type_of(target),
             Expr::SizeofType(_) | Expr::Unary(UnOp::Sizeof, _) => Type::UnsignedLong,
             Expr::CompoundLiteral(ty, _) => ty.clone(),
             Expr::VaStart(_) | Expr::VaEnd(_) | Expr::VaCopy(_, _) => Type::Void,
@@ -1167,8 +1168,17 @@ impl Lowerer {
         layout: &crate::layout::FieldLayout,
         v: &mut Vec<Instr>,
     ) -> String {
-        let width = layout.width.unwrap_or(0);
         let addr = self.lvalue_addr(e, v);
+        self.load_bitfield_at(layout, addr, v)
+    }
+
+    fn load_bitfield_at(
+        &mut self,
+        layout: &crate::layout::FieldLayout,
+        addr: String,
+        v: &mut Vec<Instr>,
+    ) -> String {
+        let width = layout.width.unwrap_or(0);
         let unit = self.tmp();
         v.push(Instr::LoadZero(unit.clone(), addr, Self::size(&layout.ty)));
         let mut value = unit;
@@ -1334,6 +1344,105 @@ impl Lowerer {
         values
     }
 
+    fn increment_decrement(
+        &mut self,
+        target: &Expr,
+        increment: bool,
+        prefix: bool,
+        v: &mut Vec<Instr>,
+    ) -> String {
+        let ty = self.type_of(target);
+        let scalar_ty = Self::scalar(&ty);
+        let addr = self.lvalue_addr(target, v);
+        let bitfield = self
+            .member_layout(target)
+            .filter(|layout| layout.width.is_some_and(|width| width > 0));
+        let old = if let Some(layout) = &bitfield {
+            self.load_bitfield_at(layout, addr.clone(), v)
+        } else {
+            let old = self.tmp();
+            v.push(Instr::Load(old.clone(), addr.clone(), ty.clone()));
+            old
+        };
+        let new = self.tmp();
+        if Self::is_pointer(&ty) {
+            let element_size = Self::pointee(&ty)
+                .map(|element| Self::size(&element).max(1))
+                .unwrap_or(1) as i64;
+            let offset = if increment {
+                element_size
+            } else {
+                -element_size
+            };
+            v.push(Instr::Addr(new.clone(), old.clone(), offset));
+        } else if Self::is_float(&scalar_ty) {
+            let one = self.tmp();
+            v.push(Instr::ConstFloat(one.clone(), 1.0, scalar_ty.clone()));
+            v.push(Instr::FloatBin(
+                new.clone(),
+                if increment { BinOp::Add } else { BinOp::Sub },
+                old.clone(),
+                one,
+                scalar_ty.clone(),
+            ));
+        } else {
+            let one = self.tmp();
+            if Self::size(&scalar_ty) >= 8 {
+                v.push(Instr::ConstLong(one.clone(), 1));
+            } else {
+                v.push(Instr::Const(one.clone(), 1));
+            }
+            v.push(Instr::BinTyped(
+                new.clone(),
+                if increment { BinOp::Add } else { BinOp::Sub },
+                old.clone(),
+                one,
+                scalar_ty.clone(),
+            ));
+            if matches!(scalar_ty, Type::Bool) {
+                let normalized = self.tmp();
+                v.push(Instr::BinTyped(
+                    normalized.clone(),
+                    BinOp::Ne,
+                    new,
+                    "0".into(),
+                    Type::Bool,
+                ));
+                self.store_increment_value(&ty, &addr, &bitfield, normalized.clone(), v);
+                return if prefix { normalized } else { old };
+            }
+        }
+        self.store_increment_value(&ty, &addr, &bitfield, new.clone(), v);
+        if prefix {
+            if let Some(layout) = &bitfield {
+                self.load_bitfield_at(layout, addr, v)
+            } else if Self::is_integer(&scalar_ty) && Self::size(&scalar_ty) < 4 {
+                let converted = self.tmp();
+                v.push(Instr::Load(converted.clone(), addr, ty));
+                converted
+            } else {
+                new
+            }
+        } else {
+            old
+        }
+    }
+
+    fn store_increment_value(
+        &mut self,
+        ty: &Type,
+        addr: &str,
+        bitfield: &Option<crate::layout::FieldLayout>,
+        value: String,
+        v: &mut Vec<Instr>,
+    ) {
+        if let Some(layout) = bitfield {
+            self.store_bitfield(layout, value, addr.to_owned(), v);
+        } else {
+            v.push(Instr::Store(value, addr.to_owned(), ty.clone()));
+        }
+    }
+
     fn expr(&mut self, e: &Expr, v: &mut Vec<Instr>) -> String {
         match e {
             Expr::Int(n) => {
@@ -1364,6 +1473,9 @@ impl Lowerer {
                 self.make_complex(base, real, imaginary, v)
             }
             Expr::Cast(target, value) => self.expr_as(value, target, v),
+            Expr::IncDec(target, increment, prefix) => {
+                self.increment_decrement(target, *increment, *prefix, v)
+            }
             Expr::CompoundLiteral(ty, values) => {
                 let ty = self.resolve_tags(ty);
                 let addr = self.compound_literal_addr(&ty, values, v);
