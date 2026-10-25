@@ -31,3 +31,4 @@
 * Execute test suite post-edit: unit -> integration
 * Include pass/fail summary in final report
 * Document new env vars / setup steps if added
+* At every end of turn, update code markings in project `TODO.md` from comments
