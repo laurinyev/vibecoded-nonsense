@@ -52,6 +52,7 @@ pub enum Instr {
     Addr(String, String, i64),
     PtrAdd(String, String, String),
     Bin(String, BinOp, String, String),
+    BinTyped(String, BinOp, String, String, Type),
     FloatBin(String, BinOp, String, String, Type),
     Convert(String, String, Type, Type),
     Call(
@@ -108,6 +109,7 @@ pub struct Lowerer {
     globals: Vec<(String, Type, DataValue, bool)>,
     aggregate_data: Vec<DataObject>,
     loops: Vec<(String, String)>,
+    local_id: usize,
     vars: HashMap<String, Type>,
     slots: HashMap<String, String>,
     functions: HashMap<String, (Type, Vec<Type>, bool)>,
@@ -131,6 +133,7 @@ impl Lowerer {
             globals: Vec::new(),
             aggregate_data: Vec::new(),
             loops: Vec::new(),
+            local_id: 0,
             vars: HashMap::new(),
             slots: HashMap::new(),
             functions: HashMap::new(),
@@ -278,17 +281,25 @@ impl Lowerer {
         let scalar = Self::scalar(ty);
         if let Type::Vla(element, bound) = scalar {
             let count = self.expr(&bound, v);
+            let count_ty = self.type_of(&bound);
+            let count = self.convert_value(count, &count_ty, &Type::UnsignedLong, v);
             let unit = self.tmp();
-            v.push(Instr::Const(
+            v.push(Instr::ConstLong(
                 unit.clone(),
                 Self::size(&element).max(1) as i64,
             ));
             let out = self.tmp();
-            v.push(Instr::Bin(out.clone(), BinOp::Mul, count, unit));
+            v.push(Instr::BinTyped(
+                out.clone(),
+                BinOp::Mul,
+                count,
+                unit,
+                Type::UnsignedLong,
+            ));
             out
         } else {
             let out = self.tmp();
-            v.push(Instr::Const(out.clone(), Self::size(&scalar) as i64));
+            v.push(Instr::ConstLong(out.clone(), Self::size(&scalar) as i64));
             out
         }
     }
@@ -313,7 +324,8 @@ impl Lowerer {
 
     fn type_of(&self, e: &Expr) -> Type {
         match e {
-            Expr::Int(_) | Expr::Char(_) => Type::Int,
+            Expr::Int(n) => Self::integer_literal_type(*n),
+            Expr::Char(_) => Type::Int,
             Expr::Float(_, ty) => ty.clone(),
             Expr::Complex(_, _, ty) => Type::Complex(Box::new(ty.clone())),
             Expr::Cast(ty, _) => ty.clone(),
@@ -345,12 +357,11 @@ impl Lowerer {
                 | BinOp::Lt
                 | BinOp::Le
                 | BinOp::Gt
-                | BinOp::Ge
-                | BinOp::BitAnd
-                | BinOp::BitOr
-                | BinOp::BitXor
-                | BinOp::Shl
-                | BinOp::Shr => Type::Int,
+                | BinOp::Ge => Type::Int,
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                    Self::usual_arithmetic_type(&self.type_of(a), &self.type_of(b))
+                }
+                BinOp::Shl | BinOp::Shr => Self::integer_promote(&self.type_of(a)),
                 BinOp::Add | BinOp::Sub => {
                     let left = self.type_of(a);
                     let right = self.type_of(b);
@@ -447,6 +458,66 @@ impl Lowerer {
         )
     }
 
+    fn integer_literal_type(value: i64) -> Type {
+        if i32::try_from(value).is_ok() {
+            Type::Int
+        } else {
+            Type::Long
+        }
+    }
+
+    fn is_integer(t: &Type) -> bool {
+        matches!(
+            Self::scalar(t),
+            Type::Bool
+                | Type::Char
+                | Type::SignedChar
+                | Type::UnsignedChar
+                | Type::Short
+                | Type::UnsignedShort
+                | Type::Int
+                | Type::SignedInt
+                | Type::UnsignedInt
+                | Type::Long
+                | Type::UnsignedLong
+                | Type::LongLong
+                | Type::UnsignedLongLong
+                | Type::Enum(_, _)
+        )
+    }
+
+    fn integer_promote(t: &Type) -> Type {
+        if Self::integer_rank(t) < 3 {
+            Type::Int
+        } else {
+            Self::scalar(t)
+        }
+    }
+
+    fn integer_rank(t: &Type) -> u8 {
+        match Self::scalar(t) {
+            Type::Bool => 0,
+            Type::Char | Type::SignedChar | Type::UnsignedChar => 1,
+            Type::Short | Type::UnsignedShort => 2,
+            Type::Int | Type::SignedInt | Type::UnsignedInt | Type::Enum(_, _) => 3,
+            Type::Long | Type::UnsignedLong => 4,
+            Type::LongLong | Type::UnsignedLongLong => 5,
+            _ => 3,
+        }
+    }
+
+    fn integer_unsigned(t: &Type) -> bool {
+        matches!(
+            Self::scalar(t),
+            Type::Bool
+                | Type::UnsignedChar
+                | Type::UnsignedShort
+                | Type::UnsignedInt
+                | Type::UnsignedLong
+                | Type::UnsignedLongLong
+        )
+    }
+
     fn usual_arithmetic_type(a: &Type, b: &Type) -> Type {
         let complex = Self::is_complex(a) || Self::is_complex(b);
         let a = Self::real_type(a);
@@ -458,8 +529,22 @@ impl Lowerer {
         } else if matches!(a, Type::Float) || matches!(b, Type::Float) {
             Type::Float
         } else {
-            // BUG: integer usual arithmetic conversions ignore rank, signedness, and promotions.
-            Type::Int
+            let rank = Self::integer_rank(&a).max(Self::integer_rank(&b));
+            if rank < 3 {
+                Type::Int
+            } else if Self::integer_unsigned(&a) || Self::integer_unsigned(&b) {
+                match rank {
+                    4 => Type::UnsignedLong,
+                    5 => Type::UnsignedLongLong,
+                    _ => Type::UnsignedInt,
+                }
+            } else {
+                match rank {
+                    4 => Type::Long,
+                    5 => Type::LongLong,
+                    _ => Type::Int,
+                }
+            }
         };
         if complex {
             Type::Complex(Box::new(base))
@@ -1213,7 +1298,11 @@ impl Lowerer {
         match e {
             Expr::Int(n) => {
                 let x = self.tmp();
-                v.push(Instr::Const(x.clone(), *n));
+                if i32::try_from(*n).is_ok() {
+                    v.push(Instr::Const(x.clone(), *n));
+                } else {
+                    v.push(Instr::ConstLong(x.clone(), *n));
+                }
                 x
             }
             Expr::Float(value, ty) => {
@@ -1310,10 +1399,10 @@ impl Lowerer {
             }
             Expr::Unary(UnOp::Address, e) => self.lvalue_addr(e, v),
             Expr::Unary(UnOp::Deref, e) => {
-                // BUG: loads the pointer type instead of the pointee type.
-                let ty = self.type_of(e);
+                let pointer_ty = self.type_of(e);
+                let ty = Self::pointee(&pointer_ty).unwrap_or(pointer_ty);
                 let addr = self.expr(e, v);
-                if matches!(Self::pointee(&ty), Some(Type::Function(_, _, _, _))) {
+                if matches!(Self::scalar(&ty), Type::Function(_, _, _, _)) {
                     return addr;
                 }
                 if Self::is_complex(&ty) {
@@ -1400,6 +1489,17 @@ impl Lowerer {
             Expr::Binary(op, a, b) => {
                 let left_ty = self.type_of(a);
                 let right_ty = self.type_of(b);
+                if matches!(op, BinOp::Add | BinOp::Sub) {
+                    if Self::is_pointer(&left_ty) && Self::is_integer(&right_ty) {
+                        return self.pointer_offset(*op, a, b, &right_ty, v);
+                    }
+                    if *op == BinOp::Add
+                        && Self::is_integer(&left_ty)
+                        && Self::is_pointer(&right_ty)
+                    {
+                        return self.pointer_offset(BinOp::Add, b, a, &left_ty, v);
+                    }
+                }
                 if Self::is_complex(&left_ty) || Self::is_complex(&right_ty) {
                     match op {
                         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
@@ -1435,8 +1535,9 @@ impl Lowerer {
                     }
                     v.push(Instr::Label(rhs));
                     let y = self.condition(b, v);
-                    // BUG: logical RHS result is copied raw instead of normalized to 0/1.
-                    v.push(Instr::Move(z.clone(), y, Type::Int));
+                    let normalized = self.tmp();
+                    v.push(Instr::Bin(normalized.clone(), BinOp::Ne, y, "0".into()));
+                    v.push(Instr::Move(z.clone(), normalized, Type::Int));
                     v.push(Instr::Jump(end.clone()));
                     v.push(Instr::Label(end));
                     return z;
@@ -1458,6 +1559,11 @@ impl Lowerer {
                         | BinOp::Le
                         | BinOp::Gt
                         | BinOp::Ge
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr
                 ) && !Self::is_pointer(&left_ty)
                     && !Self::is_pointer(&right_ty);
                 let common = Self::usual_arithmetic_type(&left_ty, &right_ty);
@@ -1475,7 +1581,7 @@ impl Lowerer {
                 if arithmetic && (Self::is_float(&common)) {
                     v.push(Instr::FloatBin(z.clone(), *op, x, y, common));
                 } else {
-                    v.push(Instr::Bin(z.clone(), *op, x, y));
+                    v.push(Instr::BinTyped(z.clone(), *op, x, y, common));
                 }
                 z
             }
@@ -1793,7 +1899,51 @@ impl Lowerer {
             ));
             return out;
         }
+        if Self::is_integer(&source) && Self::is_integer(&target) {
+            let out = self.tmp();
+            v.push(Instr::Convert(
+                out.clone(),
+                value,
+                source.clone(),
+                target.clone(),
+            ));
+            return out;
+        }
         value
+    }
+
+    fn pointer_offset(
+        &mut self,
+        op: BinOp,
+        pointer: &Expr,
+        index: &Expr,
+        index_ty: &Type,
+        v: &mut Vec<Instr>,
+    ) -> String {
+        let pointer_ty = self.type_of(pointer);
+        let element = Self::pointee(&pointer_ty).unwrap_or(Type::Char);
+        let base = self.expr(pointer, v);
+        let offset = self.expr(index, v);
+        let offset = self.convert_value(offset, index_ty, &Type::Long, v);
+        let size = Self::size(&element).max(1);
+        let offset = if size == 1 {
+            offset
+        } else {
+            let scale = self.tmp();
+            v.push(Instr::ConstLong(scale.clone(), size as i64));
+            let scaled = self.tmp();
+            v.push(Instr::BinTyped(
+                scaled.clone(),
+                BinOp::Mul,
+                offset,
+                scale,
+                Type::Long,
+            ));
+            scaled
+        };
+        let out = self.tmp();
+        v.push(Instr::BinTyped(out.clone(), op, base, offset, Type::Long));
+        out
     }
 
     fn condition(&mut self, e: &Expr, v: &mut Vec<Instr>) -> String {
@@ -1882,7 +2032,8 @@ impl Lowerer {
             Stmt::Typedefs(_, _) => {}
             Stmt::Decl(n, ty, init, _) => {
                 let ty = self.resolve_tags(ty);
-                let slot = format!("%slot_{}", n);
+                let slot = format!("%slot_{}_{}", n, self.local_id);
+                self.local_id += 1;
                 self.vars.insert(n.clone(), ty.clone());
                 self.slots.insert(n.clone(), slot.clone());
                 self.allocate_local(&slot, &ty, v);
@@ -1891,7 +2042,8 @@ impl Lowerer {
             Stmt::Decls(declarations, _) => {
                 for (n, ty, init) in declarations {
                     let ty = self.resolve_tags(ty);
-                    let slot = format!("%slot_{}", n);
+                    let slot = format!("%slot_{}_{}", n, self.local_id);
+                    self.local_id += 1;
                     self.vars.insert(n.clone(), ty.clone());
                     self.slots.insert(n.clone(), slot.clone());
                     self.allocate_local(&slot, &ty, v);
@@ -1907,10 +2059,13 @@ impl Lowerer {
                 v.push(Instr::Ret(value));
             }
             Stmt::Block(b, _) => {
-                // BUG: block scopes do not save/restore vars and slots; shadowed locals alias.
+                let saved_vars = self.vars.clone();
+                let saved_slots = self.slots.clone();
                 for x in &b.stmts {
                     self.stmt(x, v)
                 }
+                self.vars = saved_vars;
+                self.slots = saved_slots;
             }
             Stmt::If(c, a, b, _) => {
                 let x = self.condition(c, v);
@@ -1960,6 +2115,8 @@ impl Lowerer {
                 v.push(Instr::Label(e));
             }
             Stmt::For(init, c, step, b, _) => {
+                let saved_vars = self.vars.clone();
+                let saved_slots = self.slots.clone();
                 if let Some(x) = init {
                     self.stmt(x, v);
                 }
@@ -1986,6 +2143,8 @@ impl Lowerer {
                 }
                 v.push(Instr::Jump(h));
                 v.push(Instr::Label(e));
+                self.vars = saved_vars;
+                self.slots = saved_slots;
             }
             Stmt::Break(_) => {
                 if let Some((x, _)) = self.loops.last() {
@@ -2091,6 +2250,7 @@ impl Lowerer {
             self.vars.clear();
             self.slots.clear();
             self.loops.clear();
+            self.local_id = 0;
             for declaration in &ast.declarations {
                 self.vars
                     .insert(declaration.name.clone(), declaration.ty.clone());

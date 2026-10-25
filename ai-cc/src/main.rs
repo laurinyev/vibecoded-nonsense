@@ -207,6 +207,21 @@ fn host_file(name: &str, verbose: bool) -> Result<PathBuf, String> {
     }
 }
 
+fn is_x86_64_elf(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    header[..4] == [0x7f, b'E', b'L', b'F']
+        && header[4] == 2
+        && header[5] == 1
+        && u16::from_le_bytes([header[18], header[19]]) == 62
+}
+
 fn dynamic_linker(verbose: bool) -> Result<PathBuf, String> {
     if let Ok(path) = env::var("AI_CC_DYNAMIC_LINKER") {
         return Ok(PathBuf::from(path));
@@ -222,11 +237,11 @@ fn dynamic_linker(verbose: bool) -> Result<PathBuf, String> {
     }
     for dir in ["/lib64", "/lib", "/usr/lib64", "/usr/lib"] {
         if let Ok(entries) = fs::read_dir(dir) {
-            // BUG: first ld-linux match is accepted without checking ELF class or architecture.
             if let Some(path) = entries.flatten().map(|x| x.path()).find(|x| {
                 x.file_name()
                     .and_then(|x| x.to_str())
                     .is_some_and(|x| x.starts_with("ld-linux") && x.is_ascii())
+                    && is_x86_64_elf(x)
             }) {
                 return Ok(path);
             }

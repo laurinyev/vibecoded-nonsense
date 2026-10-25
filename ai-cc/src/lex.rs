@@ -321,15 +321,16 @@ impl Lexer {
                 spelling.as_str()
             };
             let is_hex = numeric.starts_with("0x") || numeric.starts_with("0X");
-            // BUG: hex integers ending in f/F (e.g. 0xFF) are misclassified as floats.
+            // Hexadecimal integers may end in f/F without being floating constants.
             let is_float = imaginary
                 || numeric.contains('.')
                 || if is_hex {
                     numeric.contains('p') || numeric.contains('P')
                 } else {
-                    numeric.contains('e') || numeric.contains('E')
-                }
-                || matches!(numeric.chars().last(), Some('f' | 'F'));
+                    numeric.contains('e')
+                        || numeric.contains('E')
+                        || matches!(numeric.chars().last(), Some('f' | 'F'))
+                };
             if is_float {
                 let suffix = numeric
                     .chars()
@@ -506,18 +507,79 @@ impl Lexer {
                     let Some(e) = self.src.get(self.pos).copied() else {
                         break;
                     };
-                    // BUG: \x, multi-digit octal, and \a/\b/\f/\v are missing;
-                    // unknown escapes silently drop the backslash.
-                    x.push(match e {
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        '0' => '\0',
-                        '\\' => '\\',
-                        '\'' => '\'',
-                        '"' => '"',
-                        _ => e,
-                    });
+                    // Decode C99 simple, octal, and hexadecimal escape sequences.
+                    let value = match e {
+                        'a' => 0x07,
+                        'b' => 0x08,
+                        'f' => 0x0c,
+                        'n' => 0x0a,
+                        'r' => 0x0d,
+                        't' => 0x09,
+                        'v' => 0x0b,
+                        '\\' => '\\' as u32,
+                        '\'' => '\'' as u32,
+                        '"' => '"' as u32,
+                        '?' => '?' as u32,
+                        'x' => {
+                            self.pos += 1;
+                            let start = self.pos;
+                            while self.pos < self.src.len()
+                                && self.src[self.pos].is_ascii_hexdigit()
+                            {
+                                self.pos += 1;
+                            }
+                            if self.pos == start {
+                                return Err(Diagnostic::error(
+                                    "\\x escape requires a hexadecimal digit",
+                                    Some(Span {
+                                        start: escape_start,
+                                        end: self.pos,
+                                    }),
+                                ));
+                            }
+                            let digits: String = self.src[start..self.pos].iter().collect();
+                            u32::from_str_radix(&digits, 16).map_err(|_| {
+                                Diagnostic::error(
+                                    "hexadecimal escape is out of range",
+                                    Some(Span {
+                                        start: escape_start,
+                                        end: self.pos,
+                                    }),
+                                )
+                            })?
+                        }
+                        '0'..='7' => {
+                            let mut value = e.to_digit(8).unwrap();
+                            let mut count = 1;
+                            while count < 3
+                                && self.pos + 1 < self.src.len()
+                                && matches!(self.src[self.pos + 1], '0'..='7')
+                            {
+                                self.pos += 1;
+                                value = value * 8 + self.src[self.pos].to_digit(8).unwrap();
+                                count += 1;
+                            }
+                            value
+                        }
+                        _ => {
+                            return Err(Diagnostic::error(
+                                format!("unknown escape sequence \\{}", e),
+                                Some(Span {
+                                    start: escape_start,
+                                    end: self.pos + 1,
+                                }),
+                            ));
+                        }
+                    };
+                    x.push(char::from_u32(value).ok_or_else(|| {
+                        Diagnostic::error(
+                            "escape sequence is not a valid character",
+                            Some(Span {
+                                start: escape_start,
+                                end: self.pos + 1,
+                            }),
+                        )
+                    })?);
                 } else {
                     x.push(self.src[self.pos]);
                 }
@@ -537,12 +599,17 @@ impl Lexer {
                 Ok(self.t(TokenKind::String(x), s))
             } else if x.chars().count() == 1 {
                 Ok(self.t(TokenKind::Char(x.chars().next().unwrap()), s))
-            } else {
-                // TODO: C99 permits implementation-defined multi-character constants.
+            } else if x.is_empty() {
                 Err(Diagnostic::error(
-                    "character constant must contain one character",
+                    "empty character constant",
                     Some(self.t(TokenKind::End, s).span),
                 ))
+            } else {
+                // Multi-character constants use the implementation-defined big-endian value.
+                let value = x
+                    .chars()
+                    .fold(0i64, |acc, c| (acc << 8) | i64::from(c as u32 & 0xff));
+                Ok(self.t(TokenKind::Number(value), s))
             };
         }
         self.pos += 1;

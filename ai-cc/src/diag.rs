@@ -56,8 +56,11 @@ impl SourceMap {
         }
     }
     pub fn line_col(&self, at: usize) -> (usize, usize) {
-        // BUG: slicing at a byte offset panics when it splits a UTF-8 code point.
-        let s = &self.source[..at.min(self.source.len())];
+        let mut end = at.min(self.source.len());
+        while end > 0 && !self.source.is_char_boundary(end) {
+            end -= 1;
+        }
+        let s = &self.source[..end];
         (
             s.bytes().filter(|b| *b == b'\n').count() + 1,
             s.rsplit('\n').next().unwrap_or("").chars().count() + 1,

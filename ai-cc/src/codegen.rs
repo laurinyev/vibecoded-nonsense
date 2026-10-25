@@ -17,11 +17,28 @@ impl QbeCodegen {
         match t {
             Type::Pointer(_) | Type::Array(_, _, _) | Type::Vla(_, _) => "l",
             Type::Float => "s",
-            Type::Double | Type::LongDouble => "d",
+            Type::Double => "d",
+            Type::LongDouble => "d",
+            Type::Long | Type::UnsignedLong | Type::LongLong | Type::UnsignedLongLong => "l",
             Type::Complex(_) => "l",
             Type::Qualified(x, _) => Self::ty(x),
-            // BUG: Long/LongLong fall through to w and are truncated to 32 bits.
             _ => "w",
+        }
+    }
+
+    fn unsigned(t: &Type) -> bool {
+        match t {
+            Type::Qualified(inner, _) => Self::unsigned(inner),
+            Type::UnsignedChar
+            | Type::UnsignedShort
+            | Type::UnsignedInt
+            | Type::UnsignedLong
+            | Type::UnsignedLongLong
+            | Type::Bool
+            | Type::Pointer(_)
+            | Type::Array(_, _, _)
+            | Type::Vla(_, _) => true,
+            _ => false,
         }
     }
 
@@ -184,18 +201,14 @@ impl QbeCodegen {
                     }
                     Instr::Move(n, x, ty) => o += &format!("{} ={} copy {}\n", n, Self::ty(ty), x),
                     Instr::Load(n, addr, ty) => {
-                        let op = match Self::ty(ty) {
-                            "l" => "loadl",
-                            "s" => "loads",
-                            "d" => "loadd",
-                            _ if matches!(
-                                ty,
-                                Type::Char | Type::SignedChar | Type::UnsignedChar | Type::Bool
-                            ) =>
-                            {
-                                // BUG: signed char uses loadub; unsigned short falls through to signed loadw.
-                                "loadub"
-                            }
+                        let op = match (Self::ty(ty), ty) {
+                            ("l", _) => "loadl",
+                            ("s", _) => "loads",
+                            ("d", _) => "loadd",
+                            (_, Type::Char | Type::SignedChar) => "loadsb",
+                            (_, Type::UnsignedChar | Type::Bool) => "loadub",
+                            (_, Type::Short) => "loadsh",
+                            (_, Type::UnsignedShort) => "loaduh",
                             _ => "loadw",
                         };
                         o += &format!("{} ={} {} {}\n", n, Self::ty(ty), op, addr);
@@ -247,7 +260,6 @@ impl QbeCodegen {
                         );
                     }
                     Instr::Bin(n, op, a, b) => {
-                        // BUG: integer binary ops are hardcoded to w/signed; long, pointer, and unsigned math break.
                         o += &format!(
                             "{} =w {} {}, {}\n",
                             n,
@@ -273,6 +285,73 @@ impl QbeCodegen {
                             a,
                             b
                         );
+                    }
+                    Instr::BinTyped(n, op, a, b, ty) => {
+                        let qbe_ty = Self::ty(ty);
+                        let suffix = if qbe_ty == "l" { "l" } else { "w" };
+                        let unsigned = Self::unsigned(ty);
+                        let (result_ty, op) = match op {
+                            crate::ast::BinOp::Add => (qbe_ty, "add"),
+                            crate::ast::BinOp::Sub => (qbe_ty, "sub"),
+                            crate::ast::BinOp::Mul => (qbe_ty, "mul"),
+                            crate::ast::BinOp::Div => {
+                                (qbe_ty, if unsigned { "udiv" } else { "div" })
+                            }
+                            crate::ast::BinOp::Rem => {
+                                (qbe_ty, if unsigned { "urem" } else { "rem" })
+                            }
+                            crate::ast::BinOp::Eq => {
+                                ("w", if suffix == "l" { "ceql" } else { "ceqw" })
+                            }
+                            crate::ast::BinOp::Ne => {
+                                ("w", if suffix == "l" { "cnel" } else { "cnew" })
+                            }
+                            crate::ast::BinOp::Lt => (
+                                "w",
+                                match (unsigned, suffix) {
+                                    (false, "l") => "csltl",
+                                    (false, _) => "csltw",
+                                    (true, "l") => "cultl",
+                                    (true, _) => "cultw",
+                                },
+                            ),
+                            crate::ast::BinOp::Le => (
+                                "w",
+                                match (unsigned, suffix) {
+                                    (false, "l") => "cslel",
+                                    (false, _) => "cslew",
+                                    (true, "l") => "culel",
+                                    (true, _) => "culew",
+                                },
+                            ),
+                            crate::ast::BinOp::Gt => (
+                                "w",
+                                match (unsigned, suffix) {
+                                    (false, "l") => "csgtl",
+                                    (false, _) => "csgtw",
+                                    (true, "l") => "cugtl",
+                                    (true, _) => "cugtw",
+                                },
+                            ),
+                            crate::ast::BinOp::Ge => (
+                                "w",
+                                match (unsigned, suffix) {
+                                    (false, "l") => "csgel",
+                                    (false, _) => "csgew",
+                                    (true, "l") => "cugel",
+                                    (true, _) => "cugew",
+                                },
+                            ),
+                            crate::ast::BinOp::And | crate::ast::BinOp::BitAnd => (qbe_ty, "and"),
+                            crate::ast::BinOp::Or | crate::ast::BinOp::BitOr => (qbe_ty, "or"),
+                            crate::ast::BinOp::BitXor => (qbe_ty, "xor"),
+                            crate::ast::BinOp::Shl => (qbe_ty, "shl"),
+                            crate::ast::BinOp::Shr => {
+                                (qbe_ty, if unsigned { "shr" } else { "sar" })
+                            }
+                            crate::ast::BinOp::Comma => (qbe_ty, "copy"),
+                        };
+                        o += &format!("{} ={} {} {}, {}\n", n, result_ty, op, a, b);
                     }
                     Instr::FloatBin(n, op, a, b, ty) => {
                         let suffix = if matches!(ty, Type::Float) { "s" } else { "d" };
@@ -306,7 +385,20 @@ impl QbeCodegen {
                     Instr::Convert(dst, src, from, to) => {
                         let from_ty = Self::ty(from);
                         let to_ty = Self::ty(to);
-                        if matches!(from_ty, "s" | "d") && matches!(to_ty, "s" | "d") {
+                        if matches!(from_ty, "w" | "l") && matches!(to_ty, "w" | "l") {
+                            if from_ty == to_ty {
+                                o += &format!("{} ={} copy {}\n", dst, to_ty, src);
+                            } else if from_ty == "w" {
+                                let op = if Self::unsigned(from) {
+                                    "extuw"
+                                } else {
+                                    "extsw"
+                                };
+                                o += &format!("{} =l {} {}\n", dst, op, src);
+                            } else {
+                                o += &format!("{} =w copy {}\n", dst, src);
+                            }
+                        } else if matches!(from_ty, "s" | "d") && matches!(to_ty, "s" | "d") {
                             if from_ty == to_ty {
                                 o += &format!("{} ={} copy {}\n", dst, to_ty, src);
                             } else if to_ty == "d" {
@@ -446,8 +538,13 @@ impl QbeCodegen {
 
     fn data_value(value: &DataValue, directive: &str) -> String {
         match value {
-            // BUG: string symbols already include '$', so this emits "$$strN".
-            DataValue::Address(name) => format!("${name}"),
+            DataValue::Address(name) => {
+                if name.starts_with('$') {
+                    name.clone()
+                } else {
+                    format!("${name}")
+                }
+            }
             DataValue::Integer(value) => match directive {
                 "b" => (*value as u8 as i64).to_string(),
                 "h" => (*value as u16 as i64).to_string(),

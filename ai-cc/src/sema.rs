@@ -420,8 +420,9 @@ impl Sema {
 
     fn expr(&mut self, e: &mut Expr, span: crate::diag::Span) -> Type {
         match e {
-            // BUG: all integer literals are typed as int; value and suffix are ignored.
-            Expr::Int(_) | Expr::Char(_) => Type::Int,
+            // BUG: suffixes are ignored; only the value's range selects a wider type.
+            Expr::Int(n) => Self::integer_literal_type(*n),
+            Expr::Char(_) => Type::Int,
             Expr::Float(_, ty) => ty.clone(),
             Expr::Complex(_, _, ty) => Type::Complex(Box::new(ty.clone())),
             // BUG: string literals have array type in C99, not char pointer.
@@ -502,12 +503,12 @@ impl Sema {
                     BinOp::BitOr | BinOp::BitXor | BinOp::BitAnd => {
                         self.require_integer(&left, "bitwise operand", span);
                         self.require_integer(&right, "bitwise operand", span);
-                        Type::Int
+                        Self::usual_arithmetic_type(&left, &right)
                     }
                     BinOp::Shl | BinOp::Shr => {
                         self.require_integer(&left, "shift operand", span);
                         self.require_integer(&right, "shift operand", span);
-                        Type::Int
+                        Self::integer_promote(&left)
                     }
                     BinOp::Add | BinOp::Sub => {
                         let pointer_integer = (Self::pointer_like(&left) && Self::integer(&right))
@@ -516,9 +517,9 @@ impl Sema {
                                 && Self::pointer_like(&right));
                         if pointer_integer {
                             if Self::pointer_like(&left) {
-                                left
+                                Self::decay(&left)
                             } else {
-                                right
+                                Self::decay(&right)
                             }
                         } else if Self::arithmetic(&left) && Self::arithmetic(&right) {
                             Self::usual_arithmetic_type(&left, &right)
@@ -1123,9 +1124,14 @@ impl Sema {
     ) -> usize {
         let mut expr = expr.clone();
         let got = self.expr(&mut expr, span);
-        // BUG: a negative index is reported as non-constant and silently advances.
-        let index = Self::integer_constant(&expr).and_then(|x| usize::try_from(x).ok());
-        if !Self::integer(&got) || index.is_none() {
+        let value = Self::integer_constant(&expr);
+        let index = value.and_then(|x| usize::try_from(x).ok());
+        if value.is_some_and(|x| x < 0) {
+            self.errs.push(Diagnostic::error(
+                "array designator is negative",
+                Some(span),
+            ));
+        } else if !Self::integer(&got) || index.is_none() {
             self.errs.push(Diagnostic::error(
                 "array designator requires an integer constant expression",
                 Some(span),
@@ -1216,9 +1222,8 @@ impl Sema {
                     BinOp::Mul => a.checked_mul(b),
                     BinOp::Div => a.checked_div(b),
                     BinOp::Rem => a.checked_rem(b),
-                    // BUG: shift counts are unchecked and can panic or wrap.
-                    BinOp::Shl => Some(a << b),
-                    BinOp::Shr => Some(a >> b),
+                    BinOp::Shl => u32::try_from(b).ok().and_then(|b| a.checked_shl(b)),
+                    BinOp::Shr => u32::try_from(b).ok().and_then(|b| a.checked_shr(b)),
                     BinOp::BitAnd => Some(a & b),
                     BinOp::BitOr => Some(a | b),
                     BinOp::BitXor => Some(a ^ b),
@@ -1305,8 +1310,13 @@ impl Sema {
                 .lookup(n)
                 .map(|x| !matches!(Self::unqualified(&x.ty), Type::Function(_, _, _, _)))
                 .unwrap_or(false),
-            // BUG: arrow member lvalue-ness incorrectly follows the base expression.
-            Expr::Member(base, _, _) => self.is_lvalue(base),
+            Expr::Member(base, _, arrow) => {
+                if *arrow {
+                    true
+                } else {
+                    self.is_lvalue(base)
+                }
+            }
             Expr::Subscript(base, _) => {
                 let ty = self.expr_type(base);
                 matches!(
@@ -1394,7 +1404,8 @@ impl Sema {
 
     fn expr_type(&self, e: &Expr) -> Type {
         match e {
-            Expr::Int(_) | Expr::Char(_) => Type::Int,
+            Expr::Int(n) => Self::integer_literal_type(*n),
+            Expr::Char(_) => Type::Int,
             Expr::Float(_, ty) => ty.clone(),
             Expr::Complex(_, _, ty) => Type::Complex(Box::new(ty.clone())),
             Expr::Cast(ty, _) => ty.clone(),
@@ -1577,6 +1588,7 @@ impl Sema {
     fn decay(t: &Type) -> Type {
         match Self::unqualified(t) {
             Type::Function(_, _, _, _) => Type::Pointer(Box::new(t.clone())),
+            Type::Array(element, _, _) | Type::Vla(element, _) => Type::Pointer(element),
             _ => t.clone(),
         }
     }
@@ -1723,6 +1735,46 @@ impl Sema {
         }
     }
 
+    fn integer_literal_type(value: i64) -> Type {
+        if i32::try_from(value).is_ok() {
+            Type::Int
+        } else {
+            Type::Long
+        }
+    }
+
+    fn integer_promote(t: &Type) -> Type {
+        if Self::integer_rank(t) < 3 {
+            Type::Int
+        } else {
+            Self::unqualified(t)
+        }
+    }
+
+    fn integer_rank(t: &Type) -> u8 {
+        match Self::unqualified(t) {
+            Type::Bool => 0,
+            Type::Char | Type::SignedChar | Type::UnsignedChar => 1,
+            Type::Short | Type::UnsignedShort => 2,
+            Type::Int | Type::SignedInt | Type::UnsignedInt | Type::Enum(_, _) => 3,
+            Type::Long | Type::UnsignedLong => 4,
+            Type::LongLong | Type::UnsignedLongLong => 5,
+            _ => 3,
+        }
+    }
+
+    fn integer_unsigned(t: &Type) -> bool {
+        matches!(
+            Self::unqualified(t),
+            Type::Bool
+                | Type::UnsignedChar
+                | Type::UnsignedShort
+                | Type::UnsignedInt
+                | Type::UnsignedLong
+                | Type::UnsignedLongLong
+        )
+    }
+
     fn usual_arithmetic_type(a: &Type, b: &Type) -> Type {
         let complex = Self::complex(a) || Self::complex(b);
         let a = Self::real_type(&Self::unqualified(a));
@@ -1734,8 +1786,22 @@ impl Sema {
         } else if matches!(a, Type::Float) || matches!(b, Type::Float) {
             Type::Float
         } else {
-            // BUG: integer usual arithmetic conversions ignore rank, signedness, and promotions.
-            Type::Int
+            let rank = Self::integer_rank(&a).max(Self::integer_rank(&b));
+            if rank < 3 {
+                Type::Int
+            } else if Self::integer_unsigned(&a) || Self::integer_unsigned(&b) {
+                match rank {
+                    4 => Type::UnsignedLong,
+                    5 => Type::UnsignedLongLong,
+                    _ => Type::UnsignedInt,
+                }
+            } else {
+                match rank {
+                    4 => Type::Long,
+                    5 => Type::LongLong,
+                    _ => Type::Int,
+                }
+            }
         };
         if complex {
             Type::Complex(Box::new(base))

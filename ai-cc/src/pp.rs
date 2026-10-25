@@ -360,6 +360,7 @@ pub struct Preprocessor {
     resolver: Box<dyn FileResolver>,
     macros: HashMap<String, MacroDef>,
     once: HashSet<String>,
+    include_stack: Vec<String>,
     date: String,
     time: String,
 }
@@ -375,15 +376,17 @@ impl Preprocessor {
             resolver: Box::new(resolver),
             macros: HashMap::new(),
             once: HashSet::new(),
+            include_stack: Vec::new(),
             date,
             time,
         };
         preprocessor.add_builtin("__STDC__", "1");
         preprocessor.add_builtin("__STDC_VERSION__", "199901L");
         preprocessor.add_builtin("__STDC_HOSTED__", if hosted { "1" } else { "0" });
-        // BUG: __FILE__/__LINE__ expand specially but are absent here, so defined(__FILE__) is false.
         preprocessor.add_builtin("__DATE__", &preprocessor.date.clone());
         preprocessor.add_builtin("__TIME__", &preprocessor.time.clone());
+        preprocessor.add_builtin("__FILE__", "");
+        preprocessor.add_builtin("__LINE__", "");
         preprocessor
     }
 
@@ -402,6 +405,25 @@ impl Preprocessor {
         if self.once.contains(file_name) {
             return Ok(String::new());
         }
+        if self.include_stack.iter().any(|file| file == file_name) {
+            return Err(vec![Diagnostic::error(
+                format!("recursive include of {}", file_name),
+                None,
+            )]);
+        }
+        if self.include_stack.len() >= 200 {
+            return Err(vec![Diagnostic::error(
+                "include nesting limit exceeded",
+                None,
+            )]);
+        }
+        self.include_stack.push(file_name.to_string());
+        let result = self.run_inner(file_name, source);
+        self.include_stack.pop();
+        result
+    }
+
+    fn run_inner(&mut self, file_name: &str, source: &str) -> Result<String, Vec<Diagnostic>> {
         let source = normalize_source(source)?;
         let tokens = preprocessing_tokenize_normalized(&source)?;
         let mut lines = Vec::new();
@@ -522,7 +544,7 @@ impl Preprocessor {
                         errors.push(Diagnostic::error("#undef requires an identifier", span));
                     }
                 }
-                // HACK HACK: includes recurse without depth/cycle tracking; self-include can overflow the stack.
+                // Includes are guarded by run(); recursion is diagnosed before re-entry.
                 Some("include") => match self.include_path(rest, &logical_file, logical_line) {
                     Ok(path) => match self.resolver.resolve(&path, file_name) {
                         Ok(included) => match self.run(&path, &included) {
@@ -776,8 +798,7 @@ impl Preprocessor {
                     i += 1;
                     continue;
                 };
-                // BUG: whitespace before '(' blocks invocation; C99 requires adjacency only in definitions.
-                if token_spelling(open) != "(" || open.leading_space {
+                if token_spelling(open) != "(" {
                     output.push(tokens[i].clone());
                     i += 1;
                     continue;
@@ -795,11 +816,10 @@ impl Preprocessor {
                     i += 1;
                     continue;
                 }
-                let mut nested_disabled = disabled.clone();
-                nested_disabled.insert(name.clone());
-                let replacement =
-                    substitute_macro(definition, &args, self, &mut nested_disabled, file, line);
-                output.extend(self.expand_tokens(&replacement, &mut nested_disabled, file, line));
+                let mut invoking_disabled = disabled.clone();
+                invoking_disabled.insert(name.clone());
+                let replacement = substitute_macro(definition, &args, self, disabled, file, line);
+                output.extend(self.expand_tokens(&replacement, &mut invoking_disabled, file, line));
                 i = end + 1;
             } else {
                 let mut nested_disabled = disabled.clone();
@@ -1034,7 +1054,6 @@ fn substitute_macro(
     let params = definition.params.as_deref().unwrap_or(&[]);
     let expanded: Vec<_> = args
         .iter()
-        // HACK HACK: the current macro is already disabled during argument prescan, breaking f(f(2)).
         .map(|arg| preprocessor.expand_tokens(arg, disabled, file, line))
         .collect();
     let mut output = Vec::new();
@@ -1065,8 +1084,11 @@ fn substitute_macro(
                     vec![next.clone()]
                 };
                 if let Some(lhs) = output.pop() {
-                    // BUG: rhs[0] panics when the right operand of ## is an empty argument.
-                    let pasted = format!("{}{}", token_spelling(&lhs), token_spelling(&rhs[0]));
+                    let lhs = token_spelling(&lhs);
+                    let pasted = match rhs.first() {
+                        Some(rhs) => format!("{}{}", lhs, token_spelling(rhs)),
+                        None => lhs.to_string(),
+                    };
                     if let Some(token) = literal_tokens(&pasted).into_iter().next() {
                         output.push(token);
                     }
@@ -1131,29 +1153,47 @@ fn remove_pragma_operators(tokens: Vec<PreprocessingToken>) -> Vec<Preprocessing
 }
 
 fn emit_tokens(output: &mut String, tokens: &[PreprocessingToken]) {
-    let mut previous = None;
+    let mut previous: Option<&PreprocessingToken> = None;
     for token in tokens {
         let spelling = token_spelling(token);
-        // HACK HACK: spacing only separates identifier-like tokens; punctuators can fuse into comments/operators.
         if token.leading_space
-            || previous.is_some_and(|previous: &PreprocessingToken| {
-                let previous = token_spelling(previous);
-                (previous
-                    .chars()
-                    .last()
-                    .is_some_and(|x| x.is_ascii_alphanumeric() || x == '_'))
-                    && spelling
-                        .chars()
-                        .next()
-                        .is_some_and(|x| x.is_ascii_alphanumeric() || x == '_')
-            })
+            || previous
+                .is_some_and(|previous| tokens_would_fuse(&token_spelling(previous), &spelling))
         {
-            output.push(' ');
+            if !matches!(output.as_bytes().last(), Some(b' ' | b'\n')) {
+                output.push(' ');
+            }
         }
         output.push_str(&spelling);
         previous = Some(token);
     }
     output.push('\n');
+}
+
+fn tokens_would_fuse(previous: &str, next: &str) -> bool {
+    let last = previous.chars().last();
+    let first = next.chars().next();
+    if let (Some(last), Some(first)) = (last, first) {
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        if (word(last) && word(first))
+            || (last.is_ascii_digit() && first == '.')
+            || (last == '.' && first.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    if previous.ends_with('/') && (next.starts_with('/') || next.starts_with('*')) {
+        return true;
+    }
+    if previous.ends_with('.') && next.starts_with('.') {
+        return true;
+    }
+    const PUNCTUATORS: [&str; 27] = [
+        "++", "--", "->", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "*=", "/=", "%=", "+=",
+        "-=", "&=", "^=", "|=", "##", "%:", "<:", ":>", "<%", "%>", "...", "<<=",
+    ];
+    let joined = format!("{}{}", previous, next);
+    PUNCTUATORS.contains(&joined.as_str()) || joined == ">>="
 }
 
 struct IfExpr {
@@ -1170,15 +1210,15 @@ impl IfExpr {
     }
 
     fn parse(mut self) -> Result<i64, String> {
-        let value = self.expression(0)?;
+        let value = self.expression(0, true)?;
         if self.position != self.tokens.len() {
             return Err("invalid #if expression".into());
         }
         Ok(value)
     }
 
-    fn expression(&mut self, minimum: u8) -> Result<i64, String> {
-        let mut left = self.unary()?;
+    fn expression(&mut self, minimum: u8, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.unary(evaluate)?;
         while let Some((precedence, operator)) = self
             .tokens
             .get(self.position)
@@ -1189,18 +1229,28 @@ impl IfExpr {
                 break;
             }
             self.position += 1;
-            // BUG: &&/|| do not short-circuit; an unevaluated RHS can raise division-by-zero.
-            let right = self.expression(precedence + 1)?;
-            left = apply_if_operator(&operator, left, right)?;
+            let short_circuit =
+                evaluate && ((operator == "&&" && left == 0) || (operator == "||" && left != 0));
+            let right = self.expression(precedence + 1, evaluate && !short_circuit)?;
+            if !evaluate {
+                left = 0;
+            } else if short_circuit {
+                left = i64::from(operator == "||");
+            } else {
+                left = apply_if_operator(&operator, left, right)?;
+            }
         }
         Ok(left)
     }
 
-    fn unary(&mut self) -> Result<i64, String> {
+    fn unary(&mut self, evaluate: bool) -> Result<i64, String> {
         if let Some(operator) = self.tokens.get(self.position).cloned() {
             if matches!(operator.as_str(), "+" | "-" | "!" | "~") {
                 self.position += 1;
-                let value = self.unary()?;
+                let value = self.unary(evaluate)?;
+                if !evaluate {
+                    return Ok(0);
+                }
                 return Ok(match operator.as_str() {
                     "+" => value,
                     "-" => value.wrapping_neg(),
@@ -1212,7 +1262,7 @@ impl IfExpr {
         }
         if self.tokens.get(self.position).map(String::as_str) == Some("(") {
             self.position += 1;
-            let value = self.expression(0)?;
+            let value = self.expression(0, evaluate)?;
             if self.tokens.get(self.position).map(String::as_str) != Some(")") {
                 return Err("missing ')' in #if expression".into());
             }
@@ -1225,9 +1275,10 @@ impl IfExpr {
             .ok_or_else(|| "expected expression in #if".to_string())?
             .clone();
         self.position += 1;
-        integer_text(&token)
+        let value = integer_text(&token)
             .or_else(|| is_identifier_text(&token).then_some(0))
-            .ok_or_else(|| "invalid #if expression operand".into())
+            .ok_or_else(|| "invalid #if expression operand".to_string())?;
+        Ok(if evaluate { value } else { 0 })
     }
 }
 

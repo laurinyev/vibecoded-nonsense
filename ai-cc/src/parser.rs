@@ -40,6 +40,7 @@ pub struct Parser {
     aliases: Vec<HashMap<String, Option<Type>>>,
     pending_functions: Vec<Function>,
     pending_declarations: Vec<GlobalDecl>,
+    anonymous_tags: usize,
     eof: TokenKind,
 }
 impl Parser {
@@ -51,6 +52,7 @@ impl Parser {
             aliases: vec![HashMap::new()],
             pending_functions: Vec::new(),
             pending_declarations: Vec::new(),
+            anonymous_tags: 0,
             eof: TokenKind::End,
         }
     }
@@ -163,8 +165,21 @@ impl Parser {
         }
         if self.take(&TokenKind::Struct) || self.take(&TokenKind::Union) {
             let union = self.t[self.p - 1].kind == TokenKind::Union;
-            // BUG: a missing struct/union tag silently becomes an empty tag.
-            let tag = self.ident().unwrap_or_default();
+            let tag = if matches!(self.cur(), TokenKind::Ident(_)) {
+                self.ident()?
+            } else if *self.cur() == TokenKind::LBrace {
+                self.anonymous_tags += 1;
+                format!(
+                    "__anonymous_{}_{}",
+                    if union { "union" } else { "struct" },
+                    self.anonymous_tags
+                )
+            } else {
+                return Err(Diagnostic::error(
+                    "expected struct/union tag or definition",
+                    Some(self.cur_span()),
+                ));
+            };
             let mut fields: Vec<Field> = Vec::new();
             if self.take(&TokenKind::LBrace) {
                 while *self.cur() != TokenKind::RBrace && *self.cur() != TokenKind::End {
@@ -255,16 +270,13 @@ impl Parser {
                 while *self.cur() != TokenKind::RBrace && *self.cur() != TokenKind::End {
                     let n = self.ident()?;
                     if self.take(&TokenKind::Assign) {
-                        // TODO: enumerator values only accept a literal, not an integer constant expression.
-                        if let TokenKind::Number(v) = self.cur().clone() {
-                            next = v;
-                            self.p += 1;
-                        } else {
-                            return Err(Diagnostic::error(
-                                "enumerator requires integer constant",
+                        let value = self.assign()?;
+                        next = Self::integer_constant(&value).ok_or_else(|| {
+                            Diagnostic::error(
+                                "enumerator requires an integer constant expression",
                                 Some(self.cur_span()),
-                            ));
-                        }
+                            )
+                        })?;
                     }
                     // BUG: enumerator names are not bound in ordinary identifier scope.
                     values.push((n, next));
@@ -874,6 +886,7 @@ impl Parser {
             ret,
             storage == Some(StorageClass::Static)
                 || (is_inline && storage != Some(StorageClass::Extern)),
+            storage == Some(StorageClass::Extern),
             is_inline,
         )
     }
@@ -881,6 +894,7 @@ impl Parser {
         &mut self,
         ret: Type,
         is_static: bool,
+        is_extern: bool,
         is_inline: bool,
     ) -> Result<Vec<Function>, Diagnostic> {
         let start = self.cur_span().start;
@@ -916,7 +930,11 @@ impl Parser {
                     span: self.span_from(start),
                 };
                 if *self.cur() == TokenKind::Semicolon || *self.cur() == TokenKind::Comma {
-                    return self.finish_function_declaration_list(function, declaration_base);
+                    return self.finish_function_declaration_list(
+                        function,
+                        declaration_base,
+                        is_extern,
+                    );
                 }
                 return self
                     .finish_function(
@@ -1014,7 +1032,11 @@ impl Parser {
                     span: self.span_from(start),
                 };
                 if *self.cur() == TokenKind::Semicolon || *self.cur() == TokenKind::Comma {
-                    return self.finish_function_declaration_list(function, declaration_base);
+                    return self.finish_function_declaration_list(
+                        function,
+                        declaration_base,
+                        is_extern,
+                    );
                 }
                 return self
                     .finish_function(
@@ -1058,7 +1080,7 @@ impl Parser {
                 is_inline,
                 span: self.span_from(start),
             };
-            return self.finish_function_declaration_list(function, declaration_base);
+            return self.finish_function_declaration_list(function, declaration_base, is_extern);
         }
         self.finish_function(
             name,
@@ -1076,6 +1098,7 @@ impl Parser {
         &mut self,
         first: Function,
         declaration_base: Type,
+        is_extern: bool,
     ) -> Result<Vec<Function>, Diagnostic> {
         let is_static = first.is_static;
         let is_inline = first.is_inline;
@@ -1105,8 +1128,13 @@ impl Parser {
                 } else {
                     None
                 };
-                // BUG: this drops extern for comma-list objects; tentative_definition cannot see Extern.
-                let storage = is_static.then_some(StorageClass::Static);
+                let storage = if is_static {
+                    Some(StorageClass::Static)
+                } else if is_extern {
+                    Some(StorageClass::Extern)
+                } else {
+                    None
+                };
                 self.aliases[0].insert(name.clone(), None);
                 self.pending_declarations.push(GlobalDecl {
                     name,
@@ -1202,9 +1230,10 @@ impl Parser {
                 }
             }
         }
-        // BUG: scope is popped only after expect succeeds; a parse error leaks aliases.
-        self.expect(&TokenKind::RBrace)?;
+        // Keep the alias scope balanced even when the closing brace is missing.
+        let closing = self.expect(&TokenKind::RBrace);
         self.aliases.pop();
+        closing?;
         Ok(Block { stmts: v })
     }
     fn synchronize(&mut self, in_block: bool) {
@@ -1265,41 +1294,45 @@ impl Parser {
         }
         if self.take(&TokenKind::For) {
             self.expect(&TokenKind::LParen)?;
-            let init = if self.take(&TokenKind::Semicolon) {
-                None
-            } else {
-                let s = if self.is_type() {
-                    // BUG: for-init declarations use the enclosing scope and remain visible after the loop.
-                    self.declaration()?
+            self.aliases.push(HashMap::new());
+            let result = (|| {
+                let init = if self.take(&TokenKind::Semicolon) {
+                    None
                 } else {
-                    let expr_start = self.cur_span().start;
+                    let s = if self.is_type() {
+                        self.declaration()?
+                    } else {
+                        let expr_start = self.cur_span().start;
+                        let e = self.expr()?;
+                        self.expect(&TokenKind::Semicolon)?;
+                        Stmt::Expr(e, self.span_from(expr_start))
+                    };
+                    Some(Box::new(s))
+                };
+                let cond = if self.take(&TokenKind::Semicolon) {
+                    None
+                } else {
                     let e = self.expr()?;
                     self.expect(&TokenKind::Semicolon)?;
-                    Stmt::Expr(e, self.span_from(expr_start))
+                    Some(e)
                 };
-                Some(Box::new(s))
-            };
-            let cond = if self.take(&TokenKind::Semicolon) {
-                None
-            } else {
-                let e = self.expr()?;
-                self.expect(&TokenKind::Semicolon)?;
-                Some(e)
-            };
-            let step = if self.take(&TokenKind::RParen) {
-                None
-            } else {
-                let e = self.expr()?;
-                self.expect(&TokenKind::RParen)?;
-                Some(e)
-            };
-            return Ok(Stmt::For(
-                init,
-                cond,
-                step,
-                Box::new(self.stmt()?),
-                self.span_from(start),
-            ));
+                let step = if self.take(&TokenKind::RParen) {
+                    None
+                } else {
+                    let e = self.expr()?;
+                    self.expect(&TokenKind::RParen)?;
+                    Some(e)
+                };
+                Ok(Stmt::For(
+                    init,
+                    cond,
+                    step,
+                    Box::new(self.stmt()?),
+                    self.span_from(start),
+                ))
+            })();
+            self.aliases.pop();
+            return result;
         }
         if self.take(&TokenKind::Break) {
             self.expect(&TokenKind::Semicolon)?;
@@ -1312,7 +1345,12 @@ impl Parser {
         if self.is_type() {
             return self.declaration();
         }
-        // BUG: a bare ';' is not accepted as an empty statement and reaches expr().
+        if self.take(&TokenKind::Semicolon) {
+            return Ok(Stmt::Block(
+                Block { stmts: Vec::new() },
+                self.span_from(start),
+            ));
+        }
         let x = self.expr()?;
         self.expect(&TokenKind::Semicolon)?;
         Ok(Stmt::Expr(x, self.span_from(start)))
@@ -1664,10 +1702,13 @@ impl Parser {
                 let bound = if matches!(self.cur(), TokenKind::Number(_)) {
                     if let TokenKind::Number(n) = self.cur().clone() {
                         self.p += 1;
-                        // BUG: negative or overflowing bounds silently become unspecified arrays.
-                        usize::try_from(n)
-                            .map(ArrayBound::Fixed)
-                            .unwrap_or(ArrayBound::Unspecified)
+                        let bound = usize::try_from(n).map_err(|_| {
+                            Diagnostic::error(
+                                "array bound must be a nonnegative integer",
+                                Some(self.cur_span()),
+                            )
+                        })?;
+                        ArrayBound::Fixed(bound)
                     } else {
                         unreachable!()
                     }
@@ -1923,8 +1964,26 @@ impl Parser {
         match expr {
             Expr::Int(n) => Some(*n),
             Expr::Char(c) => Some(*c as i64),
-            // BUG: cast type is ignored during integer constant evaluation.
-            Expr::Cast(_, x) | Expr::Unary(UnOp::Pos, x) => Self::integer_constant(x),
+            Expr::Cast(ty, x) => {
+                let value = Self::integer_constant(x)?;
+                let mut ty = ty;
+                while let Type::Qualified(inner, _) = ty {
+                    ty = inner;
+                }
+                Some(match ty {
+                    Type::Bool => i64::from(value != 0),
+                    Type::Char | Type::SignedChar => value as i8 as i64,
+                    Type::UnsignedChar => value as u8 as i64,
+                    Type::Short => value as i16 as i64,
+                    Type::UnsignedShort => value as u16 as i64,
+                    Type::Int | Type::SignedInt | Type::Enum(_, _) => value as i32 as i64,
+                    Type::UnsignedInt => value as u32 as i64,
+                    Type::Long | Type::LongLong | Type::Pointer(_) => value,
+                    Type::UnsignedLong | Type::UnsignedLongLong => value as u64 as i64,
+                    _ => value,
+                })
+            }
+            Expr::Unary(UnOp::Pos, x) => Self::integer_constant(x),
             Expr::Unary(UnOp::Neg, x) => Self::integer_constant(x)?.checked_neg(),
             Expr::Unary(UnOp::Not, x) => Some((Self::integer_constant(x)? == 0) as i64),
             Expr::Unary(UnOp::BitNot, x) => Some(!Self::integer_constant(x)?),
@@ -2121,10 +2180,8 @@ impl Parser {
                         Expr::VaArg(Box::new(ap), ty)
                     } else if matches!(n.as_str(), "va_start" | "__builtin_va_start") {
                         let ap = self.assign()?;
-                        // HACK HACK: the required last-named-parameter argument is optional and discarded.
-                        if self.take(&TokenKind::Comma) {
-                            let _last = self.assign()?;
-                        }
+                        self.expect(&TokenKind::Comma)?;
+                        let _last = self.assign()?;
                         self.expect(&TokenKind::RParen)?;
                         Expr::VaStart(Box::new(ap))
                     } else if matches!(n.as_str(), "va_end" | "__builtin_va_end") {

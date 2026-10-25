@@ -14,10 +14,13 @@ pub trait SymbolTable {
     fn lookup(&self, name: &str) -> Option<&Symbol>;
     fn lookup_current_scope(&self, name: &str) -> Option<&Symbol>;
 }
-#[derive(Default)]
 pub struct Scopes {
-    // BUG: Default leaves the stack empty; insert/lookup_current_scope then panic.
     pub scopes: Vec<std::collections::HashMap<String, Symbol>>,
+}
+impl Default for Scopes {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl Scopes {
     pub fn new() -> Self {

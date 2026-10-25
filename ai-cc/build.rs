@@ -5,8 +5,8 @@ fn main() {
     for name in ["crtbegin", "crtend", "crtstart"] {
         let src = root.join("crt").join(format!("{}.S", name));
         let dst = out.join(format!("{}.o", name));
-        // HACK HACK: build-time assembler is hardcoded, breaking cross-compilation.
-        let s = Command::new("as")
+        let assembler = env::var_os("AS").unwrap_or_else(|| "as".into());
+        let s = Command::new(&assembler)
             .arg(&src)
             .arg("-o")
             .arg(&dst)
