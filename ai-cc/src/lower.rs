@@ -334,7 +334,7 @@ impl Lowerer {
             Expr::CompoundLiteral(ty, _) => ty.clone(),
             Expr::VaStart(_) | Expr::VaEnd(_) | Expr::VaCopy(_, _) => Type::Void,
             Expr::VaArg(_, ty) => ty.clone(),
-            Expr::String(_) => Type::Pointer(Box::new(Type::Char)),
+            Expr::String(value) => Type::Array(Box::new(Type::Char), Some(value.len() + 1), false),
             Expr::Var(n) => {
                 if let Some(ty) = self.vars.get(n) {
                     self.resolve_tags(ty)

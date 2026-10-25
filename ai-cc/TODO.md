@@ -1,6 +1,6 @@
 # Code Markings
 
-13 active markings.
+12 active markings.
 
 ## TODO
 
@@ -17,7 +17,6 @@
 - `src/pp.rs:811` — wrong macro argument count silently leaves the invocation unexpanded.
 - `src/pp.rs:868` — malformed replacement tokenization is silently discarded.
 - `src/sema.rs:576` — integer literal suffixes are ignored; only the value range selects int versus long.
-- `src/sema.rs:581` — string literals have array type in C99, not char pointer.
 
 ## HACK
 
@@ -26,7 +25,7 @@ None.
 ## HACK HACK
 
 - `src/lib.rs:47` — hyphen heuristic for multiarch includes can select the wrong architecture.
-- `src/sema.rs:915` — undeclared callees are silently accepted as an implicit-int extension.
+- `src/sema.rs:914` — undeclared callees are silently accepted as an implicit-int extension.
 
 ## HACK HACK HACK
 

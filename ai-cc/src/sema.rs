@@ -578,8 +578,7 @@ impl Sema {
             Expr::Char(_) => Type::Int,
             Expr::Float(_, ty) => ty.clone(),
             Expr::Complex(_, _, ty) => Type::Complex(Box::new(ty.clone())),
-            // BUG: string literals have array type in C99, not char pointer.
-            Expr::String(_) => Type::Pointer(Box::new(Type::Char)),
+            Expr::String(value) => Type::Array(Box::new(Type::Char), Some(value.len() + 1), false),
             Expr::Var(n) => self
                 .syms
                 .lookup(n)
@@ -1244,10 +1243,8 @@ impl Sema {
                     }
                 }
                 if !cursor.is_empty() {
-                    self.errs.push(Diagnostic::error(
-                        "too many union initializers",
-                        Some(span),
-                    ));
+                    self.errs
+                        .push(Diagnostic::error("too many union initializers", Some(span)));
                 }
             }
             _ => {
@@ -1578,6 +1575,7 @@ impl Sema {
                 .lookup(n)
                 .map(|x| !matches!(Self::unqualified(&x.ty), Type::Function(_, _, _, _)))
                 .unwrap_or(false),
+            Expr::String(_) => true,
             Expr::Member(base, _, arrow) => {
                 if *arrow {
                     true
@@ -1830,7 +1828,7 @@ impl Sema {
             Expr::CompoundLiteral(ty, _) => ty.clone(),
             Expr::VaStart(_) | Expr::VaEnd(_) | Expr::VaCopy(_, _) => Type::Void,
             Expr::VaArg(_, ty) => ty.clone(),
-            Expr::String(_) => Type::Pointer(Box::new(Type::Char)),
+            Expr::String(value) => Type::Array(Box::new(Type::Char), Some(value.len() + 1), false),
             Expr::Var(n) => self
                 .syms
                 .lookup(n)

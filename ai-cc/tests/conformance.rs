@@ -321,6 +321,11 @@ fn compound_assignment() {
 }
 
 #[test]
+fn string_literal_arrays() {
+    run_valid_fixture("string-literal-arrays.c");
+}
+
+#[test]
 fn string_arrays() {
     let path = root().join("tests/conformance/valid/string-array-initialization.c");
     let work = temp_dir("string-array-initialization");
